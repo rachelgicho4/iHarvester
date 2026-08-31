@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: iharvester
+    runtime: docker
+    healthCheckPath: /healthz
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_USER_IDS
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB_NAME
+        value: telegram_campaign_orchestrator
+      - key: RUN_MODE
+        value: webhook
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: WEBHOOK_PATH_SECRET
+        generateValue: true
+      - key: WEBHOOK_SECRET_TOKEN
+        generateValue: true
+

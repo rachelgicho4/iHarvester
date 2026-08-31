@@ -1,0 +1,228 @@
+"""Campaign lifecycle: freeze targets once, preserve history, and never reactivate archives."""
+
+from __future__ import annotations
+
+import base64
+import secrets
+from datetime import timedelta
+from typing import Any
+
+from app.campaigns.models import CampaignMode, CampaignStatus, Creative, Destination, Schedule
+from app.campaigns.scheduling import can_create_cycle, scheduled_cycle_time
+from app.campaigns.shuffle import cohort_map, dispatch_rank, variant_for
+from app.campaigns.validation import protected_destination_ids, validate_launch
+from app.db.repositories import Document, Repositories
+from app.utils.ids import opaque_id
+from app.utils.time import utcnow
+
+
+class CampaignService:
+    def __init__(self, repositories: Repositories, send_rps: float) -> None:
+        self.repositories = repositories
+        self.send_rps = send_rps
+
+    async def create_draft(self, owner_id: int, name: str) -> Document:
+        now = utcnow()
+        campaign = {
+            "campaign_id": opaque_id("cmp"),
+            "name": name.strip() or "Untitled campaign",
+            "status": CampaignStatus.DRAFT.value,
+            "mode": CampaignMode.STANDARD.value,
+            "variants": [],
+            "destinations": [],
+            "target_selector": {},
+            "target_snapshot": [],
+            "protected_destination_ids": [],
+            "cohort_map": {},
+            "created_by": owner_id,
+            "created_at": now,
+            "version": 1,
+        }
+        await self.repositories.create_campaign(campaign)
+        return campaign
+
+    async def configure_draft(
+        self,
+        campaign_id: str,
+        *,
+        variants: list[Creative],
+        destinations: list[Destination],
+        selector: Document,
+        mode: CampaignMode,
+        schedule: Schedule,
+        preview_sent: bool,
+    ) -> list[str]:
+        campaign = await self._draft(campaign_id)
+        active_sources = await self.repositories.active_channels(selector)
+        source_ids = {channel["telegram_chat_id"] for channel in active_sources}
+        errors = validate_launch(
+            variants=variants, destinations=destinations, source_ids=source_ids, mode=mode,
+            schedule=schedule, preview_sent=preview_sent, send_rps=self.send_rps,
+        )
+        if errors:
+            return errors
+        await self.repositories.update_campaign(campaign["campaign_id"], {
+            "variants": [variant.model_dump(mode="json") for variant in variants],
+            "destinations": [destination.model_dump(mode="json") for destination in destinations],
+            "target_selector": selector,
+            "mode": mode.value,
+            "start_at_utc": schedule.start_at_utc,
+            "original_end_at_utc": schedule.end_at_utc,
+            "current_end_at_utc": schedule.end_at_utc,
+            "repost_interval_seconds": schedule.repost_interval_seconds,
+            "delete_on_repost": schedule.delete_on_repost,
+            "delete_on_end": schedule.delete_on_end,
+            "owner_timezone": schedule.owner_timezone,
+            "preview_sent": preview_sent,
+            "updated_at": utcnow(),
+        })
+        return []
+
+    async def activate(self, campaign_id: str) -> Document:
+        campaign = await self._draft(campaign_id)
+        variants = [Creative.model_validate(variant) for variant in campaign["variants"]]
+        destinations = [Destination.model_validate(destination) for destination in campaign["destinations"]]
+        schedule = Schedule(
+            start_at_utc=campaign["start_at_utc"], end_at_utc=campaign["current_end_at_utc"],
+            repost_interval_seconds=campaign.get("repost_interval_seconds"),
+            delete_on_repost=campaign.get("delete_on_repost", True),
+            delete_on_end=campaign.get("delete_on_end", True), owner_timezone=campaign.get("owner_timezone", "UTC"),
+        )
+        sources = await self.repositories.active_channels(campaign.get("target_selector"))
+        source_ids = {source["telegram_chat_id"] for source in sources}
+        errors = validate_launch(
+            variants=variants, destinations=destinations, source_ids=source_ids,
+            mode=CampaignMode(campaign["mode"]), schedule=schedule,
+            preview_sent=bool(campaign.get("preview_sent")), send_rps=self.send_rps,
+        )
+        if errors:
+            raise ValueError(" ".join(errors))
+        protected = protected_destination_ids(destinations)
+        target_snapshot = sorted(source_ids - protected)
+        cohort_seed = secrets.token_bytes(32)
+        shuffle_seed = secrets.token_bytes(32)
+        cohorts = cohort_map(target_snapshot, len(variants), cohort_seed)
+        now = utcnow()
+        status = CampaignStatus.SCHEDULED if schedule.start_at_utc > now else CampaignStatus.ACTIVE
+        update = {
+            "status": status.value,
+            "target_snapshot": target_snapshot,
+            "protected_destination_ids": sorted(protected),
+            "cohort_map": {str(channel_id): cohort for channel_id, cohort in cohorts.items()},
+            "cohort_seed": base64.urlsafe_b64encode(cohort_seed).decode(),
+            "shuffle_seed": base64.urlsafe_b64encode(shuffle_seed).decode(),
+            "activated_at": now,
+            "next_cycle_number": 0,
+            "next_cycle_at": schedule.start_at_utc,
+            "updated_at": now,
+        }
+        await self.repositories.update_campaign(campaign_id, update)
+        campaign.update(update)
+        return campaign
+
+    async def plan_due_cycle(self, campaign: Document, now: Any) -> bool:
+        """Materialize the one due cycle. Its fixed HMAC ranks make restart ordering reproducible."""
+        if campaign["status"] not in {CampaignStatus.ACTIVE.value, CampaignStatus.SCHEDULED.value}:
+            return False
+        start = campaign["start_at_utc"]
+        end = campaign["current_end_at_utc"]
+        if now < start:
+            return False
+        if now >= end:
+            await self.repositories.mark_campaign_ending(campaign["campaign_id"], "schedule_complete")
+            return False
+        cycle_number = int(campaign.get("next_cycle_number", 0))
+        expected = scheduled_cycle_time(start, cycle_number, campaign.get("repost_interval_seconds"))
+        if now < expected:
+            return False
+        if not can_create_cycle(start, end, cycle_number, campaign.get("repost_interval_seconds")):
+            await self.repositories.mark_campaign_ending(campaign["campaign_id"], "schedule_complete")
+            return False
+        seed = base64.urlsafe_b64decode(campaign["shuffle_seed"])
+        variant_count = len(campaign["variants"])
+        deliveries: list[Document] = []
+        for channel_id in campaign["target_snapshot"]:
+            cohort_index = int(campaign["cohort_map"][str(channel_id)])
+            deliveries.append({
+                "campaign_id": campaign["campaign_id"],
+                "cycle_number": cycle_number,
+                "channel_id": channel_id,
+                "cohort_index": cohort_index,
+                "variant_index": variant_for(campaign["mode"], cycle_number, cohort_index, variant_count),
+                "dispatch_rank": dispatch_rank(seed, cycle_number, channel_id),
+                "status": "PENDING",
+                "previous_message_id": None,
+                "sent_message_ids": [],
+                "attempts": 0,
+                "worker_id": None,
+                "lease_until": None,
+                "next_retry_at": None,
+                "created_at": now,
+                "updated_at": now,
+            })
+        await self.repositories.create_cycle({
+            "campaign_id": campaign["campaign_id"], "cycle_number": cycle_number,
+            "scheduled_at_utc": expected, "created_at": now, "started_at": now,
+            "completed_at": None, "status": "RUNNING", "target_count": len(deliveries),
+        }, deliveries)
+        interval = campaign.get("repost_interval_seconds")
+        if interval:
+            await self.repositories.update_campaign(campaign["campaign_id"], {
+                "status": CampaignStatus.ACTIVE.value,
+                "next_cycle_number": cycle_number + 1,
+                "next_cycle_at": expected + timedelta(seconds=interval),
+                "updated_at": now,
+            })
+        else:
+            # Single-post campaigns remain active until their end-time cleanup.
+            await self.repositories.update_campaign(campaign["campaign_id"], {
+                "status": CampaignStatus.ACTIVE.value,
+                "next_cycle_number": cycle_number + 1,
+                "next_cycle_at": end,
+                "updated_at": now,
+            })
+        return True
+
+    async def extend(self, campaign_id: str, owner_id: int, seconds: int) -> Document:
+        campaign = await self.repositories.get_campaign(campaign_id)
+        if not campaign or campaign["status"] not in {"SCHEDULED", "ACTIVE"}:
+            raise ValueError("Only scheduled or active campaigns can be extended.")
+        if seconds <= 0:
+            raise ValueError("Extension must be positive.")
+        new_end = campaign["current_end_at_utc"] + timedelta(seconds=seconds)
+        event = {"at": utcnow(), "owner_id": owner_id, "seconds": seconds, "new_end_at_utc": new_end}
+        await self.repositories.db.campaigns.update_one(
+            {"campaign_id": campaign_id},
+            {"$set": {"current_end_at_utc": new_end, "updated_at": utcnow()}, "$push": {"extensions": event}},
+        )
+        campaign["current_end_at_utc"] = new_end
+        return campaign
+
+    async def end_early(self, campaign_id: str) -> bool:
+        return await self.repositories.mark_campaign_ending(campaign_id, "ended_early")
+
+    async def duplicate(self, campaign_id: str, owner_id: int) -> Document:
+        original = await self.repositories.get_campaign(campaign_id)
+        if not original or original["status"] != CampaignStatus.ARCHIVED.value:
+            raise ValueError("Only archived campaigns can be duplicated.")
+        now = utcnow()
+        copied = {
+            key: value for key, value in original.items() if key in {
+                "name", "mode", "variants", "destinations", "target_selector", "delete_on_repost",
+                "delete_on_end", "owner_timezone", "repost_interval_seconds",
+            }
+        }
+        copied.update({
+            "campaign_id": opaque_id("cmp"), "name": f"{original['name']} (copy)",
+            "status": CampaignStatus.DRAFT.value, "target_snapshot": [], "protected_destination_ids": [],
+            "cohort_map": {}, "created_by": owner_id, "created_at": now,
+            "derived_from_campaign_id": original["campaign_id"], "version": 1,
+        })
+        await self.repositories.create_campaign(copied)
+        return copied
+
+    async def _draft(self, campaign_id: str) -> Document:
+        campaign = await self.repositories.get_campaign(campaign_id)
+        if not campaign or campaign["status"] != CampaignStatus.DRAFT.value:
+            raise ValueError("Campaign must be an editable draft.")
+        return campaign
