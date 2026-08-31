@@ -879,6 +879,7 @@ class OwnerHandlers:
             if interval
             else "at " + ", ".join(_period_label(offset // 60) for offset in offsets)
         )
+        cleanup_text = "enabled" if campaign.get("delete_on_end", True) else "not available (the final repost gap exceeds 47 hours)"
         await message.answer(
             "Ready to launch\n\n"
             f"This campaign will target {eligible_count} source channels.\n"
@@ -886,6 +887,7 @@ class OwnerHandlers:
             f"Start: {self._date(campaign['start_at_utc'])}\n"
             f"End: {self._date(campaign['current_end_at_utc'])}\n"
             f"Repost: {repost_text}\n"
+            f"Final cleanup: {cleanup_text}\n"
             f"Mode: {campaign['mode']} ({len(campaign['variants'])} creative{'s' if len(campaign['variants']) != 1 else ''})\n"
             f"Active sources before destination protection: {source_count}",
             reply_markup=_markup(
