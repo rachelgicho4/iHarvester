@@ -10,7 +10,9 @@ from collections.abc import Iterable
 
 def dispatch_rank(shuffle_seed: bytes, cycle_number: int, channel_id: int) -> int:
     digest = hmac.new(shuffle_seed, f"{cycle_number}:{channel_id}".encode(), hashlib.sha256).digest()
-    return int.from_bytes(digest[:8], "big", signed=False)
+    # MongoDB BSON integers are signed 64-bit. Retain a deterministic 63-bit
+    # rank instead of occasionally generating an unencodable uint64 value.
+    return int.from_bytes(digest[:8], "big", signed=False) & ((1 << 63) - 1)
 
 
 def cohort_map(channel_ids: Iterable[int], variant_count: int, cohort_seed: bytes) -> dict[int, int]:
@@ -32,4 +34,3 @@ def variant_for(mode: str, cycle_number: int, cohort_index: int, variant_count: 
     if mode == "MIX_ROTATE":
         return (cohort_index + cycle_number) % variant_count
     raise ValueError(f"unknown campaign mode: {mode}")
-

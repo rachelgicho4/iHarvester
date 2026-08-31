@@ -1,3 +1,5 @@
+from bson import BSON
+
 from app.campaigns.shuffle import cohort_map, dispatch_rank, variant_for
 
 
@@ -5,6 +7,13 @@ def test_dispatch_rank_is_repeatable_and_cycle_specific() -> None:
     seed = b"s" * 32
     assert dispatch_rank(seed, 4, -1001) == dispatch_rank(seed, 4, -1001)
     assert dispatch_rank(seed, 4, -1001) != dispatch_rank(seed, 5, -1001)
+
+
+def test_dispatch_rank_is_always_a_mongo_safe_signed_int64() -> None:
+    for channel_id in range(-1010, -990):
+        rank = dispatch_rank(b"x" * 32, 0, channel_id)
+        assert 0 <= rank < 2**63
+        BSON.encode({"dispatch_rank": rank})
 
 
 def test_registry_insertion_order_cannot_set_cohort_or_send_order() -> None:
