@@ -28,6 +28,8 @@ from app.telegram.sender import TelegramSender
 from app.utils.ids import opaque_id
 from app.web.routes import install_routes
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class Runtime:
@@ -66,12 +68,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ).router)
         runtime = Runtime(settings, database, repositories, bot, dispatcher, sender)
         app.state.runtime = runtime
+        stage = "MongoDB connection"
         try:
             await database.ping()
+            stage = "MongoDB index initialization"
             await ensure_indexes(database)
+            stage = "Telegram bot authentication"
             await bot.get_me()
             allowed_updates = dispatcher.resolve_used_update_types()
             if settings.run_mode == "webhook":
+                stage = "Telegram webhook registration"
                 await bot.set_webhook(
                     settings.webhook_url, secret_token=settings.webhook_secret_token, allowed_updates=allowed_updates,
                     drop_pending_updates=False,
@@ -101,6 +107,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ))
             runtime.ready = True
             yield
+        except Exception:
+            logger.exception("Startup self-check failed during %s", stage)
+            raise
         finally:
             runtime.ready = False
             runtime.stopping.set()
