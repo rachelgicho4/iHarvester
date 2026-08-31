@@ -6,4 +6,4 @@ The scheduler uses one short MongoDB lease. A deployment overlap may run two pro
 
 Delivery statuses distinguish permanent failures, retry waits, and `UNKNOWN_SEND_STATE`. The last is deliberately not auto-retried because a Telegram request timeout has no idempotency key. Correct permission problems by re-promoting the bot, then wait for the next campaign cycle or use the owner retry control where eligible.
 
-Keep normal broadcast rates at or below the conservative free defaults. Do not use Koyeb Free or Render Free for production scheduling.
+Keep normal broadcast rates at or below the conservative free defaults. Koyeb Free reaches scale-to-zero after one hour without public Internet traffic; its health checks are not an uptime mechanism. An external request to `/` every 5–10 minutes can keep a hobby deployment awake, but an always-on instance is the reliable scheduler option.

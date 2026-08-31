@@ -8,6 +8,11 @@ from fastapi import HTTPException, Request, Response
 
 def install_routes(app: object) -> None:
     # Deferred import keeps the tiny HTTP layer independent from application construction.
+    @app.get("/")
+    async def index() -> dict[str, str]:
+        """Safe public ping target for a platform or external uptime monitor."""
+        return {"status": "ok", "service": "iHarvester"}
+
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}

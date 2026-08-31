@@ -13,7 +13,9 @@ It deliberately remains one Python service plus MongoDB: no Redis, Celery, dashb
 5. Koyeb supplies `KOYEB_PUBLIC_DOMAIN`; iHarvester derives its public webhook base URL from it. Deploy and check `/readyz`.
 6. Open the bot in Telegram, press **Start**, and promote it to administrator in the source channels.
 
-The service sets its Telegram webhook on startup. Keep `WEB_CONCURRENCY=1` / one application worker; the MongoDB scheduler lease remains a safety net during deployment overlaps.
+Koyeb's default TCP health check is sufficient; an HTTP `/healthz` check is optional if the port settings expose the customization control. The service sets its Telegram webhook on startup. Keep `WEB_CONCURRENCY=1` / one application worker; the MongoDB scheduler lease remains a safety net during deployment overlaps.
+
+If you choose a Free Instance, Koyeb scales it to zero after one hour without **public** traffic. Its internal health probes do not prevent this. Configure an external monitor to request `https://<your-koyeb-domain>/` every 5–10 minutes, or use an always-on instance for reliable scheduling.
 
 ## Local or VPS polling mode
 
