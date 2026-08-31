@@ -35,7 +35,7 @@ Everything is in the bot's private chat with an allowed owner ID:
 2. Choose **Text**, **Photo**, **Photo + caption**, **Video**, **Video + caption**, **Album**, or **Forward ready post**. Forwarded content retains its Telegram formatting and media IDs.
 3. Add a CTA by entering its label and URL in separate prompts. Use **Add beside last** for a horizontal button or **Add new row** for a vertical one; labels are never rewritten or truncated by iHarvester.
 4. Add destinations, source targets, mode, and schedule through their own guided controls. The Network screen shows active, unavailable, paused, and attention-required channel counts, and accepts a forwarded channel post for manual repair/registration.
-5. Send **Preview**; it renders the actual stored content and inline keyboard in Telegram. **Review & launch** shows exact planned targets and protected destination exclusions before a separate confirmation.
+5. Choose **Send campaign**, then pick a campaign duration (minutes, hours, days, or 30 days) and repost interval. iHarvester renders a real preview and presents the final launch confirmation with the exact planned targets and protected destination exclusions.
 6. **Launch** freezes the active target snapshot and automatically excludes all known destination channel IDs.
 
 For fallback channel registration, forward a post from a source channel to the bot and select **Register/Refresh**. `/backup` creates a compressed core export; `/restore` validates an attached export and asks for confirmation before upserting it.

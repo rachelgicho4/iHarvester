@@ -354,6 +354,21 @@ class Repositories:
         rows = await cursor.to_list(None)
         return {row["_id"]: row["count"] for row in rows if row.get("_id")}
 
+    async def get_setting(self, key: str, default: Any = None) -> Any:
+        document = await self.db.settings.find_one({"key": key})
+        return document.get("value", default) if document else default
+
+    async def set_setting(self, key: str, value: Any) -> None:
+        await self.db.settings.update_one(
+            {"key": key},
+            {"$set": {"key": key, "value": value, "updated_at": utcnow()}},
+            upsert=True,
+        )
+
+    async def delete_draft_campaign(self, campaign_id: str) -> bool:
+        result = await self.db.campaigns.delete_one({"campaign_id": campaign_id, "status": "DRAFT"})
+        return result.deleted_count == 1
+
     async def save_pending_restore(self, restore_id: str, owner_id: int, backup: Document) -> None:
         await self.db.pending_restores.update_one(
             {"restore_id": restore_id},

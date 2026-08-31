@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aiogram import Bot, F, Router
@@ -27,12 +27,22 @@ def _markup(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _navigation(back_callback: str = "home:back") -> list[list[InlineKeyboardButton]]:
+    return [[
+        InlineKeyboardButton(text="Back", callback_data=back_callback),
+        InlineKeyboardButton(text="Home", callback_data="home:back"),
+    ]]
+
+
 def campaign_keyboard(campaign_id: str, status: str) -> InlineKeyboardMarkup:
     if status == CampaignStatus.ARCHIVED.value:
         return _markup(
             [
                 [InlineKeyboardButton(text="Duplicate / Run Again", callback_data=f"c:{campaign_id}:duplicate")],
-                [InlineKeyboardButton(text="Back to campaigns", callback_data="home:campaigns")],
+                [
+                    InlineKeyboardButton(text="Back to campaigns", callback_data="home:campaigns"),
+                    InlineKeyboardButton(text="Home", callback_data="home:back"),
+                ],
             ]
         )
     if status in {CampaignStatus.ACTIVE.value, CampaignStatus.SCHEDULED.value, CampaignStatus.ENDING.value}:
@@ -48,14 +58,20 @@ def campaign_keyboard(campaign_id: str, status: str) -> InlineKeyboardMarkup:
             ],
         ]
         if status != CampaignStatus.ENDING.value:
-            rows.append([InlineKeyboardButton(text="End campaign", callback_data=f"c:{campaign_id}:end")])
-        rows.append([InlineKeyboardButton(text="Back to campaigns", callback_data="home:campaigns")])
+            rows.append([
+                InlineKeyboardButton(text="End campaign", callback_data=f"c:{campaign_id}:end"),
+                InlineKeyboardButton(text="Edit as new draft", callback_data=f"c:{campaign_id}:refactor"),
+            ])
+        rows.append([
+            InlineKeyboardButton(text="Back to campaigns", callback_data="home:campaigns"),
+            InlineKeyboardButton(text="Home", callback_data="home:back"),
+        ])
         return _markup(rows)
     return _markup(
         [
             [
                 InlineKeyboardButton(text="Add content", callback_data=f"c:{campaign_id}:add"),
-                InlineKeyboardButton(text="Variants", callback_data=f"c:{campaign_id}:variants"),
+                InlineKeyboardButton(text="Edit creatives", callback_data=f"c:{campaign_id}:variants"),
             ],
             [
                 InlineKeyboardButton(text="CTA buttons", callback_data=f"c:{campaign_id}:buttons"),
@@ -63,7 +79,7 @@ def campaign_keyboard(campaign_id: str, status: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="Targets", callback_data=f"c:{campaign_id}:targets"),
-                InlineKeyboardButton(text="Schedule", callback_data=f"c:{campaign_id}:schedule"),
+                InlineKeyboardButton(text="Plan for later", callback_data=f"c:{campaign_id}:schedule"),
             ],
             [
                 InlineKeyboardButton(text="Mode", callback_data=f"c:{campaign_id}:mode"),
@@ -71,9 +87,12 @@ def campaign_keyboard(campaign_id: str, status: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="Test send", callback_data=f"c:{campaign_id}:test"),
-                InlineKeyboardButton(text="Review & launch", callback_data=f"c:{campaign_id}:launch"),
+                InlineKeyboardButton(text="Send campaign", callback_data=f"c:{campaign_id}:send"),
             ],
-            [InlineKeyboardButton(text="Back to campaigns", callback_data="home:campaigns")],
+            [
+                InlineKeyboardButton(text="Delete draft", callback_data=f"c:{campaign_id}:delete"),
+            ],
+            [InlineKeyboardButton(text="Back to campaigns", callback_data="home:campaigns"), InlineKeyboardButton(text="Home", callback_data="home:back")],
         ]
     )
 
@@ -95,7 +114,7 @@ def content_type_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text="Album", callback_data=f"ct:{campaign_id}:ALBUM")],
             [InlineKeyboardButton(text="Forward ready post", callback_data=f"ct:{campaign_id}:FORWARD")],
-            [InlineKeyboardButton(text="Back", callback_data=f"c:{campaign_id}:open")],
+            * _navigation(f"c:{campaign_id}:open"),
         ]
     )
 
@@ -108,7 +127,7 @@ def mode_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Rotate", callback_data=f"mode:{campaign_id}:ROTATE"),
             ],
             [InlineKeyboardButton(text="Mix + Rotate", callback_data=f"mode:{campaign_id}:MIX_ROTATE")],
-            [InlineKeyboardButton(text="Back", callback_data=f"c:{campaign_id}:open")],
+            * _navigation(f"c:{campaign_id}:open"),
         ]
     )
 
@@ -125,7 +144,7 @@ def schedule_interval_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Every 24h", callback_data=f"sch:{campaign_id}:24"),
             ],
             [InlineKeyboardButton(text="Custom interval", callback_data=f"sch:{campaign_id}:custom")],
-            [InlineKeyboardButton(text="Cancel", callback_data=f"c:{campaign_id}:open")],
+            * _navigation(f"c:{campaign_id}:open"),
         ]
     )
 
@@ -142,9 +161,41 @@ def target_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Manually include IDs", callback_data=f"target:{campaign_id}:include"),
                 InlineKeyboardButton(text="Exclude IDs", callback_data=f"target:{campaign_id}:exclude"),
             ],
-            [InlineKeyboardButton(text="Back", callback_data=f"c:{campaign_id}:open")],
+            * _navigation(f"c:{campaign_id}:open"),
         ]
     )
+
+
+def quick_duration_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
+    return _markup([
+        [InlineKeyboardButton(text="15 minutes", callback_data=f"dur:{campaign_id}:15"),
+         InlineKeyboardButton(text="1 hour", callback_data=f"dur:{campaign_id}:60")],
+        [InlineKeyboardButton(text="6 hours", callback_data=f"dur:{campaign_id}:360"),
+         InlineKeyboardButton(text="1 day", callback_data=f"dur:{campaign_id}:1440")],
+        [InlineKeyboardButton(text="3 days", callback_data=f"dur:{campaign_id}:4320"),
+         InlineKeyboardButton(text="7 days", callback_data=f"dur:{campaign_id}:10080")],
+        [InlineKeyboardButton(text="30 days", callback_data=f"dur:{campaign_id}:43200")],
+        * _navigation(f"c:{campaign_id}:open"),
+    ])
+
+
+def quick_interval_keyboard(campaign_id: str, duration_minutes: int, default_hours: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    default_text = "Post once" if default_hours == 0 else f"Use my default: every {default_hours}h"
+    if default_hours == 0 and duration_minutes > 47 * 60:
+        default_hours = 24
+        default_text = "Use safe default: every 24h"
+    rows.append([InlineKeyboardButton(text=default_text, callback_data=f"qint:{campaign_id}:{default_hours}")])
+    if duration_minutes <= 47 * 60:
+        rows.append([InlineKeyboardButton(text="Post once", callback_data=f"qint:{campaign_id}:0")])
+    rows.extend([
+        [InlineKeyboardButton(text="Every 1 hour", callback_data=f"qint:{campaign_id}:1"),
+         InlineKeyboardButton(text="Every 6 hours", callback_data=f"qint:{campaign_id}:6")],
+        [InlineKeyboardButton(text="Every 12 hours", callback_data=f"qint:{campaign_id}:12"),
+         InlineKeyboardButton(text="Every 24 hours", callback_data=f"qint:{campaign_id}:24")],
+        * _navigation(f"c:{campaign_id}:send"),
+    ])
+    return _markup(rows)
 
 
 class OwnerHandlers:
@@ -195,6 +246,25 @@ class OwnerHandlers:
             f"Active source channels: {channels.get('ACTIVE', 0)}\n"
             f"Need attention: {channels.get('NEEDS_ATTENTION', 0)}",
             reply_markup=home_keyboard(),
+        )
+
+    async def _show_settings(self, message: Message) -> None:
+        timezone = await self.repositories.get_setting("owner_timezone", "UTC")
+        interval = await self.repositories.get_setting("quick_interval_hours", 6)
+        interval_text = "Post once" if not interval else f"Every {interval} hour{'s' if interval != 1 else ''}"
+        await message.answer(
+            "Settings\n\n"
+            f"Display timezone: {timezone}\n"
+            f"Quick-send default interval: {interval_text}\n\n"
+            "These preferences are used when you schedule a new campaign with Send campaign.",
+            reply_markup=_markup([
+                [InlineKeyboardButton(text="UTC", callback_data="set:timezone:UTC"),
+                 InlineKeyboardButton(text="Africa/Nairobi", callback_data="set:timezone:Africa/Nairobi")],
+                [InlineKeyboardButton(text="Default: post once", callback_data="set:interval:0"),
+                 InlineKeyboardButton(text="Default: every 6h", callback_data="set:interval:6")],
+                [InlineKeyboardButton(text="Default: every 24h", callback_data="set:interval:24")],
+                * _navigation(),
+            ]),
         )
 
     async def _show_campaign(self, message: Message, campaign: Document) -> None:
@@ -452,6 +522,15 @@ class OwnerHandlers:
             elif data.startswith("sch:"):
                 _, campaign_id, value = data.split(":", 2)
                 await self._schedule_interval(query, campaign_id, value)
+            elif data.startswith("dur:"):
+                _, campaign_id, minutes = data.split(":", 2)
+                await self._quick_duration(query, campaign_id, int(minutes))
+            elif data.startswith("qint:"):
+                _, campaign_id, hours = data.split(":", 2)
+                await self._quick_interval(query, campaign_id, int(hours))
+            elif data.startswith("set:"):
+                _, action, value = data.split(":", 2)
+                await self._settings_action(query, action, value)
             elif data.startswith("confirm:"):
                 _, campaign_id, action = data.split(":", 2)
                 await self._confirm(query, campaign_id, action)
@@ -468,9 +547,14 @@ class OwnerHandlers:
         await query.answer()
 
     async def _home(self, query: CallbackQuery, action: str) -> None:
+        # Moving between top-level areas is an explicit cancellation point for
+        # a pending text-entry step.  Otherwise an old message sent after
+        # navigating home could accidentally be consumed by that old step.
+        if action != "create":
+            await self.repositories.clear_owner_session(query.from_user.id)
         if action == "create":
             await self.repositories.set_owner_session(query.from_user.id, {"action": "await_campaign_name"})
-            await query.message.answer("What should this campaign be called?")
+            await query.message.answer("What should this campaign be called?", reply_markup=_markup(_navigation()))
         elif action == "network":
             await self._show_network(query.message)
         elif action == "campaigns":
@@ -478,7 +562,24 @@ class OwnerHandlers:
             if not rows:
                 await query.message.answer("No campaigns yet. Create your first one when ready.", reply_markup=home_keyboard())
                 return
-            buttons = [[InlineKeyboardButton(text=f"{row['name']} ({row['status']})", callback_data=f"c:{row['campaign_id']}:open")] for row in rows]
+            buttons: list[list[InlineKeyboardButton]] = []
+            for row in rows:
+                campaign_id = row["campaign_id"]
+                status = row["status"]
+                buttons.append([InlineKeyboardButton(text=f"{row['name']} ({status})", callback_data=f"c:{campaign_id}:open")])
+                if status == CampaignStatus.DRAFT.value:
+                    buttons.append([
+                        InlineKeyboardButton(text="Send", callback_data=f"c:{campaign_id}:send"),
+                        InlineKeyboardButton(text="Edit", callback_data=f"c:{campaign_id}:edit"),
+                        InlineKeyboardButton(text="Delete", callback_data=f"c:{campaign_id}:delete"),
+                    ])
+                elif status in {CampaignStatus.ACTIVE.value, CampaignStatus.SCHEDULED.value}:
+                    buttons.append([
+                        InlineKeyboardButton(text="Progress", callback_data=f"c:{campaign_id}:progress"),
+                        InlineKeyboardButton(text="End", callback_data=f"c:{campaign_id}:end"),
+                    ])
+                elif status == CampaignStatus.ARCHIVED.value:
+                    buttons.append([InlineKeyboardButton(text="Run again", callback_data=f"c:{campaign_id}:duplicate")])
             buttons.append([InlineKeyboardButton(text="Back", callback_data="home:back")])
             await query.message.answer("Campaigns", reply_markup=_markup(buttons))
         elif action == "back":
@@ -486,13 +587,14 @@ class OwnerHandlers:
         elif action == "backups":
             await query.message.answer("Use /backup to export a core backup, or /restore then attach a backup file.")
         elif action == "settings":
-            await query.message.answer("All campaign times are shown in UTC. Sessions expire after 30 minutes to keep old controls from lingering.")
+            await self._show_settings(query.message)
 
     async def _campaign_action(self, query: CallbackQuery, campaign_id: str, action: str) -> None:
         campaign = await self.repositories.get_campaign(campaign_id)
         if not campaign:
             raise ValueError("campaign no longer exists")
-        if action == "open":
+        if action in {"open", "edit"}:
+            await self.repositories.clear_owner_session(query.from_user.id)
             await self._show_campaign(query.message, campaign)
         elif action == "add":
             await query.message.answer("What kind of post are you creating?", reply_markup=content_type_keyboard(campaign_id))
@@ -520,12 +622,25 @@ class OwnerHandlers:
             await query.message.answer("Choose how variants rotate across source channels.", reply_markup=mode_keyboard(campaign_id))
         elif action == "schedule":
             await self.repositories.set_owner_session(query.from_user.id, {"action": "await_schedule_start", "campaign_id": campaign_id})
-            await query.message.answer("When should it start? Send `YYYY-MM-DD HH:MM` in UTC, for example `2026-09-02 09:30`.")
+            await query.message.answer(
+                "For a future start, send `YYYY-MM-DD HH:MM` in UTC, for example `2026-09-02 09:30`.",
+                reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
+            )
+        elif action == "send":
+            if not campaign.get("variants"):
+                raise ValueError("Add campaign content before sending.")
+            await query.message.answer(
+                "Send campaign\n\nWhen should the campaign end? It will start as soon as you confirm launch.",
+                reply_markup=quick_duration_keyboard(campaign_id),
+            )
         elif action == "preview":
             await self._preview_variant(query, campaign_id, 0)
         elif action == "test":
             await self.repositories.set_owner_session(query.from_user.id, {"action": "await_test_channel", "campaign_id": campaign_id})
-            await query.message.answer("Send one owner-controlled test channel ID. The first creative will be posted there.")
+            await query.message.answer(
+                "Send one owner-controlled test channel ID. The first creative will be posted there.",
+                reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
+            )
         elif action == "launch":
             campaign, errors, source_count, protected_count, eligible_count = await self.campaigns.launch_summary(campaign_id)
             if errors:
@@ -574,6 +689,22 @@ class OwnerHandlers:
             copied = await self.campaigns.duplicate(campaign_id, query.from_user.id)
             await query.message.answer("Created a new editable draft from the archived campaign.")
             await self._show_campaign(query.message, copied)
+        elif action == "refactor":
+            copied = await self.campaigns.fork_to_draft(campaign_id, query.from_user.id)
+            await query.message.answer(
+                "The running campaign remains unchanged. I created an editable draft copy so you can safely replace content, buttons, targets, or schedule.",
+            )
+            await self._show_campaign(query.message, copied)
+        elif action == "delete":
+            if campaign["status"] != CampaignStatus.DRAFT.value:
+                raise ValueError("only drafts can be deleted; end a live campaign instead")
+            await query.message.answer(
+                "Delete this draft? Its saved creative, CTA buttons, destinations, and schedule will be removed. This cannot be undone.",
+                reply_markup=_markup([
+                    [InlineKeyboardButton(text="Delete draft", callback_data=f"confirm:{campaign_id}:delete"),
+                     InlineKeyboardButton(text="Keep draft", callback_data=f"c:{campaign_id}:open")],
+                ]),
+            )
         elif action == "progress":
             cycle = max(0, int(campaign.get("next_cycle_number", 1)) - 1)
             summary = await self.repositories.delivery_summary(campaign_id, cycle)
@@ -665,7 +796,10 @@ class OwnerHandlers:
         await self.campaigns.editable_campaign(campaign_id)
         if action == "add":
             await self.repositories.set_owner_session(query.from_user.id, {"action": "await_destination_name", "campaign_id": campaign_id})
-            await query.message.answer("Send the destination's display name.")
+            await query.message.answer(
+                "Send the destination's display name.",
+                reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
+            )
         elif action == "skip":
             session = await self.repositories.owner_session(query.from_user.id)
             if not session or session.get("action") != "await_destination_id" or session.get("campaign_id") != campaign_id:
@@ -689,7 +823,7 @@ class OwnerHandlers:
                 "exclude": "Send comma-separated numeric channel IDs to exclude.",
             }
             await self.repositories.set_owner_session(query.from_user.id, {"action": f"await_target_{action}", "campaign_id": campaign_id})
-            await query.message.answer(prompts[action])
+            await query.message.answer(prompts[action], reply_markup=_markup(_navigation(f"c:{campaign_id}:open")))
 
     async def _schedule_interval(self, query: CallbackQuery, campaign_id: str, value: str) -> None:
         session = await self.repositories.owner_session(query.from_user.id)
@@ -697,12 +831,48 @@ class OwnerHandlers:
             raise ValueError("schedule entry expired; start again")
         if value == "custom":
             await self.repositories.set_owner_session(query.from_user.id, {**session, "action": "await_schedule_hours"})
-            await query.message.answer("Send the repost interval in whole hours (or `0` for a single post).")
+            await query.message.answer(
+                "Send the repost interval in whole hours (or `0` for a single post).",
+                reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
+            )
             return
         await self._save_schedule(campaign_id, session["start"], session["end"], int(value))
         await self.repositories.clear_owner_session(query.from_user.id)
         await query.message.answer("Schedule saved.")
         await self._show_campaign(query.message, await self.repositories.get_campaign(campaign_id))
+
+    async def _quick_duration(self, query: CallbackQuery, campaign_id: str, minutes: int) -> None:
+        await self.campaigns.editable_campaign(campaign_id)
+        default_hours = int(await self.repositories.get_setting("quick_interval_hours", 6))
+        await self.repositories.set_owner_session(
+            query.from_user.id,
+            {"action": "await_quick_interval", "campaign_id": campaign_id, "duration_minutes": minutes},
+        )
+        await query.message.answer(
+            f"Campaign end: {minutes} minutes after launch. Choose how often to replace the post.",
+            reply_markup=quick_interval_keyboard(campaign_id, minutes, default_hours),
+        )
+
+    async def _quick_interval(self, query: CallbackQuery, campaign_id: str, hours: int) -> None:
+        session = await self.repositories.owner_session(query.from_user.id)
+        if not session or session.get("action") != "await_quick_interval" or session.get("campaign_id") != campaign_id:
+            raise ValueError("send setup expired; open the campaign and choose Send campaign again")
+        start = datetime.now(UTC)
+        end = start + timedelta(minutes=int(session["duration_minutes"]))
+        await self._save_schedule(campaign_id, start, end, hours)
+        await self.repositories.clear_owner_session(query.from_user.id)
+        await self._preview_variant(query, campaign_id, 0)
+        await self._campaign_action(query, campaign_id, "launch")
+
+    async def _settings_action(self, query: CallbackQuery, action: str, value: str) -> None:
+        if action == "timezone" and value in {"UTC", "Africa/Nairobi"}:
+            await self.repositories.set_setting("owner_timezone", value)
+        elif action == "interval" and value in {"0", "6", "24"}:
+            await self.repositories.set_setting("quick_interval_hours", int(value))
+        else:
+            raise ValueError("invalid setting")
+        await query.message.answer("Setting saved.")
+        await self._show_settings(query.message)
 
     async def _network_action(self, query: CallbackQuery, data: str) -> None:
         parts = data.split(":")
@@ -741,6 +911,10 @@ class OwnerHandlers:
             await query.message.answer(
                 "Campaign ending: future cycles are stopped and live posts will be cleaned up." if changed else "Campaign was already ending or archived."
             )
+        elif action == "delete":
+            deleted = await self.campaigns.delete_draft(campaign_id)
+            await query.message.answer("Draft deleted." if deleted else "That draft has already been removed.")
+            await self._show_home(query.message)
 
     async def _restore_confirm(self, query: CallbackQuery, restore_id: str, action: str) -> None:
         if action == "cancel":
@@ -820,7 +994,10 @@ class OwnerHandlers:
             if not label:
                 raise ValueError("send a button label")
             await self.repositories.set_owner_session(owner_id, {**session, "action": "await_button_url", "label": label})
-            await message.answer("Now send its direct destination URL, for example `https://t.me/example`.")
+            await message.answer(
+                "Now send its direct destination URL, for example `https://t.me/example`.",
+                reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
+            )
         elif action == "await_button_url":
             await self._save_button(message, session)
         elif action == "await_destination_name":
@@ -828,7 +1005,10 @@ class OwnerHandlers:
             if not name:
                 raise ValueError("send a destination name")
             await self.repositories.set_owner_session(owner_id, {"action": "await_destination_url", "campaign_id": campaign_id, "name": name})
-            await message.answer("Send its direct Telegram/channel URL.")
+            await message.answer(
+                "Send its direct Telegram/channel URL.",
+                reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
+            )
         elif action == "await_destination_url":
             raw_url = (message.text or "").strip()
             Destination(display_name=session["name"], raw_url=raw_url)
@@ -842,7 +1022,7 @@ class OwnerHandlers:
                         [
                             InlineKeyboardButton(text="Save without channel ID", callback_data=f"dest:{campaign_id}:skip"),
                         ]
-                    ]
+                    ] + _navigation(f"c:{campaign_id}:open")
                 ),
             )
         elif action == "await_destination_id":
@@ -854,7 +1034,10 @@ class OwnerHandlers:
         elif action == "await_schedule_start":
             start = self._parse_utc(message.text or "")
             await self.repositories.set_owner_session(owner_id, {"action": "await_schedule_end", "campaign_id": campaign_id, "start": start})
-            await message.answer("When should it end? Send `YYYY-MM-DD HH:MM` in UTC.")
+            await message.answer(
+                "When should it end? Send `YYYY-MM-DD HH:MM` in UTC.",
+                reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
+            )
         elif action == "await_schedule_end":
             end = self._parse_utc(message.text or "")
             if end <= session["start"]:
@@ -870,6 +1053,7 @@ class OwnerHandlers:
             await self._save_schedule(campaign_id, session["start"], session["end"], hours)
             await self.repositories.clear_owner_session(owner_id)
             await message.answer("Schedule saved.")
+            await self._show_campaign(message, await self.repositories.get_campaign(campaign_id))
         elif action == "await_test_channel":
             campaign = await self.repositories.get_campaign(campaign_id)
             if not campaign or not campaign.get("variants"):
@@ -877,6 +1061,7 @@ class OwnerHandlers:
             await self.sender.send_variant(int((message.text or "").strip()), campaign["variants"][0])
             await self.repositories.clear_owner_session(owner_id)
             await message.answer("Test send completed.")
+            await self._show_campaign(message, campaign)
 
     async def _capture_creative(self, message: Message, session: Document) -> None:
         kind = session["kind"]
@@ -1016,6 +1201,7 @@ class OwnerHandlers:
     async def _save_schedule(self, campaign_id: str, start: datetime, end: datetime, hours: int) -> None:
         interval = hours * 3600 or None
         await self.campaigns.editable_campaign(campaign_id)
+        timezone = await self.repositories.get_setting("owner_timezone", "UTC")
         await self.repositories.update_campaign(
             campaign_id,
             {
@@ -1025,7 +1211,7 @@ class OwnerHandlers:
                 "repost_interval_seconds": interval,
                 "delete_on_repost": True,
                 "delete_on_end": True,
-                "owner_timezone": "UTC",
+                "owner_timezone": timezone,
                 "preview_sent": False,
                 "updated_at": datetime.now(UTC),
             },

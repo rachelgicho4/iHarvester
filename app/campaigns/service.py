@@ -304,6 +304,33 @@ class CampaignService:
         await self.repositories.create_campaign(copied)
         return copied
 
+    async def fork_to_draft(self, campaign_id: str, owner_id: int) -> Document:
+        """Create an editable successor without mutating a live campaign's history."""
+        original = await self.repositories.get_campaign(campaign_id)
+        if not original:
+            raise ValueError("Campaign no longer exists.")
+        now = utcnow()
+        copied = {
+            key: value
+            for key, value in original.items()
+            if key in {
+                "mode", "variants", "destinations", "target_selector", "delete_on_repost",
+                "delete_on_end", "owner_timezone", "repost_interval_seconds",
+            }
+        }
+        copied.update({
+            "campaign_id": opaque_id("cmp"), "name": f"{original['name']} (edited copy)",
+            "status": CampaignStatus.DRAFT.value, "target_snapshot": [], "protected_destination_ids": [],
+            "cohort_map": {}, "created_by": owner_id, "created_at": now,
+            "derived_from_campaign_id": original["campaign_id"], "version": 1,
+            "preview_sent": False,
+        })
+        await self.repositories.create_campaign(copied)
+        return copied
+
+    async def delete_draft(self, campaign_id: str) -> bool:
+        return await self.repositories.delete_draft_campaign(campaign_id)
+
     async def _draft(self, campaign_id: str) -> Document:
         campaign = await self.repositories.get_campaign(campaign_id)
         if not campaign or campaign["status"] != CampaignStatus.DRAFT.value:
