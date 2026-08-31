@@ -101,6 +101,20 @@ class Schedule(BaseModel):
     start_at_utc: datetime
     end_at_utc: datetime
     repost_interval_seconds: int | None = Field(default=None, ge=60)
+    # Exact elapsed points after cycle 0. This supports schedules such as
+    # "repost after 1 day, then after 4 days" without a repeating interval.
+    repost_offsets_seconds: list[int] | None = None
     delete_on_repost: bool = True
     delete_on_end: bool = True
     owner_timezone: str = "UTC"
+
+    @model_validator(mode="after")
+    def valid_repost_plan(self) -> Schedule:
+        if self.repost_interval_seconds and self.repost_offsets_seconds:
+            raise ValueError("choose either a repeating repost interval or specific repost times")
+        if self.repost_offsets_seconds:
+            if any(value < 60 for value in self.repost_offsets_seconds):
+                raise ValueError("specific repost times must be at least one minute after launch")
+            if self.repost_offsets_seconds != sorted(set(self.repost_offsets_seconds)):
+                raise ValueError("specific repost times must be unique and in ascending order")
+        return self

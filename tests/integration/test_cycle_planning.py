@@ -132,3 +132,32 @@ async def test_activate_accepts_legacy_naive_mongo_timestamps() -> None:
     activated = await CampaignService(repositories, send_rps=20).activate("cmp_naive_dates")
     assert activated["status"] == "ACTIVE"
     assert activated["target_snapshot"] == [-1001]
+    assert len(repositories.cycles) == 1
+    assert len(repositories.deliveries) == 1
+
+
+@pytest.mark.asyncio
+async def test_specific_repost_times_create_only_the_requested_cycles() -> None:
+    now = datetime.now(UTC)
+    start = now - timedelta(seconds=1)
+    campaign = {
+        "campaign_id": "cmp_specific_times",
+        "status": "ACTIVE",
+        "mode": "STANDARD",
+        "start_at_utc": start,
+        "current_end_at_utc": start + timedelta(days=7),
+        "repost_interval_seconds": None,
+        "repost_offsets_seconds": [3600, 4 * 24 * 3600],
+        "target_snapshot": [-1001],
+        "cohort_map": {"-1001": 0},
+        "shuffle_seed": base64.urlsafe_b64encode(b"x" * 32).decode(),
+        "variants": [{}],
+        "next_cycle_number": 0,
+    }
+    repositories = MemoryRepositories(campaign, [{"telegram_chat_id": -1001}])
+    service = CampaignService(repositories, send_rps=20)
+    assert await service.plan_due_cycle(campaign, now)
+    assert await service.plan_due_cycle(campaign, start + timedelta(hours=1, seconds=1))
+    assert await service.plan_due_cycle(campaign, start + timedelta(days=4, seconds=1))
+    assert [cycle["cycle_number"] for cycle in repositories.cycles] == [0, 1, 2]
+    assert not await service.plan_due_cycle(campaign, start + timedelta(days=5))

@@ -27,7 +27,12 @@ class Scheduler:
     async def run(self, stopping: asyncio.Event) -> None:
         try:
             while not stopping.is_set():
-                await self.tick()
+                try:
+                    await self.tick()
+                except Exception:
+                    # Keep the task alive: a temporary Mongo/network failure
+                    # must not permanently stop all future reposts.
+                    logger.exception("Campaign scheduler tick failed")
                 try:
                     await asyncio.wait_for(stopping.wait(), timeout=self.tick_seconds)
                 except TimeoutError:

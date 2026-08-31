@@ -73,6 +73,35 @@ def parse_period_minutes(raw: str, *, field: str) -> int:
     return minutes
 
 
+def parse_repost_offsets_minutes(raw: str, *, duration_minutes: int) -> list[int]:
+    values = [parse_period_minutes(item, field="repost time") for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError("send one or more comma-separated repost times")
+    if len(values) > 20:
+        raise ValueError("choose at most 20 specific repost times")
+    values = sorted(set(values))
+    if values[-1] >= duration_minutes:
+        raise ValueError("each repost time must be before the campaign end")
+    return values
+
+
+def parse_repost_gaps_minutes(raw: str, *, duration_minutes: int) -> list[int]:
+    """Convert 1-20 owner-entered gaps between posts into elapsed offsets."""
+    gaps = [parse_period_minutes(item, field="repost gap") for item in raw.split(",") if item.strip()]
+    if not gaps:
+        raise ValueError("send one or more comma-separated repost gaps")
+    if len(gaps) > 20:
+        raise ValueError("choose at most 20 repost gaps")
+    offsets: list[int] = []
+    elapsed = 0
+    for gap in gaps:
+        elapsed += gap
+        if elapsed >= duration_minutes:
+            raise ValueError("the combined repost gaps must end before the campaign end")
+        offsets.append(elapsed)
+    return offsets
+
+
 def _valid_repost_minutes(duration_minutes: int) -> tuple[int, ...]:
     return tuple(
         interval for interval in _INTERVAL_PRESET_MINUTES
@@ -109,6 +138,10 @@ def _interval_keyboard(
             for interval in valid[offset : offset + 2]
         ])
     rows.append([InlineKeyboardButton(text="Custom interval", callback_data=f"{prefix}:{campaign_id}:custom")])
+    rows.append([
+        InlineKeyboardButton(text="Specific times after launch", callback_data=f"times:{prefix}:{campaign_id}"),
+        InlineKeyboardButton(text="Set custom repost gaps", callback_data=f"gaps:{prefix}:{campaign_id}"),
+    ])
     rows.extend(_navigation(back_callback))
     return _markup(rows)
 
@@ -577,6 +610,12 @@ class OwnerHandlers:
             elif data.startswith("dest:"):
                 _, campaign_id, action = data.split(":", 2)
                 await self._destination_action(query, campaign_id, action)
+            elif data.startswith("times:"):
+                _, flow, campaign_id = data.split(":", 2)
+                await self._specific_repost_times(query, campaign_id, flow)
+            elif data.startswith("gaps:"):
+                _, flow, campaign_id = data.split(":", 2)
+                await self._custom_repost_gaps(query, campaign_id, flow)
             elif data.startswith("sint:"):
                 _, campaign_id, value = data.split(":", 2)
                 await self._schedule_interval(query, campaign_id, value)
@@ -832,13 +871,21 @@ class OwnerHandlers:
             )
             return
         interval = campaign.get("repost_interval_seconds")
+        offsets = campaign.get("repost_offsets_seconds")
+        repost_text = (
+            "single post"
+            if not interval and not offsets
+            else f"every {_period_label(interval // 60)}"
+            if interval
+            else "at " + ", ".join(_period_label(offset // 60) for offset in offsets)
+        )
         await message.answer(
             "Ready to launch\n\n"
             f"This campaign will target {eligible_count} source channels.\n"
             f"{protected_count} promoted destination channels are excluded automatically.\n"
             f"Start: {self._date(campaign['start_at_utc'])}\n"
             f"End: {self._date(campaign['current_end_at_utc'])}\n"
-            f"Repost: {'single post' if not interval else f'every {_period_label(interval // 60)}'}\n"
+            f"Repost: {repost_text}\n"
             f"Mode: {campaign['mode']} ({len(campaign['variants'])} creative{'s' if len(campaign['variants']) != 1 else ''})\n"
             f"Active sources before destination protection: {source_count}",
             reply_markup=_markup(
@@ -924,6 +971,44 @@ class OwnerHandlers:
         await query.message.answer("Schedule saved.")
         await self._show_campaign(query.message, await self.repositories.get_campaign(campaign_id))
 
+    async def _specific_repost_times(self, query: CallbackQuery, campaign_id: str, flow: str) -> None:
+        session = await self.repositories.owner_session(query.from_user.id)
+        expected_action = {"qmin": "await_quick_interval", "sint": "await_schedule_interval"}.get(flow)
+        if not expected_action or not session or session.get("action") != expected_action or session.get("campaign_id") != campaign_id:
+            raise ValueError("repost-time entry expired; choose Send campaign or Plan for later again")
+        duration_minutes = (
+            int(session["duration_minutes"])
+            if flow == "qmin"
+            else self._duration_minutes(session["start"], session["end"])
+        )
+        action = "await_quick_repost_times" if flow == "qmin" else "await_schedule_repost_times"
+        await self.repositories.set_owner_session(query.from_user.id, {**session, "action": action})
+        await query.message.answer(
+            "Enter 1-20 exact elapsed repost times after launch, separated by commas. For example `1d, 4d, 6d` means "
+            "an initial post now, then reposts at day 1, day 4, and day 6. Times can be uneven and must be before the "
+            f"campaign ends in {_period_label(duration_minutes)}.",
+            reply_markup=_markup(_navigation(f"c:{campaign_id}:send" if flow == "qmin" else f"c:{campaign_id}:open")),
+        )
+
+    async def _custom_repost_gaps(self, query: CallbackQuery, campaign_id: str, flow: str) -> None:
+        session = await self.repositories.owner_session(query.from_user.id)
+        expected_action = {"qmin": "await_quick_interval", "sint": "await_schedule_interval"}.get(flow)
+        if not expected_action or not session or session.get("action") != expected_action or session.get("campaign_id") != campaign_id:
+            raise ValueError("repost-gap entry expired; choose Send campaign or Plan for later again")
+        duration_minutes = (
+            int(session["duration_minutes"])
+            if flow == "qmin"
+            else self._duration_minutes(session["start"], session["end"])
+        )
+        action = "await_quick_repost_gaps" if flow == "qmin" else "await_schedule_repost_gaps"
+        await self.repositories.set_owner_session(query.from_user.id, {**session, "action": action})
+        await query.message.answer(
+            "Enter 1-20 custom gaps between posts, separated by commas. For example `1d, 3d, 2d` means "
+            "post now, then repost after 1 day, then 3 days later, then 2 days later. "
+            f"Their combined length must fit inside {_period_label(duration_minutes)}.",
+            reply_markup=_markup(_navigation(f"c:{campaign_id}:send" if flow == "qmin" else f"c:{campaign_id}:open")),
+        )
+
     async def _quick_duration(self, query: CallbackQuery, campaign_id: str, minutes: int) -> None:
         await self._begin_quick_interval(query.from_user.id, query.message, campaign_id, minutes)
 
@@ -963,12 +1048,19 @@ class OwnerHandlers:
         await self._complete_quick_send(query.from_user.id, query.message, campaign_id, int(session["duration_minutes"]), int(value))
 
     async def _complete_quick_send(
-        self, owner_id: int, message: Message, campaign_id: str, duration_minutes: int, interval_minutes: int,
+        self,
+        owner_id: int,
+        message: Message,
+        campaign_id: str,
+        duration_minutes: int,
+        interval_minutes: int,
+        repost_offsets_minutes: list[int] | None = None,
     ) -> None:
-        self._validate_repost_interval(duration_minutes, interval_minutes)
+        if repost_offsets_minutes is None:
+            self._validate_repost_interval(duration_minutes, interval_minutes)
         start = datetime.now(UTC)
         end = start + timedelta(minutes=duration_minutes)
-        await self._save_schedule(campaign_id, start, end, interval_minutes)
+        await self._save_schedule(campaign_id, start, end, interval_minutes, repost_offsets_minutes)
         await self.repositories.clear_owner_session(owner_id)
         await self._send_preview(message, owner_id, campaign_id, 0)
         await self._show_launch_confirmation(message, campaign_id)
@@ -992,6 +1084,11 @@ class OwnerHandlers:
             raise ValueError("repost interval must divide the campaign duration exactly")
         if duration_minutes > _SAFE_REPOST_MAX_MINUTES and interval_minutes > _SAFE_REPOST_MAX_MINUTES:
             raise ValueError("campaigns over 47 hours need a repost interval of 47 hours or less")
+
+    @staticmethod
+    def _specific_times_support_final_cleanup(duration_minutes: int, offsets_minutes: list[int]) -> bool:
+        points = [0, *offsets_minutes, duration_minutes]
+        return all(right - left <= _SAFE_REPOST_MAX_MINUTES for left, right in zip(points, points[1:], strict=False))
 
     async def _settings_action(self, query: CallbackQuery, action: str, value: str) -> None:
         if action == "timezone" and value in {"UTC", "Africa/Nairobi"}:
@@ -1199,12 +1296,34 @@ class OwnerHandlers:
             await self.repositories.clear_owner_session(owner_id)
             await message.answer("Schedule saved.")
             await self._show_campaign(message, await self.repositories.get_campaign(campaign_id))
+        elif action == "await_schedule_repost_times":
+            duration_minutes = self._duration_minutes(session["start"], session["end"])
+            offsets_minutes = parse_repost_offsets_minutes(message.text or "", duration_minutes=duration_minutes)
+            final_cleanup = await self._save_schedule(campaign_id, session["start"], session["end"], 0, offsets_minutes)
+            await self.repositories.clear_owner_session(owner_id)
+            await message.answer(self._specific_schedule_saved_text(offsets_minutes, final_cleanup))
+            await self._show_campaign(message, await self.repositories.get_campaign(campaign_id))
+        elif action == "await_schedule_repost_gaps":
+            duration_minutes = self._duration_minutes(session["start"], session["end"])
+            offsets_minutes = parse_repost_gaps_minutes(message.text or "", duration_minutes=duration_minutes)
+            final_cleanup = await self._save_schedule(campaign_id, session["start"], session["end"], 0, offsets_minutes)
+            await self.repositories.clear_owner_session(owner_id)
+            await message.answer(self._specific_schedule_saved_text(offsets_minutes, final_cleanup))
+            await self._show_campaign(message, await self.repositories.get_campaign(campaign_id))
         elif action == "await_quick_duration":
             duration_minutes = parse_period_minutes(message.text or "", field="campaign duration")
             await self._begin_quick_interval(owner_id, message, campaign_id, duration_minutes)
         elif action == "await_quick_interval_custom":
             interval_minutes = parse_period_minutes(message.text or "", field="repost interval")
             await self._complete_quick_send(owner_id, message, campaign_id, int(session["duration_minutes"]), interval_minutes)
+        elif action == "await_quick_repost_times":
+            duration_minutes = int(session["duration_minutes"])
+            offsets_minutes = parse_repost_offsets_minutes(message.text or "", duration_minutes=duration_minutes)
+            await self._complete_quick_send(owner_id, message, campaign_id, duration_minutes, 0, offsets_minutes)
+        elif action == "await_quick_repost_gaps":
+            duration_minutes = int(session["duration_minutes"])
+            offsets_minutes = parse_repost_gaps_minutes(message.text or "", duration_minutes=duration_minutes)
+            await self._complete_quick_send(owner_id, message, campaign_id, duration_minutes, 0, offsets_minutes)
         elif action == "await_test_channel":
             campaign = await self.repositories.get_campaign(campaign_id)
             if not campaign or not campaign.get("variants"):
@@ -1349,10 +1468,23 @@ class OwnerHandlers:
         await self.repositories.clear_owner_session(message.from_user.id)
         await message.answer("Target selection saved. Destination channels will remain protected.")
 
-    async def _save_schedule(self, campaign_id: str, start: datetime, end: datetime, interval_minutes: int) -> None:
+    async def _save_schedule(
+        self,
+        campaign_id: str,
+        start: datetime,
+        end: datetime,
+        interval_minutes: int,
+        repost_offsets_minutes: list[int] | None = None,
+    ) -> bool:
         interval = interval_minutes * 60 or None
         start = as_utc(start)
         end = as_utc(end)
+        duration_minutes = self._duration_minutes(start, end)
+        final_cleanup = (
+            self._specific_times_support_final_cleanup(duration_minutes, repost_offsets_minutes)
+            if repost_offsets_minutes is not None
+            else True
+        )
         await self.campaigns.editable_campaign(campaign_id)
         timezone = await self.repositories.get_setting("owner_timezone", "UTC")
         await self.repositories.update_campaign(
@@ -1362,12 +1494,24 @@ class OwnerHandlers:
                 "original_end_at_utc": end,
                 "current_end_at_utc": end,
                 "repost_interval_seconds": interval,
+                "repost_offsets_seconds": [minutes * 60 for minutes in repost_offsets_minutes] if repost_offsets_minutes is not None else None,
                 "delete_on_repost": True,
-                "delete_on_end": True,
+                "delete_on_end": final_cleanup,
                 "owner_timezone": timezone,
                 "preview_sent": False,
                 "updated_at": datetime.now(UTC),
             },
+        )
+        return final_cleanup
+
+    @staticmethod
+    def _specific_schedule_saved_text(offsets_minutes: list[int], final_cleanup: bool) -> str:
+        plan = ", ".join(_period_label(value) for value in offsets_minutes)
+        if final_cleanup:
+            return f"Specific repost plan saved: {plan}. Every repost replaces the previous post; final cleanup is enabled."
+        return (
+            f"Specific repost plan saved: {plan}. Every repost replaces the previous post. "
+            "The final post will remain after campaign end because this plan has a gap over 47 hours."
         )
 
     @staticmethod

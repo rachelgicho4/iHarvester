@@ -77,6 +77,7 @@ class CampaignService:
                 "original_end_at_utc": schedule.end_at_utc,
                 "current_end_at_utc": schedule.end_at_utc,
                 "repost_interval_seconds": schedule.repost_interval_seconds,
+                "repost_offsets_seconds": schedule.repost_offsets_seconds,
                 "delete_on_repost": schedule.delete_on_repost,
                 "delete_on_end": schedule.delete_on_end,
                 "owner_timezone": schedule.owner_timezone,
@@ -94,6 +95,7 @@ class CampaignService:
             start_at_utc=as_utc(campaign["start_at_utc"]),
             end_at_utc=as_utc(campaign["current_end_at_utc"]),
             repost_interval_seconds=campaign.get("repost_interval_seconds"),
+            repost_offsets_seconds=campaign.get("repost_offsets_seconds"),
             delete_on_repost=campaign.get("delete_on_repost", True),
             delete_on_end=campaign.get("delete_on_end", True),
             owner_timezone=campaign.get("owner_timezone", "UTC"),
@@ -134,7 +136,12 @@ class CampaignService:
         }
         await self.repositories.update_campaign(campaign_id, update)
         campaign.update(update)
-        return campaign
+        # Do not make the first post depend on the next scheduler tick. This
+        # creates durable cycle-0 deliveries during the owner's confirmation;
+        # background scheduling remains responsible for later reposts.
+        if status == CampaignStatus.ACTIVE:
+            await self.plan_due_cycle(campaign, now)
+        return await self.repositories.get_campaign(campaign_id) or campaign
 
     async def editable_campaign(self, campaign_id: str) -> Document:
         """Return an editable draft for owner UI actions without duplicating status checks."""
@@ -153,6 +160,7 @@ class CampaignService:
             start_at_utc=as_utc(campaign["start_at_utc"]),
             end_at_utc=as_utc(campaign["current_end_at_utc"]),
             repost_interval_seconds=campaign.get("repost_interval_seconds"),
+            repost_offsets_seconds=campaign.get("repost_offsets_seconds"),
             delete_on_repost=campaign.get("delete_on_repost", True),
             delete_on_end=campaign.get("delete_on_end", True),
             owner_timezone=campaign.get("owner_timezone", "UTC"),
@@ -185,10 +193,18 @@ class CampaignService:
             await self.repositories.mark_campaign_ending(campaign["campaign_id"], "schedule_complete")
             return False
         cycle_number = int(campaign.get("next_cycle_number", 0))
-        expected = scheduled_cycle_time(start, cycle_number, campaign.get("repost_interval_seconds"))
+        repost_offsets = campaign.get("repost_offsets_seconds")
+        # After a one-off or final specific repost, keep the campaign active
+        # until its configured end so cleanup can run. There is simply no
+        # further cycle to plan before then.
+        if (repost_offsets is not None and cycle_number > len(repost_offsets)) or (
+            repost_offsets is None and not campaign.get("repost_interval_seconds") and cycle_number > 0
+        ):
+            return False
+        expected = scheduled_cycle_time(start, cycle_number, campaign.get("repost_interval_seconds"), repost_offsets)
         if now < expected:
             return False
-        if not can_create_cycle(start, end, cycle_number, campaign.get("repost_interval_seconds")):
+        if not can_create_cycle(start, end, cycle_number, campaign.get("repost_interval_seconds"), repost_offsets):
             await self.repositories.mark_campaign_ending(campaign["campaign_id"], "schedule_complete")
             return False
         seed = base64.urlsafe_b64decode(campaign["shuffle_seed"])
@@ -229,7 +245,23 @@ class CampaignService:
             deliveries,
         )
         interval = campaign.get("repost_interval_seconds")
-        if interval:
+        if repost_offsets is not None:
+            next_cycle = cycle_number + 1
+            next_cycle_at = (
+                scheduled_cycle_time(start, next_cycle, interval, repost_offsets)
+                if next_cycle <= len(repost_offsets)
+                else end
+            )
+            await self.repositories.update_campaign(
+                campaign["campaign_id"],
+                {
+                    "status": CampaignStatus.ACTIVE.value,
+                    "next_cycle_number": next_cycle,
+                    "next_cycle_at": next_cycle_at,
+                    "updated_at": now,
+                },
+            )
+        elif interval:
             await self.repositories.update_campaign(
                 campaign["campaign_id"],
                 {
@@ -289,6 +321,7 @@ class CampaignService:
                 "delete_on_end",
                 "owner_timezone",
                 "repost_interval_seconds",
+                "repost_offsets_seconds",
             }
         }
         copied.update(
@@ -319,7 +352,7 @@ class CampaignService:
             for key, value in original.items()
             if key in {
                 "mode", "variants", "destinations", "target_selector", "delete_on_repost",
-                "delete_on_end", "owner_timezone", "repost_interval_seconds",
+                "delete_on_end", "owner_timezone", "repost_interval_seconds", "repost_offsets_seconds",
             }
         }
         copied.update({
