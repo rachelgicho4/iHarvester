@@ -5,11 +5,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
+# Koyeb may supply PORT=80. Grant only the capability needed to bind it while
+# continuing to run the application itself as the non-root app user.
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates \
+    && apt-get install --yes --no-install-recommends ca-certificates libcap2-bin \
     && rm -rf /var/lib/apt/lists/* \
     && addgroup --system app \
-    && adduser --system --ingroup app app
+    && adduser --system --ingroup app app \
+    && setcap cap_net_bind_service=+ep /usr/local/bin/python3.12
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 COPY app ./app

@@ -8,7 +8,7 @@ It deliberately remains one Python service plus MongoDB: no Redis, Celery, dashb
 
 1. Create a MongoDB Atlas database and copy its connection URI.
 2. Push this repository to GitHub, then create a **Web Service** in the Koyeb UI from the repository. Koyeb will detect the Dockerfile.
-3. Choose an always-on paid instance with one minimum instance. Koyeb Free scales to zero after idle time, which is unsuitable for a campaign scheduler.
+3. Under **Exposed ports**, select `8000` with protocol `HTTP`; Koyeb supplies that value as `PORT`. Choose an always-on paid instance with one minimum instance. Koyeb Free scales to zero after idle time, which is unsuitable for a campaign scheduler.
 4. Add `BOT_TOKEN`, `OWNER_USER_IDS`, `MONGODB_URI`, `WEBHOOK_PATH_SECRET`, and `WEBHOOK_SECRET_TOKEN` as Koyeb Secrets. Set `RUN_MODE=webhook` and `MONGODB_DB_NAME=telegram_campaign_orchestrator`.
 5. Koyeb supplies `KOYEB_PUBLIC_DOMAIN`; iHarvester derives its public webhook base URL from it. Deploy and check `/readyz`.
 6. Open the bot in Telegram, press **Start**, and promote it to administrator in the source channels.

@@ -1,6 +1,6 @@
 # Deploy on Koyeb (primary)
 
-Create a Koyeb Web Service from this GitHub repository and choose the **Dockerfile** builder. Expose the application as an HTTP Web Service; the container listens on Koyeb's supplied `$PORT`. Leave Koyeb's default TCP health check in place. If your port settings show **Customize health check**, you may optionally set an HTTP `GET /healthz` check, but it is not required.
+Create a Koyeb Web Service from this GitHub repository and choose the **Dockerfile** builder. In **Exposed ports**, use `8000` with protocol `HTTP` (Koyeb then supplies `PORT=8000`). The image can also safely bind Koyeb's legacy/default `PORT=80` setting. Leave Koyeb's default TCP health check in place. If your port settings show **Customize health check**, you may optionally set an HTTP `GET /healthz` check, but it is not required.
 
 Set these Koyeb Secrets: `BOT_TOKEN`, `OWNER_USER_IDS`, `MONGODB_URI`, `WEBHOOK_PATH_SECRET`, and `WEBHOOK_SECRET_TOKEN`. Set `RUN_MODE=webhook` and `MONGODB_DB_NAME=telegram_campaign_orchestrator`. Do not set `PUBLIC_BASE_URL` unless using a custom domain: the app derives it from Koyeb's `KOYEB_PUBLIC_DOMAIN`.
 
