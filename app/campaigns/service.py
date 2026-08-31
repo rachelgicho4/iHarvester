@@ -56,26 +56,34 @@ class CampaignService:
         active_sources = await self.repositories.active_channels(selector)
         source_ids = {channel["telegram_chat_id"] for channel in active_sources}
         errors = validate_launch(
-            variants=variants, destinations=destinations, source_ids=source_ids, mode=mode,
-            schedule=schedule, preview_sent=preview_sent, send_rps=self.send_rps,
+            variants=variants,
+            destinations=destinations,
+            source_ids=source_ids,
+            mode=mode,
+            schedule=schedule,
+            preview_sent=preview_sent,
+            send_rps=self.send_rps,
         )
         if errors:
             return errors
-        await self.repositories.update_campaign(campaign["campaign_id"], {
-            "variants": [variant.model_dump(mode="json") for variant in variants],
-            "destinations": [destination.model_dump(mode="json") for destination in destinations],
-            "target_selector": selector,
-            "mode": mode.value,
-            "start_at_utc": schedule.start_at_utc,
-            "original_end_at_utc": schedule.end_at_utc,
-            "current_end_at_utc": schedule.end_at_utc,
-            "repost_interval_seconds": schedule.repost_interval_seconds,
-            "delete_on_repost": schedule.delete_on_repost,
-            "delete_on_end": schedule.delete_on_end,
-            "owner_timezone": schedule.owner_timezone,
-            "preview_sent": preview_sent,
-            "updated_at": utcnow(),
-        })
+        await self.repositories.update_campaign(
+            campaign["campaign_id"],
+            {
+                "variants": [variant.model_dump(mode="json") for variant in variants],
+                "destinations": [destination.model_dump(mode="json") for destination in destinations],
+                "target_selector": selector,
+                "mode": mode.value,
+                "start_at_utc": schedule.start_at_utc,
+                "original_end_at_utc": schedule.end_at_utc,
+                "current_end_at_utc": schedule.end_at_utc,
+                "repost_interval_seconds": schedule.repost_interval_seconds,
+                "delete_on_repost": schedule.delete_on_repost,
+                "delete_on_end": schedule.delete_on_end,
+                "owner_timezone": schedule.owner_timezone,
+                "preview_sent": preview_sent,
+                "updated_at": utcnow(),
+            },
+        )
         return []
 
     async def activate(self, campaign_id: str) -> Document:
@@ -83,17 +91,23 @@ class CampaignService:
         variants = [Creative.model_validate(variant) for variant in campaign["variants"]]
         destinations = [Destination.model_validate(destination) for destination in campaign["destinations"]]
         schedule = Schedule(
-            start_at_utc=campaign["start_at_utc"], end_at_utc=campaign["current_end_at_utc"],
+            start_at_utc=campaign["start_at_utc"],
+            end_at_utc=campaign["current_end_at_utc"],
             repost_interval_seconds=campaign.get("repost_interval_seconds"),
             delete_on_repost=campaign.get("delete_on_repost", True),
-            delete_on_end=campaign.get("delete_on_end", True), owner_timezone=campaign.get("owner_timezone", "UTC"),
+            delete_on_end=campaign.get("delete_on_end", True),
+            owner_timezone=campaign.get("owner_timezone", "UTC"),
         )
         sources = await self.repositories.active_channels(campaign.get("target_selector"))
         source_ids = {source["telegram_chat_id"] for source in sources}
         errors = validate_launch(
-            variants=variants, destinations=destinations, source_ids=source_ids,
-            mode=CampaignMode(campaign["mode"]), schedule=schedule,
-            preview_sent=bool(campaign.get("preview_sent")), send_rps=self.send_rps,
+            variants=variants,
+            destinations=destinations,
+            source_ids=source_ids,
+            mode=CampaignMode(campaign["mode"]),
+            schedule=schedule,
+            preview_sent=bool(campaign.get("preview_sent")),
+            send_rps=self.send_rps,
         )
         if errors:
             raise ValueError(" ".join(errors))
@@ -120,6 +134,41 @@ class CampaignService:
         campaign.update(update)
         return campaign
 
+    async def editable_campaign(self, campaign_id: str) -> Document:
+        """Return an editable draft for owner UI actions without duplicating status checks."""
+        return await self._draft(campaign_id)
+
+    async def launch_summary(self, campaign_id: str) -> tuple[Document, list[str], int, int, int]:
+        """Validate a draft and expose exact owner-facing launch counts before confirmation."""
+        campaign = await self._draft(campaign_id)
+        required = ("start_at_utc", "current_end_at_utc")
+        missing = [field for field in required if not campaign.get(field)]
+        if missing:
+            return campaign, ["Set a start and end time before launch."], 0, 0, 0
+        variants = [Creative.model_validate(variant) for variant in campaign.get("variants", [])]
+        destinations = [Destination.model_validate(destination) for destination in campaign.get("destinations", [])]
+        schedule = Schedule(
+            start_at_utc=campaign["start_at_utc"],
+            end_at_utc=campaign["current_end_at_utc"],
+            repost_interval_seconds=campaign.get("repost_interval_seconds"),
+            delete_on_repost=campaign.get("delete_on_repost", True),
+            delete_on_end=campaign.get("delete_on_end", True),
+            owner_timezone=campaign.get("owner_timezone", "UTC"),
+        )
+        sources = await self.repositories.active_channels(campaign.get("target_selector"))
+        source_ids = {source["telegram_chat_id"] for source in sources}
+        protected = protected_destination_ids(destinations)
+        errors = validate_launch(
+            variants=variants,
+            destinations=destinations,
+            source_ids=source_ids,
+            mode=CampaignMode(campaign["mode"]),
+            schedule=schedule,
+            preview_sent=bool(campaign.get("preview_sent")),
+            send_rps=self.send_rps,
+        )
+        return campaign, errors, len(source_ids), len(protected), len(source_ids - protected)
+
     async def plan_due_cycle(self, campaign: Document, now: Any) -> bool:
         """Materialize the one due cycle. Its fixed HMAC ranks make restart ordering reproducible."""
         if campaign["status"] not in {CampaignStatus.ACTIVE.value, CampaignStatus.SCHEDULED.value}:
@@ -143,44 +192,60 @@ class CampaignService:
         deliveries: list[Document] = []
         for channel_id in campaign["target_snapshot"]:
             cohort_index = int(campaign["cohort_map"][str(channel_id)])
-            deliveries.append({
+            deliveries.append(
+                {
+                    "campaign_id": campaign["campaign_id"],
+                    "cycle_number": cycle_number,
+                    "channel_id": channel_id,
+                    "cohort_index": cohort_index,
+                    "variant_index": variant_for(campaign["mode"], cycle_number, cohort_index, variant_count),
+                    "dispatch_rank": dispatch_rank(seed, cycle_number, channel_id),
+                    "status": "PENDING",
+                    "previous_message_id": None,
+                    "sent_message_ids": [],
+                    "attempts": 0,
+                    "worker_id": None,
+                    "lease_until": None,
+                    "next_retry_at": None,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+        await self.repositories.create_cycle(
+            {
                 "campaign_id": campaign["campaign_id"],
                 "cycle_number": cycle_number,
-                "channel_id": channel_id,
-                "cohort_index": cohort_index,
-                "variant_index": variant_for(campaign["mode"], cycle_number, cohort_index, variant_count),
-                "dispatch_rank": dispatch_rank(seed, cycle_number, channel_id),
-                "status": "PENDING",
-                "previous_message_id": None,
-                "sent_message_ids": [],
-                "attempts": 0,
-                "worker_id": None,
-                "lease_until": None,
-                "next_retry_at": None,
+                "scheduled_at_utc": expected,
                 "created_at": now,
-                "updated_at": now,
-            })
-        await self.repositories.create_cycle({
-            "campaign_id": campaign["campaign_id"], "cycle_number": cycle_number,
-            "scheduled_at_utc": expected, "created_at": now, "started_at": now,
-            "completed_at": None, "status": "RUNNING", "target_count": len(deliveries),
-        }, deliveries)
+                "started_at": now,
+                "completed_at": None,
+                "status": "RUNNING",
+                "target_count": len(deliveries),
+            },
+            deliveries,
+        )
         interval = campaign.get("repost_interval_seconds")
         if interval:
-            await self.repositories.update_campaign(campaign["campaign_id"], {
-                "status": CampaignStatus.ACTIVE.value,
-                "next_cycle_number": cycle_number + 1,
-                "next_cycle_at": expected + timedelta(seconds=interval),
-                "updated_at": now,
-            })
+            await self.repositories.update_campaign(
+                campaign["campaign_id"],
+                {
+                    "status": CampaignStatus.ACTIVE.value,
+                    "next_cycle_number": cycle_number + 1,
+                    "next_cycle_at": expected + timedelta(seconds=interval),
+                    "updated_at": now,
+                },
+            )
         else:
             # Single-post campaigns remain active until their end-time cleanup.
-            await self.repositories.update_campaign(campaign["campaign_id"], {
-                "status": CampaignStatus.ACTIVE.value,
-                "next_cycle_number": cycle_number + 1,
-                "next_cycle_at": end,
-                "updated_at": now,
-            })
+            await self.repositories.update_campaign(
+                campaign["campaign_id"],
+                {
+                    "status": CampaignStatus.ACTIVE.value,
+                    "next_cycle_number": cycle_number + 1,
+                    "next_cycle_at": end,
+                    "updated_at": now,
+                },
+            )
         return True
 
     async def extend(self, campaign_id: str, owner_id: int, seconds: int) -> Document:
@@ -207,17 +272,35 @@ class CampaignService:
             raise ValueError("Only archived campaigns can be duplicated.")
         now = utcnow()
         copied = {
-            key: value for key, value in original.items() if key in {
-                "name", "mode", "variants", "destinations", "target_selector", "delete_on_repost",
-                "delete_on_end", "owner_timezone", "repost_interval_seconds",
+            key: value
+            for key, value in original.items()
+            if key
+            in {
+                "name",
+                "mode",
+                "variants",
+                "destinations",
+                "target_selector",
+                "delete_on_repost",
+                "delete_on_end",
+                "owner_timezone",
+                "repost_interval_seconds",
             }
         }
-        copied.update({
-            "campaign_id": opaque_id("cmp"), "name": f"{original['name']} (copy)",
-            "status": CampaignStatus.DRAFT.value, "target_snapshot": [], "protected_destination_ids": [],
-            "cohort_map": {}, "created_by": owner_id, "created_at": now,
-            "derived_from_campaign_id": original["campaign_id"], "version": 1,
-        })
+        copied.update(
+            {
+                "campaign_id": opaque_id("cmp"),
+                "name": f"{original['name']} (copy)",
+                "status": CampaignStatus.DRAFT.value,
+                "target_snapshot": [],
+                "protected_destination_ids": [],
+                "cohort_map": {},
+                "created_by": owner_id,
+                "created_at": now,
+                "derived_from_campaign_id": original["campaign_id"],
+                "version": 1,
+            }
+        )
         await self.repositories.create_campaign(copied)
         return copied
 

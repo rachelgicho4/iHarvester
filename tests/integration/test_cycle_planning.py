@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from app.campaigns.models import Button, Creative, Destination
 from app.campaigns.service import CampaignService
 from app.campaigns.shuffle import cohort_map
 
@@ -46,11 +47,17 @@ async def test_2000_channel_cycle_is_bounded_excludes_destination_and_changes_or
     seed = b"x" * 32
     cohorts = cohort_map(target_ids, 3, b"c" * 32)
     campaign = {
-        "campaign_id": "cmp_test", "status": "ACTIVE", "mode": "MIX_ROTATE",
-        "start_at_utc": now - timedelta(seconds=1), "current_end_at_utc": now + timedelta(hours=3),
-        "repost_interval_seconds": 3600, "target_snapshot": target_ids,
+        "campaign_id": "cmp_test",
+        "status": "ACTIVE",
+        "mode": "MIX_ROTATE",
+        "start_at_utc": now - timedelta(seconds=1),
+        "current_end_at_utc": now + timedelta(hours=3),
+        "repost_interval_seconds": 3600,
+        "target_snapshot": target_ids,
         "cohort_map": {str(key): value for key, value in cohorts.items()},
-        "shuffle_seed": base64.urlsafe_b64encode(seed).decode(), "variants": [{}, {}, {}], "next_cycle_number": 0,
+        "shuffle_seed": base64.urlsafe_b64encode(seed).decode(),
+        "variants": [{}, {}, {}],
+        "next_cycle_number": 0,
     }
     repositories = MemoryRepositories(campaign, [{"telegram_chat_id": channel_id} for channel_id in source_ids])
     service = CampaignService(repositories, send_rps=20)
@@ -63,3 +70,40 @@ async def test_2000_channel_cycle_is_bounded_excludes_destination_and_changes_or
     second_order = [item["channel_id"] for item in sorted(second, key=lambda item: item["dispatch_rank"])]
     assert first_order != second_order
     assert max(delivery["cohort_index"] for delivery in second) == 2
+
+
+@pytest.mark.asyncio
+async def test_launch_summary_shows_exact_source_and_protected_destination_counts() -> None:
+    now = datetime.now(UTC)
+    creative = Creative(
+        id="var_1",
+        kind="TEXT",
+        text="Hello",
+        buttons=[Button(id="btn_1", text="Join", url="https://t.me/example")],
+    )
+    campaign = {
+        "campaign_id": "cmp_summary",
+        "status": "DRAFT",
+        "mode": "STANDARD",
+        "variants": [creative.model_dump(mode="json")],
+        "destinations": [Destination(display_name="Promoted", telegram_chat_id=-1002).model_dump(mode="json")],
+        "target_selector": {},
+        "start_at_utc": now + timedelta(minutes=1),
+        "current_end_at_utc": now + timedelta(hours=2),
+        "repost_interval_seconds": None,
+        "delete_on_repost": True,
+        "delete_on_end": True,
+        "owner_timezone": "UTC",
+        "preview_sent": True,
+    }
+    repositories = MemoryRepositories(
+        campaign,
+        [
+            {"telegram_chat_id": -1001},
+            {"telegram_chat_id": -1002},
+            {"telegram_chat_id": -1003},
+        ],
+    )
+    _, errors, source_count, protected_count, eligible_count = await CampaignService(repositories, send_rps=20).launch_summary("cmp_summary")
+    assert not errors
+    assert (source_count, protected_count, eligible_count) == (3, 1, 2)
