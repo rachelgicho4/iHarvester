@@ -13,7 +13,7 @@ from app.campaigns.shuffle import cohort_map, dispatch_rank, variant_for
 from app.campaigns.validation import protected_destination_ids, validate_launch
 from app.db.repositories import Document, Repositories
 from app.utils.ids import opaque_id
-from app.utils.time import utcnow
+from app.utils.time import as_utc, utcnow
 
 
 class CampaignService:
@@ -91,8 +91,8 @@ class CampaignService:
         variants = [Creative.model_validate(variant) for variant in campaign["variants"]]
         destinations = [Destination.model_validate(destination) for destination in campaign["destinations"]]
         schedule = Schedule(
-            start_at_utc=campaign["start_at_utc"],
-            end_at_utc=campaign["current_end_at_utc"],
+            start_at_utc=as_utc(campaign["start_at_utc"]),
+            end_at_utc=as_utc(campaign["current_end_at_utc"]),
             repost_interval_seconds=campaign.get("repost_interval_seconds"),
             delete_on_repost=campaign.get("delete_on_repost", True),
             delete_on_end=campaign.get("delete_on_end", True),
@@ -148,8 +148,8 @@ class CampaignService:
         variants = [Creative.model_validate(variant) for variant in campaign.get("variants", [])]
         destinations = [Destination.model_validate(destination) for destination in campaign.get("destinations", [])]
         schedule = Schedule(
-            start_at_utc=campaign["start_at_utc"],
-            end_at_utc=campaign["current_end_at_utc"],
+            start_at_utc=as_utc(campaign["start_at_utc"]),
+            end_at_utc=as_utc(campaign["current_end_at_utc"]),
             repost_interval_seconds=campaign.get("repost_interval_seconds"),
             delete_on_repost=campaign.get("delete_on_repost", True),
             delete_on_end=campaign.get("delete_on_end", True),
@@ -173,8 +173,8 @@ class CampaignService:
         """Materialize the one due cycle. Its fixed HMAC ranks make restart ordering reproducible."""
         if campaign["status"] not in {CampaignStatus.ACTIVE.value, CampaignStatus.SCHEDULED.value}:
             return False
-        start = campaign["start_at_utc"]
-        end = campaign["current_end_at_utc"]
+        start = as_utc(campaign["start_at_utc"])
+        end = as_utc(campaign["current_end_at_utc"])
         if now < start:
             return False
         if now >= end:
@@ -254,7 +254,7 @@ class CampaignService:
             raise ValueError("Only scheduled or active campaigns can be extended.")
         if seconds <= 0:
             raise ValueError("Extension must be positive.")
-        new_end = campaign["current_end_at_utc"] + timedelta(seconds=seconds)
+        new_end = as_utc(campaign["current_end_at_utc"]) + timedelta(seconds=seconds)
         event = {"at": utcnow(), "owner_id": owner_id, "seconds": seconds, "new_end_at_utc": new_end}
         await self.repositories.db.campaigns.update_one(
             {"campaign_id": campaign_id},

@@ -12,6 +12,9 @@ class Database:
             uri,
             serverSelectionTimeoutMS=5_000,
             tlsCAFile=certifi.where(),
+            # MongoDB stores UTC instants without a timezone marker.  Return
+            # them as UTC-aware datetimes so scheduler comparisons are valid.
+            tz_aware=True,
         )
         self.db = self.client[database_name]
 

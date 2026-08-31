@@ -1,8 +1,17 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from app.campaigns.models import Button
 from app.campaigns.scheduling import can_create_cycle, scheduled_cycle_time
-from app.telegram.handlers_owner import campaign_keyboard, content_type_keyboard, quick_duration_keyboard, quick_interval_keyboard
+from app.telegram.handlers_owner import (
+    OwnerHandlers,
+    campaign_keyboard,
+    content_type_keyboard,
+    parse_period_minutes,
+    quick_duration_keyboard,
+    quick_interval_keyboard,
+)
 from app.telegram.keyboards import auto_button_rows
 
 
@@ -38,9 +47,23 @@ def test_guided_creator_uses_callback_controls_not_pipe_delimited_commands() -> 
     assert {"CTA buttons", "Destinations", "Targets", "Plan for later", "Send campaign", "Delete draft", "Home"} <= set(campaign_controls)
 
 
-def test_quick_send_controls_offer_duration_and_safe_interval_choices() -> None:
+def test_quick_send_controls_offer_custom_duration_and_compatible_intervals() -> None:
     duration_controls = [item.text for row in quick_duration_keyboard("cmp").inline_keyboard for item in row]
-    interval_controls = [item.text for row in quick_interval_keyboard("cmp", 30 * 24 * 60, 0).inline_keyboard for item in row]
-    assert {"15 minutes", "1 day", "30 days", "Back", "Home"} <= set(duration_controls)
-    assert "Use safe default: every 24h" in interval_controls
-    assert "Post once" not in interval_controls
+    short_intervals = [item.text for row in quick_interval_keyboard("cmp", 15, 6).inline_keyboard for item in row]
+    thirty_minute_intervals = [item.text for row in quick_interval_keyboard("cmp", 30, 6).inline_keyboard for item in row]
+    assert {"15 minutes", "1 day", "30 days", "Custom duration", "Back", "Home"} <= set(duration_controls)
+    assert {"Post once only", "Every 5 minutes", "Custom interval"} <= set(short_intervals)
+    assert "Every 1 hour" not in short_intervals
+    assert {"Every 5 minutes", "Every 10 minutes", "Every 15 minutes"} <= set(thirty_minute_intervals)
+
+
+def test_custom_periods_and_reposts_require_clean_campaign_boundaries() -> None:
+    assert parse_period_minutes("45m", field="duration") == 45
+    assert parse_period_minutes("2h", field="duration") == 120
+    assert parse_period_minutes("3d", field="duration") == 4_320
+    assert parse_period_minutes("1mo", field="duration") == 43_200
+    OwnerHandlers._validate_repost_interval(30, 10)
+    with pytest.raises(ValueError, match="divide"):
+        OwnerHandlers._validate_repost_interval(30, 7)
+    with pytest.raises(ValueError, match="shorter"):
+        OwnerHandlers._validate_repost_interval(15, 60)

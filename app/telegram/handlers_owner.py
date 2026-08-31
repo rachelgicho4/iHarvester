@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -21,6 +23,9 @@ from app.telegram.handlers_admin_updates import refresh_channel, register_forwar
 from app.telegram.keyboards import home_keyboard
 from app.telegram.sender import TelegramSender
 from app.utils.ids import opaque_id
+from app.utils.time import as_utc
+
+logger = logging.getLogger(__name__)
 
 
 def _markup(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
@@ -32,6 +37,80 @@ def _navigation(back_callback: str = "home:back") -> list[list[InlineKeyboardBut
         InlineKeyboardButton(text="Back", callback_data=back_callback),
         InlineKeyboardButton(text="Home", callback_data="home:back"),
     ]]
+
+
+_PERIOD_UNITS = {
+    "m": 1, "min": 1, "mins": 1, "minute": 1, "minutes": 1,
+    "h": 60, "hr": 60, "hrs": 60, "hour": 60, "hours": 60,
+    "d": 24 * 60, "day": 24 * 60, "days": 24 * 60,
+    "mo": 30 * 24 * 60, "month": 30 * 24 * 60, "months": 30 * 24 * 60,
+}
+_INTERVAL_PRESET_MINUTES = (5, 10, 15, 30, 60, 120, 180, 240, 360, 480, 720, 1440)
+_SAFE_REPOST_MAX_MINUTES = 47 * 60
+
+
+def _period_label(minutes: int) -> str:
+    if minutes % (30 * 24 * 60) == 0:
+        value = minutes // (30 * 24 * 60)
+        return f"{value} month{'s' if value != 1 else ''}"
+    if minutes % (24 * 60) == 0:
+        value = minutes // (24 * 60)
+        return f"{value} day{'s' if value != 1 else ''}"
+    if minutes % 60 == 0:
+        value = minutes // 60
+        return f"{value} hour{'s' if value != 1 else ''}"
+    return f"{minutes} minute{'s' if minutes != 1 else ''}"
+
+
+def parse_period_minutes(raw: str, *, field: str) -> int:
+    """Parse short owner-entered periods; a month is deliberately 30 days."""
+    match = re.fullmatch(r"\s*(\d+)\s*([A-Za-z]+)\s*", raw)
+    if not match or match.group(2).lower() not in _PERIOD_UNITS:
+        raise ValueError(f"send {field} as a whole number with m, h, d, or mo (for example `45m`, `2h`, `3d`, or `1mo`)")
+    minutes = int(match.group(1)) * _PERIOD_UNITS[match.group(2).lower()]
+    if minutes < 1:
+        raise ValueError(f"{field} must be at least 1 minute")
+    return minutes
+
+
+def _valid_repost_minutes(duration_minutes: int) -> tuple[int, ...]:
+    return tuple(
+        interval for interval in _INTERVAL_PRESET_MINUTES
+        if interval < duration_minutes
+        and duration_minutes % interval == 0
+        and (duration_minutes <= _SAFE_REPOST_MAX_MINUTES or interval <= _SAFE_REPOST_MAX_MINUTES)
+    )
+
+
+def _interval_keyboard(
+    campaign_id: str,
+    duration_minutes: int,
+    *,
+    prefix: str,
+    back_callback: str,
+    preferred_minutes: int | None = None,
+) -> InlineKeyboardMarkup:
+    """Offer only repost periods that end exactly on a campaign boundary."""
+    rows: list[list[InlineKeyboardButton]] = []
+    valid = list(_valid_repost_minutes(duration_minutes))
+    if duration_minutes <= _SAFE_REPOST_MAX_MINUTES:
+        rows.append([InlineKeyboardButton(text="Post once only", callback_data=f"{prefix}:{campaign_id}:0")])
+    if preferred_minutes and preferred_minutes in valid:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"Use my preference: every {_period_label(preferred_minutes)}",
+                callback_data=f"{prefix}:{campaign_id}:{preferred_minutes}",
+            )
+        ])
+        valid.remove(preferred_minutes)
+    for offset in range(0, len(valid), 2):
+        rows.append([
+            InlineKeyboardButton(text=f"Every {_period_label(interval)}", callback_data=f"{prefix}:{campaign_id}:{interval}")
+            for interval in valid[offset : offset + 2]
+        ])
+    rows.append([InlineKeyboardButton(text="Custom interval", callback_data=f"{prefix}:{campaign_id}:custom")])
+    rows.extend(_navigation(back_callback))
+    return _markup(rows)
 
 
 def campaign_keyboard(campaign_id: str, status: str) -> InlineKeyboardMarkup:
@@ -132,21 +211,8 @@ def mode_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def schedule_interval_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
-    return _markup(
-        [
-            [
-                InlineKeyboardButton(text="Single post", callback_data=f"sch:{campaign_id}:0"),
-                InlineKeyboardButton(text="Every 6h", callback_data=f"sch:{campaign_id}:6"),
-            ],
-            [
-                InlineKeyboardButton(text="Every 12h", callback_data=f"sch:{campaign_id}:12"),
-                InlineKeyboardButton(text="Every 24h", callback_data=f"sch:{campaign_id}:24"),
-            ],
-            [InlineKeyboardButton(text="Custom interval", callback_data=f"sch:{campaign_id}:custom")],
-            * _navigation(f"c:{campaign_id}:open"),
-        ]
-    )
+def schedule_interval_keyboard(campaign_id: str, duration_minutes: int) -> InlineKeyboardMarkup:
+    return _interval_keyboard(campaign_id, duration_minutes, prefix="sint", back_callback=f"c:{campaign_id}:open")
 
 
 def target_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
@@ -175,27 +241,19 @@ def quick_duration_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="3 days", callback_data=f"dur:{campaign_id}:4320"),
          InlineKeyboardButton(text="7 days", callback_data=f"dur:{campaign_id}:10080")],
         [InlineKeyboardButton(text="30 days", callback_data=f"dur:{campaign_id}:43200")],
+        [InlineKeyboardButton(text="Custom duration", callback_data=f"dur:{campaign_id}:custom")],
         * _navigation(f"c:{campaign_id}:open"),
     ])
 
 
 def quick_interval_keyboard(campaign_id: str, duration_minutes: int, default_hours: int) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    default_text = "Post once" if default_hours == 0 else f"Use my default: every {default_hours}h"
-    if default_hours == 0 and duration_minutes > 47 * 60:
-        default_hours = 24
-        default_text = "Use safe default: every 24h"
-    rows.append([InlineKeyboardButton(text=default_text, callback_data=f"qint:{campaign_id}:{default_hours}")])
-    if duration_minutes <= 47 * 60:
-        rows.append([InlineKeyboardButton(text="Post once", callback_data=f"qint:{campaign_id}:0")])
-    rows.extend([
-        [InlineKeyboardButton(text="Every 1 hour", callback_data=f"qint:{campaign_id}:1"),
-         InlineKeyboardButton(text="Every 6 hours", callback_data=f"qint:{campaign_id}:6")],
-        [InlineKeyboardButton(text="Every 12 hours", callback_data=f"qint:{campaign_id}:12"),
-         InlineKeyboardButton(text="Every 24 hours", callback_data=f"qint:{campaign_id}:24")],
-        * _navigation(f"c:{campaign_id}:send"),
-    ])
-    return _markup(rows)
+    return _interval_keyboard(
+        campaign_id,
+        duration_minutes,
+        prefix="qmin",
+        back_callback=f"c:{campaign_id}:send",
+        preferred_minutes=default_hours * 60 if default_hours else None,
+    )
 
 
 class OwnerHandlers:
@@ -225,7 +283,7 @@ class OwnerHandlers:
     def _date(value: Any) -> str:
         if not value:
             return "Not set"
-        return value.astimezone(UTC).strftime("%d %b %Y, %H:%M UTC")
+        return as_utc(value).strftime("%d %b %Y, %H:%M UTC")
 
     async def _retire(self, query: CallbackQuery) -> None:
         """Disable the just-used control so old UI messages cannot drive stale workflows."""
@@ -519,15 +577,27 @@ class OwnerHandlers:
             elif data.startswith("dest:"):
                 _, campaign_id, action = data.split(":", 2)
                 await self._destination_action(query, campaign_id, action)
-            elif data.startswith("sch:"):
+            elif data.startswith("sint:"):
                 _, campaign_id, value = data.split(":", 2)
                 await self._schedule_interval(query, campaign_id, value)
+            elif data.startswith("sch:"):
+                # Compatibility with buttons emitted before intervals used
+                # minute-based callbacks. Those values were whole hours.
+                _, campaign_id, value = data.split(":", 2)
+                await self._schedule_interval(query, campaign_id, value if value == "custom" else str(int(value) * 60))
             elif data.startswith("dur:"):
-                _, campaign_id, minutes = data.split(":", 2)
-                await self._quick_duration(query, campaign_id, int(minutes))
+                _, campaign_id, value = data.split(":", 2)
+                if value == "custom":
+                    await self._custom_duration(query, campaign_id)
+                else:
+                    await self._quick_duration(query, campaign_id, int(value))
+            elif data.startswith("qmin:"):
+                _, campaign_id, value = data.split(":", 2)
+                await self._quick_interval(query, campaign_id, value)
             elif data.startswith("qint:"):
-                _, campaign_id, hours = data.split(":", 2)
-                await self._quick_interval(query, campaign_id, int(hours))
+                # Compatibility with old quick-send buttons, which encoded hours.
+                _, campaign_id, value = data.split(":", 2)
+                await self._quick_interval(query, campaign_id, value if value == "custom" else str(int(value) * 60))
             elif data.startswith("set:"):
                 _, action, value = data.split(":", 2)
                 await self._settings_action(query, action, value)
@@ -544,6 +614,9 @@ class OwnerHandlers:
                 await query.message.answer("That control has expired. Open the current screen again with /start.")
         except (ValueError, KeyError, ValidationError) as error:
             await query.message.answer(f"Could not complete that action: {error}")
+        except Exception:
+            logger.exception("Owner callback failed", extra={"callback_data": data, "owner_id": query.from_user.id})
+            await query.message.answer("Could not complete that action due to an internal error. Nothing was launched; please retry after the issue is fixed.")
         await query.answer()
 
     async def _home(self, query: CallbackQuery, action: str) -> None:
@@ -642,31 +715,7 @@ class OwnerHandlers:
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
             )
         elif action == "launch":
-            campaign, errors, source_count, protected_count, eligible_count = await self.campaigns.launch_summary(campaign_id)
-            if errors:
-                await query.message.answer(
-                    "Launch checklist\n\n" + "\n".join(f"- {error}" for error in errors), reply_markup=campaign_keyboard(campaign_id, campaign["status"])
-                )
-                return
-            interval = campaign.get("repost_interval_seconds")
-            await query.message.answer(
-                "Ready to launch\n\n"
-                f"This campaign will target {eligible_count} source channels.\n"
-                f"{protected_count} promoted destination channels are excluded automatically.\n"
-                f"Start: {self._date(campaign['start_at_utc'])}\n"
-                f"End: {self._date(campaign['current_end_at_utc'])}\n"
-                f"Repost: {'single post' if not interval else f'every {interval // 3600} hours'}\n"
-                f"Mode: {campaign['mode']} ({len(campaign['variants'])} creative{'s' if len(campaign['variants']) != 1 else ''})\n"
-                f"Active sources before destination protection: {source_count}",
-                reply_markup=_markup(
-                    [
-                        [
-                            InlineKeyboardButton(text="Launch now", callback_data=f"confirm:{campaign_id}:launch"),
-                            InlineKeyboardButton(text="Cancel", callback_data=f"c:{campaign_id}:open"),
-                        ],
-                    ]
-                ),
-            )
+            await self._show_launch_confirmation(query.message, campaign_id)
         elif action == "extend6":
             await self.campaigns.extend(campaign_id, query.from_user.id, 6 * 3600)
             await query.message.answer("Campaign extended by 6 hours.")
@@ -764,12 +813,43 @@ class OwnerHandlers:
         await self._show_button_editor(query.message, campaign, index)
 
     async def _preview_variant(self, query: CallbackQuery, campaign_id: str, index: int) -> None:
+        await self._send_preview(query.message, query.from_user.id, campaign_id, index)
+
+    async def _send_preview(self, message: Message, owner_id: int, campaign_id: str, index: int) -> None:
         campaign = await self.repositories.get_campaign(campaign_id)
         if not campaign or index >= len(campaign.get("variants", [])):
             raise ValueError("add a creative first")
-        await self.sender.send_variant(query.from_user.id, campaign["variants"][index])
+        await self.sender.send_variant(owner_id, campaign["variants"][index])
         await self.repositories.update_campaign(campaign_id, {"preview_sent": True, "updated_at": datetime.now(UTC)})
-        await query.message.answer("That is a real Telegram preview using the saved content and CTA keyboard.")
+        await message.answer("That is a real Telegram preview using the saved content and CTA keyboard.")
+
+    async def _show_launch_confirmation(self, message: Message, campaign_id: str) -> None:
+        campaign, errors, source_count, protected_count, eligible_count = await self.campaigns.launch_summary(campaign_id)
+        if errors:
+            await message.answer(
+                "Launch checklist\n\n" + "\n".join(f"- {error}" for error in errors),
+                reply_markup=campaign_keyboard(campaign_id, campaign["status"]),
+            )
+            return
+        interval = campaign.get("repost_interval_seconds")
+        await message.answer(
+            "Ready to launch\n\n"
+            f"This campaign will target {eligible_count} source channels.\n"
+            f"{protected_count} promoted destination channels are excluded automatically.\n"
+            f"Start: {self._date(campaign['start_at_utc'])}\n"
+            f"End: {self._date(campaign['current_end_at_utc'])}\n"
+            f"Repost: {'single post' if not interval else f'every {_period_label(interval // 60)}'}\n"
+            f"Mode: {campaign['mode']} ({len(campaign['variants'])} creative{'s' if len(campaign['variants']) != 1 else ''})\n"
+            f"Active sources before destination protection: {source_count}",
+            reply_markup=_markup(
+                [
+                    [
+                        InlineKeyboardButton(text="Launch now", callback_data=f"confirm:{campaign_id}:launch"),
+                        InlineKeyboardButton(text="Cancel", callback_data=f"c:{campaign_id}:open"),
+                    ],
+                ]
+            ),
+        )
 
     async def _show_destinations(self, message: Message, campaign: Document) -> None:
         destinations = campaign.get("destinations", [])
@@ -830,39 +910,88 @@ class OwnerHandlers:
         if not session or session.get("action") != "await_schedule_interval" or session.get("campaign_id") != campaign_id:
             raise ValueError("schedule entry expired; start again")
         if value == "custom":
-            await self.repositories.set_owner_session(query.from_user.id, {**session, "action": "await_schedule_hours"})
+            await self.repositories.set_owner_session(query.from_user.id, {**session, "action": "await_schedule_interval_custom"})
             await query.message.answer(
-                "Send the repost interval in whole hours (or `0` for a single post).",
+                "Send the repost interval, for example `5m`, `2h`, or `1d`. It must be shorter than the campaign and divide its duration exactly.",
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
             )
             return
-        await self._save_schedule(campaign_id, session["start"], session["end"], int(value))
+        interval_minutes = int(value)
+        duration_minutes = self._duration_minutes(session["start"], session["end"])
+        self._validate_repost_interval(duration_minutes, interval_minutes)
+        await self._save_schedule(campaign_id, session["start"], session["end"], interval_minutes)
         await self.repositories.clear_owner_session(query.from_user.id)
         await query.message.answer("Schedule saved.")
         await self._show_campaign(query.message, await self.repositories.get_campaign(campaign_id))
 
     async def _quick_duration(self, query: CallbackQuery, campaign_id: str, minutes: int) -> None:
+        await self._begin_quick_interval(query.from_user.id, query.message, campaign_id, minutes)
+
+    async def _custom_duration(self, query: CallbackQuery, campaign_id: str) -> None:
         await self.campaigns.editable_campaign(campaign_id)
+        await self.repositories.set_owner_session(query.from_user.id, {"action": "await_quick_duration", "campaign_id": campaign_id})
+        await query.message.answer(
+            "Send the campaign duration, for example `45m`, `2h`, `3d`, or `1mo`. One month is 30 days.",
+            reply_markup=_markup(_navigation(f"c:{campaign_id}:send")),
+        )
+
+    async def _begin_quick_interval(self, owner_id: int, message: Message, campaign_id: str, minutes: int) -> None:
+        await self.campaigns.editable_campaign(campaign_id)
+        if minutes < 1:
+            raise ValueError("campaign duration must be at least 1 minute")
         default_hours = int(await self.repositories.get_setting("quick_interval_hours", 6))
         await self.repositories.set_owner_session(
-            query.from_user.id,
+            owner_id,
             {"action": "await_quick_interval", "campaign_id": campaign_id, "duration_minutes": minutes},
         )
-        await query.message.answer(
-            f"Campaign end: {minutes} minutes after launch. Choose how often to replace the post.",
+        await message.answer(
+            f"Campaign duration: {_period_label(minutes)}. Choose a repost interval. The offered periods divide this duration exactly.",
             reply_markup=quick_interval_keyboard(campaign_id, minutes, default_hours),
         )
 
-    async def _quick_interval(self, query: CallbackQuery, campaign_id: str, hours: int) -> None:
+    async def _quick_interval(self, query: CallbackQuery, campaign_id: str, value: str) -> None:
         session = await self.repositories.owner_session(query.from_user.id)
         if not session or session.get("action") != "await_quick_interval" or session.get("campaign_id") != campaign_id:
             raise ValueError("send setup expired; open the campaign and choose Send campaign again")
+        if value == "custom":
+            await self.repositories.set_owner_session(query.from_user.id, {**session, "action": "await_quick_interval_custom"})
+            await query.message.answer(
+                "Send the repost interval, for example `5m`, `2h`, or `1d`. It must be shorter than the campaign and divide its duration exactly.",
+                reply_markup=_markup(_navigation(f"c:{campaign_id}:send")),
+            )
+            return
+        await self._complete_quick_send(query.from_user.id, query.message, campaign_id, int(session["duration_minutes"]), int(value))
+
+    async def _complete_quick_send(
+        self, owner_id: int, message: Message, campaign_id: str, duration_minutes: int, interval_minutes: int,
+    ) -> None:
+        self._validate_repost_interval(duration_minutes, interval_minutes)
         start = datetime.now(UTC)
-        end = start + timedelta(minutes=int(session["duration_minutes"]))
-        await self._save_schedule(campaign_id, start, end, hours)
-        await self.repositories.clear_owner_session(query.from_user.id)
-        await self._preview_variant(query, campaign_id, 0)
-        await self._campaign_action(query, campaign_id, "launch")
+        end = start + timedelta(minutes=duration_minutes)
+        await self._save_schedule(campaign_id, start, end, interval_minutes)
+        await self.repositories.clear_owner_session(owner_id)
+        await self._send_preview(message, owner_id, campaign_id, 0)
+        await self._show_launch_confirmation(message, campaign_id)
+
+    @staticmethod
+    def _duration_minutes(start: datetime, end: datetime) -> int:
+        minutes = int((as_utc(end) - as_utc(start)).total_seconds() // 60)
+        if minutes < 1:
+            raise ValueError("campaign duration must be at least 1 minute")
+        return minutes
+
+    @staticmethod
+    def _validate_repost_interval(duration_minutes: int, interval_minutes: int) -> None:
+        if interval_minutes == 0:
+            if duration_minutes > _SAFE_REPOST_MAX_MINUTES:
+                raise ValueError("campaigns over 47 hours need a repost interval for reliable cleanup")
+            return
+        if interval_minutes < 1 or interval_minutes >= duration_minutes:
+            raise ValueError("repost interval must be at least 1 minute and shorter than the campaign")
+        if duration_minutes % interval_minutes:
+            raise ValueError("repost interval must divide the campaign duration exactly")
+        if duration_minutes > _SAFE_REPOST_MAX_MINUTES and interval_minutes > _SAFE_REPOST_MAX_MINUTES:
+            raise ValueError("campaigns over 47 hours need a repost interval of 47 hours or less")
 
     async def _settings_action(self, query: CallbackQuery, action: str, value: str) -> None:
         if action == "timezone" and value in {"UTC", "Africa/Nairobi"}:
@@ -904,7 +1033,10 @@ class OwnerHandlers:
     async def _confirm(self, query: CallbackQuery, campaign_id: str, action: str) -> None:
         if action == "launch":
             activated = await self.campaigns.activate(campaign_id)
-            await query.message.answer(f"{activated['name']} is now {activated['status']}. It targets {len(activated['target_snapshot'])} source channels.")
+            await query.message.answer(
+                f"{activated['name']} is now {activated['status']}. It targets {len(activated['target_snapshot'])} source channels. "
+                "The first deliveries are being queued now and normally appear within a few seconds."
+            )
             await self._show_campaign(query.message, activated)
         elif action == "end":
             changed = await self.campaigns.end_early(campaign_id)
@@ -1045,15 +1177,34 @@ class OwnerHandlers:
             await self.repositories.set_owner_session(
                 owner_id, {"action": "await_schedule_interval", "campaign_id": campaign_id, "start": session["start"], "end": end}
             )
-            await message.answer("How often should the post be replaced?", reply_markup=schedule_interval_keyboard(campaign_id))
+            duration_minutes = self._duration_minutes(session["start"], end)
+            await message.answer(
+                "How often should the post be replaced? The offered periods divide the campaign duration exactly.",
+                reply_markup=schedule_interval_keyboard(campaign_id, duration_minutes),
+            )
         elif action == "await_schedule_hours":
+            # Complete a short-lived session created by a previous deployment.
             hours = int((message.text or "").strip())
             if hours < 0:
                 raise ValueError("interval cannot be negative")
-            await self._save_schedule(campaign_id, session["start"], session["end"], hours)
+            await self._save_schedule(campaign_id, session["start"], session["end"], hours * 60)
             await self.repositories.clear_owner_session(owner_id)
             await message.answer("Schedule saved.")
             await self._show_campaign(message, await self.repositories.get_campaign(campaign_id))
+        elif action == "await_schedule_interval_custom":
+            interval_minutes = parse_period_minutes(message.text or "", field="repost interval")
+            duration_minutes = self._duration_minutes(session["start"], session["end"])
+            self._validate_repost_interval(duration_minutes, interval_minutes)
+            await self._save_schedule(campaign_id, session["start"], session["end"], interval_minutes)
+            await self.repositories.clear_owner_session(owner_id)
+            await message.answer("Schedule saved.")
+            await self._show_campaign(message, await self.repositories.get_campaign(campaign_id))
+        elif action == "await_quick_duration":
+            duration_minutes = parse_period_minutes(message.text or "", field="campaign duration")
+            await self._begin_quick_interval(owner_id, message, campaign_id, duration_minutes)
+        elif action == "await_quick_interval_custom":
+            interval_minutes = parse_period_minutes(message.text or "", field="repost interval")
+            await self._complete_quick_send(owner_id, message, campaign_id, int(session["duration_minutes"]), interval_minutes)
         elif action == "await_test_channel":
             campaign = await self.repositories.get_campaign(campaign_id)
             if not campaign or not campaign.get("variants"):
@@ -1198,8 +1349,10 @@ class OwnerHandlers:
         await self.repositories.clear_owner_session(message.from_user.id)
         await message.answer("Target selection saved. Destination channels will remain protected.")
 
-    async def _save_schedule(self, campaign_id: str, start: datetime, end: datetime, hours: int) -> None:
-        interval = hours * 3600 or None
+    async def _save_schedule(self, campaign_id: str, start: datetime, end: datetime, interval_minutes: int) -> None:
+        interval = interval_minutes * 60 or None
+        start = as_utc(start)
+        end = as_utc(end)
         await self.campaigns.editable_campaign(campaign_id)
         timezone = await self.repositories.get_setting("owner_timezone", "UTC")
         await self.repositories.update_campaign(

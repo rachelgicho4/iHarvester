@@ -107,3 +107,28 @@ async def test_launch_summary_shows_exact_source_and_protected_destination_count
     _, errors, source_count, protected_count, eligible_count = await CampaignService(repositories, send_rps=20).launch_summary("cmp_summary")
     assert not errors
     assert (source_count, protected_count, eligible_count) == (3, 1, 2)
+
+
+@pytest.mark.asyncio
+async def test_activate_accepts_legacy_naive_mongo_timestamps() -> None:
+    now = datetime.now(UTC)
+    creative = Creative(id="var_1", kind="TEXT", text="Hello")
+    campaign = {
+        "campaign_id": "cmp_naive_dates",
+        "status": "DRAFT",
+        "mode": "STANDARD",
+        "variants": [creative.model_dump(mode="json")],
+        "destinations": [],
+        "target_selector": {},
+        # PyMongo returned this form before tz_aware=True was configured.
+        "start_at_utc": (now - timedelta(minutes=1)).replace(tzinfo=None),
+        "current_end_at_utc": (now + timedelta(hours=1)).replace(tzinfo=None),
+        "repost_interval_seconds": None,
+        "delete_on_repost": True,
+        "delete_on_end": True,
+        "preview_sent": True,
+    }
+    repositories = MemoryRepositories(campaign, [{"telegram_chat_id": -1001}])
+    activated = await CampaignService(repositories, send_rps=20).activate("cmp_naive_dates")
+    assert activated["status"] == "ACTIVE"
+    assert activated["target_snapshot"] == [-1001]
