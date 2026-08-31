@@ -70,11 +70,12 @@ class Repositories:
         return await self.db.channels.count_documents(query)
 
     async def channel_status_counts(self) -> Document:
-        rows = await self.db.channels.aggregate(
+        cursor = await self.db.channels.aggregate(
             [
                 {"$group": {"_id": "$status", "count": {"$sum": 1}}},
             ]
-        ).to_list(None)
+        )
+        rows = await cursor.to_list(None)
         return {row["_id"]: row["count"] for row in rows if row.get("_id")}
 
     async def list_channels(self, status: str | None = None, *, skip: int = 0, limit: int = 10) -> list[Document]:
@@ -269,12 +270,13 @@ class Repositories:
         return outstanding == 0
 
     async def delivery_summary(self, campaign_id: str, cycle_number: int) -> Document:
-        rows = await self.db.deliveries.aggregate(
+        cursor = await self.db.deliveries.aggregate(
             [
                 {"$match": {"campaign_id": campaign_id, "cycle_number": cycle_number}},
                 {"$group": {"_id": "$status", "count": {"$sum": 1}}},
             ]
-        ).to_list(None)
+        )
+        rows = await cursor.to_list(None)
         return {item["_id"]: item["count"] for item in rows}
 
     async def failed_deliveries(self, campaign_id: str, cycle_number: int, *, limit: int = 20) -> list[Document]:
@@ -344,11 +346,12 @@ class Repositories:
         return await self.db.campaigns.find({}).sort("updated_at", -1).limit(limit).to_list(limit)
 
     async def campaign_status_counts(self) -> Document:
-        rows = await self.db.campaigns.aggregate(
+        cursor = await self.db.campaigns.aggregate(
             [
                 {"$group": {"_id": "$status", "count": {"$sum": 1}}},
             ]
-        ).to_list(None)
+        )
+        rows = await cursor.to_list(None)
         return {row["_id"]: row["count"] for row in rows if row.get("_id")}
 
     async def save_pending_restore(self, restore_id: str, owner_id: int, backup: Document) -> None:
