@@ -100,6 +100,7 @@ class CampaignService:
         )
         sources = await self.repositories.active_channels(campaign.get("target_selector"))
         source_ids = {source["telegram_chat_id"] for source in sources}
+        now = utcnow()
         errors = validate_launch(
             variants=variants,
             destinations=destinations,
@@ -109,6 +110,8 @@ class CampaignService:
             preview_sent=bool(campaign.get("preview_sent")),
             send_rps=self.send_rps,
         )
+        if schedule.end_at_utc <= now:
+            errors.append("Campaign end time has already passed. Set a new schedule before launching.")
         if errors:
             raise ValueError(" ".join(errors))
         protected = protected_destination_ids(destinations)
@@ -116,7 +119,6 @@ class CampaignService:
         cohort_seed = secrets.token_bytes(32)
         shuffle_seed = secrets.token_bytes(32)
         cohorts = cohort_map(target_snapshot, len(variants), cohort_seed)
-        now = utcnow()
         status = CampaignStatus.SCHEDULED if schedule.start_at_utc > now else CampaignStatus.ACTIVE
         update = {
             "status": status.value,
@@ -167,6 +169,8 @@ class CampaignService:
             preview_sent=bool(campaign.get("preview_sent")),
             send_rps=self.send_rps,
         )
+        if schedule.end_at_utc <= utcnow():
+            errors.append("Campaign end time has already passed. Set a new schedule before launching.")
         return campaign, errors, len(source_ids), len(protected), len(source_ids - protected)
 
     async def plan_due_cycle(self, campaign: Document, now: Any) -> bool:
