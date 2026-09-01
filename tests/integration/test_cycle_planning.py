@@ -15,6 +15,8 @@ class MemoryRepositories:
         self.cycles = []
         self.deliveries = []
         self.ending = []
+        self.paused_deliveries = 0
+        self.resumed_deliveries = 0
 
     async def active_channels(self, selector):
         return self.sources
@@ -36,6 +38,14 @@ class MemoryRepositories:
     async def mark_campaign_ending(self, campaign_id, reason):
         self.ending.append(reason)
         return True
+
+    async def pause_campaign_deliveries(self, campaign_id):
+        self.paused_deliveries += 1
+        return 0
+
+    async def resume_campaign_deliveries(self, campaign_id):
+        self.resumed_deliveries += 1
+        return 0
 
 
 @pytest.mark.asyncio
@@ -161,3 +171,26 @@ async def test_specific_repost_times_create_only_the_requested_cycles() -> None:
     assert await service.plan_due_cycle(campaign, start + timedelta(days=4, seconds=1))
     assert [cycle["cycle_number"] for cycle in repositories.cycles] == [0, 1, 2]
     assert not await service.plan_due_cycle(campaign, start + timedelta(days=5))
+
+
+@pytest.mark.asyncio
+async def test_pause_and_resume_hold_work_and_extend_the_campaign_window(monkeypatch) -> None:
+    now = datetime(2026, 1, 1, 12, tzinfo=UTC)
+    campaign = {
+        "campaign_id": "cmp_pause",
+        "status": "ACTIVE",
+        "start_at_utc": now - timedelta(hours=1),
+        "current_end_at_utc": now + timedelta(hours=1),
+    }
+    repositories = MemoryRepositories(campaign, [])
+    service = CampaignService(repositories, send_rps=20)
+    clock = iter([now, now + timedelta(minutes=30)])
+    monkeypatch.setattr("app.campaigns.service.utcnow", lambda: next(clock))
+
+    paused = await service.pause("cmp_pause", owner_id=7)
+    assert paused["status"] == "PAUSED"
+    resumed = await service.resume("cmp_pause", owner_id=7)
+
+    assert resumed["status"] == "ACTIVE"
+    assert resumed["current_end_at_utc"] == now + timedelta(hours=1, minutes=30)
+    assert repositories.paused_deliveries == repositories.resumed_deliveries == 1

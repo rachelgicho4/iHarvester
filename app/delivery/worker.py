@@ -46,7 +46,9 @@ class DeliveryWorker:
             return
         campaign = await self.repositories.get_campaign(delivery["campaign_id"])
         if not campaign or campaign["status"] != "ACTIVE":
-            await self.repositories.complete_delivery(delivery["_id"], DeliveryStatus.CANCELLED)
+            await self.repositories.complete_delivery(
+                delivery["_id"], DeliveryStatus.PAUSED if campaign and campaign["status"] == "PAUSED" else DeliveryStatus.CANCELLED
+            )
             return
         channel = await self.repositories.get_channel(delivery["channel_id"])
         if not channel or channel.get("status") != ChannelStatus.ACTIVE.value or not channel.get("permissions", {}).get("can_post_messages"):
@@ -74,7 +76,9 @@ class DeliveryWorker:
         # A campaign may enter ENDING while a worker was waiting for a limiter token.
         campaign = await self.repositories.get_campaign(delivery["campaign_id"])
         if not campaign or campaign["status"] != "ACTIVE":
-            await self.repositories.complete_delivery(delivery["_id"], DeliveryStatus.CANCELLED)
+            await self.repositories.complete_delivery(
+                delivery["_id"], DeliveryStatus.PAUSED if campaign and campaign["status"] == "PAUSED" else DeliveryStatus.CANCELLED
+            )
             return
         try:
             await self.send_limiter.acquire()
@@ -98,7 +102,9 @@ class DeliveryWorker:
                 await self.mutation_limiter.acquire()
                 await self.sender.delete_messages(delivery["channel_id"], result.message_ids)
             finally:
-                await self.repositories.complete_delivery(delivery["_id"], DeliveryStatus.CANCELLED)
+                await self.repositories.complete_delivery(
+                    delivery["_id"], DeliveryStatus.PAUSED if campaign and campaign["status"] == "PAUSED" else DeliveryStatus.CANCELLED
+                )
             return
         await self.repositories.save_live_state(
             delivery["campaign_id"], delivery["channel_id"], delivery["cycle_number"],

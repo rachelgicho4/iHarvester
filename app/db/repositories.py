@@ -206,6 +206,9 @@ class Repositories:
     async def clear_live_state(self, campaign_id: str, channel_id: int) -> None:
         await self.db.campaign_channel_state.delete_one({"campaign_id": campaign_id, "channel_id": channel_id})
 
+    async def clear_campaign_live_states(self, campaign_id: str) -> None:
+        await self.db.campaign_channel_state.delete_many({"campaign_id": campaign_id})
+
     async def live_states(self, campaign_id: str) -> list[Document]:
         return await self.db.campaign_channel_state.find({"campaign_id": campaign_id}).to_list(None)
 
@@ -217,16 +220,46 @@ class Repositories:
 
     async def mark_campaign_ending(self, campaign_id: str, reason: str) -> bool:
         result = await self.db.campaigns.update_one(
-            {"campaign_id": campaign_id, "status": {"$in": ["SCHEDULED", "ACTIVE"]}},
+            {"campaign_id": campaign_id, "status": {"$in": ["SCHEDULED", "ACTIVE", "PAUSED"]}},
             {"$set": {"status": "ENDING", "end_reason": reason, "ending_at": utcnow()}},
+        )
+        return result.modified_count == 1
+
+    async def mark_retained_campaign_ending(self, campaign_id: str) -> bool:
+        """Reopen an intentionally retained archived post for safe cleanup."""
+        result = await self.db.campaigns.update_one(
+            {"campaign_id": campaign_id, "status": "ARCHIVED", "delete_on_end": False},
+            {
+                "$set": {
+                    "status": "ENDING",
+                    "delete_on_end": True,
+                    "end_reason": "retained_posts_cleanup",
+                    "ending_at": utcnow(),
+                    "updated_at": utcnow(),
+                }
+            },
         )
         return result.modified_count == 1
 
     async def cancel_pending_campaign_deliveries(self, campaign_id: str) -> None:
         await self.db.deliveries.update_many(
-            {"campaign_id": campaign_id, "status": {"$in": ["PENDING", "RETRY_WAIT"]}},
+            {"campaign_id": campaign_id, "status": {"$in": ["PENDING", "RETRY_WAIT", "PAUSED"]}},
             {"$set": {"status": DeliveryStatus.CANCELLED.value, "updated_at": utcnow()}},
         )
+
+    async def pause_campaign_deliveries(self, campaign_id: str) -> int:
+        result = await self.db.deliveries.update_many(
+            {"campaign_id": campaign_id, "status": {"$in": ["PENDING", "RETRY_WAIT"]}},
+            {"$set": {"status": DeliveryStatus.PAUSED.value, "updated_at": utcnow()}},
+        )
+        return result.modified_count
+
+    async def resume_campaign_deliveries(self, campaign_id: str) -> int:
+        result = await self.db.deliveries.update_many(
+            {"campaign_id": campaign_id, "status": DeliveryStatus.PAUSED.value},
+            {"$set": {"status": DeliveryStatus.PENDING.value, "next_retry_at": None, "updated_at": utcnow()}},
+        )
+        return result.modified_count
 
     async def materialize_cleanup_deliveries(self, campaign_id: str) -> int:
         states = await self.live_states(campaign_id)
@@ -278,6 +311,19 @@ class Repositories:
         )
         rows = await cursor.to_list(None)
         return {item["_id"]: item["count"] for item in rows}
+
+    async def campaign_delivery_totals(self, campaign_id: str) -> Document:
+        cursor = await self.db.deliveries.aggregate(
+            [
+                {"$match": {"campaign_id": campaign_id}},
+                {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+            ]
+        )
+        rows = await cursor.to_list(None)
+        return {item["_id"]: item["count"] for item in rows}
+
+    async def campaign_cycle_count(self, campaign_id: str) -> int:
+        return await self.db.campaign_cycles.count_documents({"campaign_id": campaign_id})
 
     async def failed_deliveries(self, campaign_id: str, cycle_number: int, *, limit: int = 20) -> list[Document]:
         return (

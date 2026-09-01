@@ -45,8 +45,10 @@ def test_custom_rows_are_respected() -> None:
 def test_guided_creator_uses_callback_controls_not_pipe_delimited_commands() -> None:
     content_controls = [item.text for row in content_type_keyboard("cmp").inline_keyboard for item in row]
     campaign_controls = [item.text for row in campaign_keyboard("cmp", "DRAFT").inline_keyboard for item in row]
+    archived_controls = [item.text for row in campaign_keyboard("cmp", "ARCHIVED").inline_keyboard for item in row]
     assert {"Text", "Photo", "Photo + caption", "Video", "Video + caption", "Forward ready post"} <= set(content_controls)
     assert {"CTA buttons", "Destinations", "Targets", "Plan for later", "Send campaign", "Delete draft", "Home"} <= set(campaign_controls)
+    assert {"Duplicate / Run Again", "View campaign report", "Delete retained posts"} <= set(archived_controls)
 
 
 def test_quick_send_controls_offer_custom_duration_and_compatible_intervals() -> None:
@@ -59,15 +61,17 @@ def test_quick_send_controls_offer_custom_duration_and_compatible_intervals() ->
     assert {"Every 5 minutes", "Every 10 minutes", "Every 15 minutes"} <= set(thirty_minute_intervals)
 
 
-def test_custom_periods_and_reposts_require_clean_campaign_boundaries() -> None:
+def test_custom_periods_and_reposts_fit_the_campaign_window() -> None:
     assert parse_period_minutes("45m", field="duration") == 45
     assert parse_period_minutes("2h", field="duration") == 120
     assert parse_period_minutes("3d", field="duration") == 4_320
     assert parse_period_minutes("1mo", field="duration") == 43_200
     assert parse_repost_offsets_minutes("1d, 4d, 6d", duration_minutes=7 * 24 * 60) == [1_440, 5_760, 8_640]
     assert parse_repost_gaps_minutes("1d, 3d, 2d", duration_minutes=7 * 24 * 60) == [1_440, 5_760, 8_640]
+    # A requested five-day next gap with only three days left is fitted to a
+    # final post shortly before the campaign finishes instead of rejecting it.
+    assert parse_repost_gaps_minutes("4d, 5d", duration_minutes=7 * 24 * 60) == [5_760, 10_020]
     OwnerHandlers._validate_repost_interval(30, 10)
-    with pytest.raises(ValueError, match="divide"):
-        OwnerHandlers._validate_repost_interval(30, 7)
+    OwnerHandlers._validate_repost_interval(30, 7)
     with pytest.raises(ValueError, match="shorter"):
         OwnerHandlers._validate_repost_interval(15, 60)

@@ -52,6 +52,10 @@ class Scheduler:
 
     async def _finish_ending_campaign(self, campaign: dict[str, Any]) -> None:
         await self.repositories.cancel_pending_campaign_deliveries(campaign["campaign_id"])
-        await self.repositories.materialize_cleanup_deliveries(campaign["campaign_id"])
+        if campaign.get("delete_on_end", True):
+            await self.repositories.materialize_cleanup_deliveries(campaign["campaign_id"])
+        # When retention was chosen, the live state is deliberately retained:
+        # it is the exact campaign-scoped record required if the owner later
+        # uses "Delete retained posts". It is not shared with other campaigns.
         if await self.repositories.cleanup_is_complete(campaign["campaign_id"]):
             await self.repositories.mark_campaign_archived(campaign["campaign_id"], campaign.get("end_reason", "ended"))

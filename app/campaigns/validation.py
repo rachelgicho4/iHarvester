@@ -27,8 +27,8 @@ def validate_launch(
     errors: list[str] = []
     if not variants:
         errors.append("Add at least one replayable creative variant.")
-    if mode == CampaignMode.MIX_ROTATE and len(variants) < 2:
-        errors.append("Mix + Rotate requires at least two variants.")
+    if mode != CampaignMode.STANDARD and len(variants) < 2:
+        errors.append("Rotate and Mix + Rotate require at least two variants.")
     if schedule.start_at_utc >= schedule.end_at_utc:
         errors.append("Start time must be before end time.")
     protected = protected_destination_ids(destinations)

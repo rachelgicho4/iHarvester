@@ -34,6 +34,9 @@ class CampaignService:
             "target_snapshot": [],
             "protected_destination_ids": [],
             "cohort_map": {},
+            # This default is explicit so a choice made before scheduling is
+            # not lost when the schedule is later saved.
+            "delete_on_end": True,
             "created_by": owner_id,
             "created_at": now,
             "version": 1,
@@ -300,7 +303,49 @@ class CampaignService:
         return campaign
 
     async def end_early(self, campaign_id: str) -> bool:
+        # Owner-requested stop always means stop and delete this campaign's
+        # known live messages, even if its normal end behavior was "keep".
+        await self.repositories.update_campaign(campaign_id, {"delete_on_end": True, "updated_at": utcnow()})
         return await self.repositories.mark_campaign_ending(campaign_id, "ended_early")
+
+    async def pause(self, campaign_id: str, owner_id: int) -> Document:
+        campaign = await self.repositories.get_campaign(campaign_id)
+        if not campaign or campaign["status"] not in {CampaignStatus.ACTIVE.value, CampaignStatus.SCHEDULED.value}:
+            raise ValueError("Only active or scheduled campaigns can be paused.")
+        now = utcnow()
+        await self.repositories.pause_campaign_deliveries(campaign_id)
+        await self.repositories.update_campaign(
+            campaign_id,
+            {"status": CampaignStatus.PAUSED.value, "paused_at": now, "paused_by": owner_id, "updated_at": now},
+        )
+        campaign.update({"status": CampaignStatus.PAUSED.value, "paused_at": now})
+        return campaign
+
+    async def resume(self, campaign_id: str, owner_id: int) -> Document:
+        campaign = await self.repositories.get_campaign(campaign_id)
+        if not campaign or campaign["status"] != CampaignStatus.PAUSED.value:
+            raise ValueError("Only paused campaigns can be resumed.")
+        now = utcnow()
+        paused_at = as_utc(campaign["paused_at"])
+        freeze_seconds = max(0, int((now - paused_at).total_seconds()))
+        start = as_utc(campaign["start_at_utc"]) + timedelta(seconds=freeze_seconds)
+        end = as_utc(campaign["current_end_at_utc"]) + timedelta(seconds=freeze_seconds)
+        status = CampaignStatus.SCHEDULED if start > now else CampaignStatus.ACTIVE
+        await self.repositories.resume_campaign_deliveries(campaign_id)
+        await self.repositories.update_campaign(
+            campaign_id,
+            {
+                "status": status.value,
+                "start_at_utc": start,
+                "current_end_at_utc": end,
+                "paused_at": None,
+                "last_resumed_by": owner_id,
+                "last_freeze_seconds": freeze_seconds,
+                "updated_at": now,
+            },
+        )
+        campaign.update({"status": status.value, "start_at_utc": start, "current_end_at_utc": end, "paused_at": None})
+        return campaign
 
     async def duplicate(self, campaign_id: str, owner_id: int) -> Document:
         original = await self.repositories.get_campaign(campaign_id)
