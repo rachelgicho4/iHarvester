@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from math import ceil
 from typing import Any
@@ -17,7 +19,7 @@ from pydantic import ValidationError
 
 from app.backups.export import make_backup
 from app.backups.restore import parse_backup, restore_backup
-from app.campaigns.models import Button, CampaignMode, CampaignStatus, Creative, Destination
+from app.campaigns.models import Button, CampaignMode, CampaignStatus, ChannelStatus, Creative, Destination
 from app.campaigns.service import CampaignService
 from app.db.repositories import Document, Repositories
 from app.telegram.formatting import capture_creative
@@ -66,6 +68,35 @@ _SAFE_REPOST_MAX_MINUTES = 47 * 60
 _MAX_VARIANTS = 20
 _MAX_DESTINATIONS = 20
 _MAX_CTA_BUTTONS = 20
+
+
+async def refresh_attention_channels(bot: Bot, repositories: Repositories, *, concurrency: int = 6) -> dict[str, int]:
+    """Re-verify the current attention queue without touching manual pauses."""
+    chat_ids = await repositories.channel_ids_by_status(ChannelStatus.NEEDS_ATTENTION.value)
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def verify(chat_id: int) -> str:
+        async with semaphore:
+            try:
+                await refresh_channel(bot, repositories, chat_id)
+                channel = await repositories.get_channel(chat_id)
+                return str(channel.get("status", ChannelStatus.NEEDS_ATTENTION.value)) if channel else "MISSING"
+            except Exception:
+                logger.exception("Bulk channel refresh failed", extra={"telegram_chat_id": chat_id})
+                return ChannelStatus.NEEDS_ATTENTION.value
+
+    statuses = Counter(await asyncio.gather(*(verify(chat_id) for chat_id in chat_ids)))
+    return {
+        "checked": len(chat_ids),
+        "active": statuses[ChannelStatus.ACTIVE.value],
+        "needs_attention": statuses[ChannelStatus.NEEDS_ATTENTION.value],
+        "unavailable": statuses[ChannelStatus.UNAVAILABLE.value],
+        "other": sum(
+            count
+            for status, count in statuses.items()
+            if status not in {ChannelStatus.ACTIVE.value, ChannelStatus.NEEDS_ATTENTION.value, ChannelStatus.UNAVAILABLE.value}
+        ),
+    }
 
 
 def _period_label(minutes: int) -> str:
@@ -217,6 +248,7 @@ def campaign_keyboard(campaign_id: str, status: str, *, variant_count: int = 0, 
         ]
         if has_live_posts:
             rows.append([InlineKeyboardButton(text="Delete retained posts", callback_data=f"c:{campaign_id}:cleanup")])
+        rows.append([InlineKeyboardButton(text="Delete campaign history", callback_data=f"c:{campaign_id}:delete")])
         rows.append(
             [
                 InlineKeyboardButton(text="Campaigns", callback_data="home:campaigns:0"),
@@ -731,10 +763,10 @@ class OwnerHandlers:
             campaign_keyboard(campaign["campaign_id"], status, variant_count=len(variants), has_live_posts=live_count > 0),
         )
 
-    async def _show_network(self, message: Message) -> None:
+    async def _show_network(self, message: Message, *, notice: str | None = None) -> None:
         counts = await self.repositories.channel_status_counts()
         text = (
-            "Network registry\n\n"
+            (f"{notice}\n\n" if notice else "") + "Network registry\n\n"
             f"Active: {counts.get('ACTIVE', 0)}\n"
             f"Needs attention: {counts.get('NEEDS_ATTENTION', 0)}\n"
             f"Unavailable: {counts.get('UNAVAILABLE', 0)}\n"
@@ -742,23 +774,35 @@ class OwnerHandlers:
             f"Total discovered: {sum(counts.values())}\n\n"
             "Add me as a channel admin to register automatically, or forward a channel post here to repair/register it."
         )
+        controls = [
+            [
+                InlineKeyboardButton(text=f"Active ({counts.get('ACTIVE', 0)})", callback_data="net:list:ACTIVE:0"),
+                InlineKeyboardButton(text=f"Attention ({counts.get('NEEDS_ATTENTION', 0)})", callback_data="net:list:NEEDS_ATTENTION:0"),
+            ],
+            [
+                InlineKeyboardButton(text=f"Unavailable ({counts.get('UNAVAILABLE', 0)})", callback_data="net:list:UNAVAILABLE:0"),
+                InlineKeyboardButton(text=f"Paused ({counts.get('INACTIVE_MANUAL', 0)})", callback_data="net:list:INACTIVE_MANUAL:0"),
+            ],
+        ]
+        if counts.get("NEEDS_ATTENTION", 0):
+            controls.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"Refresh all attention ({counts.get('NEEDS_ATTENTION', 0)})",
+                        callback_data="net:refresh_attention",
+                    )
+                ]
+            )
+        controls.extend(
+            [
+                [InlineKeyboardButton(text="Forward post to register", callback_data="net:forward")],
+                [InlineKeyboardButton(text="Back", callback_data="home:back")],
+            ]
+        )
         await self._render(
             message,
             text,
-            _markup(
-                [
-                    [
-                        InlineKeyboardButton(text=f"Active ({counts.get('ACTIVE', 0)})", callback_data="net:list:ACTIVE:0"),
-                        InlineKeyboardButton(text=f"Attention ({counts.get('NEEDS_ATTENTION', 0)})", callback_data="net:list:NEEDS_ATTENTION:0"),
-                    ],
-                    [
-                        InlineKeyboardButton(text=f"Unavailable ({counts.get('UNAVAILABLE', 0)})", callback_data="net:list:UNAVAILABLE:0"),
-                        InlineKeyboardButton(text=f"Paused ({counts.get('INACTIVE_MANUAL', 0)})", callback_data="net:list:INACTIVE_MANUAL:0"),
-                    ],
-                    [InlineKeyboardButton(text="Forward post to register", callback_data="net:forward")],
-                    [InlineKeyboardButton(text="Back", callback_data="home:back")],
-                ]
-            ),
+            _markup(controls),
         )
 
     async def _show_network_list(self, message: Message, status: str, page: int) -> None:
@@ -781,6 +825,8 @@ class OwnerHandlers:
             username = f"@{channel['username']}" if channel.get("username") else "private"
             lines.append(f"{index}. {channel.get('title', channel['telegram_chat_id'])}\n   {username} | {channel.get('member_count', '?')} members")
             controls.append([InlineKeyboardButton(text=f"Open channel {index}", callback_data=f"chan:{channel['telegram_chat_id']}:view")])
+        if status == ChannelStatus.NEEDS_ATTENTION.value:
+            controls.append([InlineKeyboardButton(text="Refresh all attention", callback_data="net:refresh_attention")])
         nav: list[InlineKeyboardButton] = []
         if page:
             nav.append(InlineKeyboardButton(text="Previous", callback_data=f"net:list:{status}:{page - 1}"))
@@ -964,7 +1010,12 @@ class OwnerHandlers:
                 _, campaign_id, index = data.split(":", 2)
                 await self._preview_variant(query, campaign_id, int(index))
             elif data.startswith("net:"):
-                await self._network_action(query, data)
+                if data == "net:refresh_attention":
+                    try:
+                        await query.answer("Refreshing channels…")
+                    except Exception:
+                        logger.warning("Could not acknowledge bulk refresh callback")
+                await self._network_action(query, bot, data)
             elif data.startswith("chan:"):
                 _, chat_id, action = data.split(":", 2)
                 await self._channel_action(query, bot, int(chat_id), action)
@@ -1025,13 +1076,17 @@ class OwnerHandlers:
             await query.message.answer(f"Could not complete that action: {error}", reply_markup=self._recovery_keyboard(data))
         except Exception:
             logger.exception("Owner callback failed", extra={"callback_data": data, "owner_id": query.from_user.id})
+            network_action = data.startswith(("net:", "chan:", "reg:"))
             await query.message.answer(
-                "I could not confirm that action because of an internal error. "
+                "I could not complete that network action because of an internal error. Return to Network and retry."
+                if network_action
+                else "I could not confirm that action because of an internal error. "
                 "Open the campaign to check its saved state; duplicate launches are blocked safely.",
                 reply_markup=self._recovery_keyboard(data),
             )
         try:
-            await query.answer()
+            if data != "net:refresh_attention":
+                await query.answer()
         except Exception:
             # Callback acknowledgements expire quickly. The state-changing
             # action above is already complete and must not be replayed merely
@@ -1069,6 +1124,8 @@ class OwnerHandlers:
         campaign_part = 2 if parts and parts[0] in {"times", "gaps"} else 1
         if len(parts) > campaign_part and parts[0] in campaign_prefixes and parts[campaign_part]:
             rows.append([InlineKeyboardButton(text="Return to campaign", callback_data=f"c:{parts[campaign_part]}:open")])
+        if parts and parts[0] in {"net", "chan", "reg"}:
+            rows.append([InlineKeyboardButton(text="Network", callback_data="net:home")])
         rows.append(
             [
                 InlineKeyboardButton(text="Campaigns", callback_data="home:campaigns:0"),
@@ -1126,6 +1183,7 @@ class OwnerHandlers:
                             InlineKeyboardButton(text="Report", callback_data=f"c:{campaign_id}:progress"),
                         ]
                     )
+                    buttons.append([InlineKeyboardButton(text="Delete", callback_data=f"c:{campaign_id}:delete")])
             nav: list[InlineKeyboardButton] = []
             if page:
                 nav.append(InlineKeyboardButton(text="Previous", callback_data=f"home:campaigns:{page - 1}"))
@@ -1325,19 +1383,46 @@ class OwnerHandlers:
             )
             await self._show_campaign(notice, copied)
         elif action == "delete":
-            if campaign["status"] != CampaignStatus.DRAFT.value:
-                raise ValueError("only drafts can be deleted; end a live campaign instead")
-            await query.message.answer(
-                "Delete this draft? Its saved creative, CTA buttons, destinations, and schedule will be removed. This cannot be undone.",
-                reply_markup=_markup(
-                    [
+            if campaign["status"] == CampaignStatus.DRAFT.value:
+                await query.message.answer(
+                    "Delete this draft? Its saved creative, CTA buttons, destinations, and schedule will be removed. This cannot be undone.",
+                    reply_markup=_markup(
                         [
-                            InlineKeyboardButton(text="Delete draft", callback_data=f"confirm:{campaign_id}:delete"),
-                            InlineKeyboardButton(text="Keep draft", callback_data=f"c:{campaign_id}:open"),
-                        ],
-                    ]
-                ),
-            )
+                            [
+                                InlineKeyboardButton(text="Delete draft", callback_data=f"confirm:{campaign_id}:delete"),
+                                InlineKeyboardButton(text="Keep draft", callback_data=f"c:{campaign_id}:open"),
+                            ],
+                        ]
+                    ),
+                )
+            elif campaign["status"] == CampaignStatus.ARCHIVED.value:
+                live_count = await self.repositories.campaign_live_state_count(campaign_id)
+                if live_count:
+                    await query.message.answer(
+                        f"This past campaign still tracks {live_count} live post{'s' if live_count != 1 else ''}. "
+                        "Delete the retained posts before removing its history.",
+                        reply_markup=_markup(
+                            [
+                                [InlineKeyboardButton(text="Delete retained posts", callback_data=f"c:{campaign_id}:cleanup")],
+                                *_navigation(f"c:{campaign_id}:open"),
+                            ]
+                        ),
+                    )
+                else:
+                    await query.message.answer(
+                        "Permanently delete this past campaign? Its campaign definition, delivery report, cycle history, failures, and join statistics "
+                        "will be removed. This cannot be undone.",
+                        reply_markup=_markup(
+                            [
+                                [
+                                    InlineKeyboardButton(text="Delete campaign", callback_data=f"confirm:{campaign_id}:deletearchive"),
+                                    InlineKeyboardButton(text="Keep history", callback_data=f"c:{campaign_id}:open"),
+                                ]
+                            ]
+                        ),
+                    )
+            else:
+                raise ValueError("end a live campaign before deleting it")
         elif action == "progress":
             await self._show_campaign(query.message, campaign)
         elif action == "failures":
@@ -1839,7 +1924,7 @@ class OwnerHandlers:
             raise ValueError("invalid setting")
         await self._show_settings(query.message)
 
-    async def _network_action(self, query: CallbackQuery, data: str) -> None:
+    async def _network_action(self, query: CallbackQuery, bot: Bot, data: str) -> None:
         parts = data.split(":")
         if parts[1] in {"home", "back"}:
             await self._show_network(query.message) if parts[1] == "home" else await self._show_home(query.message)
@@ -1849,6 +1934,20 @@ class OwnerHandlers:
                 "Forward any post from the channel. I will register or refresh that channel and then show its details.",
                 reply_markup=_markup(_navigation("net:home")),
             )
+        elif parts[1] == "refresh_attention":
+            result = await refresh_attention_channels(bot, self.repositories)
+            if not result["checked"]:
+                notice = "Nothing needed refreshing."
+            else:
+                notice = (
+                    f"Bulk refresh complete: {result['checked']} checked\n"
+                    f"Restored to active: {result['active']}\n"
+                    f"Still needs attention: {result['needs_attention']}\n"
+                    f"Unavailable or missing permissions: {result['unavailable']}"
+                )
+                if result["other"]:
+                    notice += f"\nOther outcomes: {result['other']}"
+            await self._show_network(query.message, notice=notice)
         elif parts[1] == "list" and len(parts) == 4:
             await self._show_network_list(query.message, parts[2], int(parts[3]))
         else:
@@ -1899,6 +1998,10 @@ class OwnerHandlers:
             deleted = await self.campaigns.delete_draft(campaign_id)
             notice = await query.message.answer("Draft deleted." if deleted else "That draft has already been removed.")
             await self._show_home(notice)
+        elif action == "deletearchive":
+            deleted = await self.repositories.delete_archived_campaign(campaign_id)
+            await query.message.answer("Past campaign deleted." if deleted else "That past campaign has already been removed.")
+            await self._home(query, "campaigns:0")
         else:
             raise ValueError("that confirmation is no longer valid")
 

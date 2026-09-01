@@ -49,7 +49,7 @@ def test_guided_creator_uses_callback_controls_not_pipe_delimited_commands() -> 
     archived_controls = [item.text for row in campaign_keyboard("cmp", "ARCHIVED", has_live_posts=True).inline_keyboard for item in row]
     assert {"Text", "Photo", "Photo + caption", "Video", "Video + caption", "Forward ready post"} <= set(content_controls)
     assert {"Rename", "CTA buttons", "Promoted links", "Audience", "Plan for later", "Send campaign", "Delete draft", "Home"} <= set(campaign_controls)
-    assert {"Run again now", "Edit a copy", "Full report", "Delete retained posts"} <= set(archived_controls)
+    assert {"Run again now", "Edit a copy", "Full report", "Delete retained posts", "Delete campaign history"} <= set(archived_controls)
 
 
 def test_every_campaign_state_has_safe_navigation_and_short_callback_data() -> None:
@@ -67,6 +67,11 @@ def test_every_campaign_state_has_safe_navigation_and_short_callback_data() -> N
         assert "Home" in {item.text for item in buttons}
         assert all(not item.callback_data or len(item.callback_data.encode()) <= 64 for item in buttons)
     assert "+3 days" in {item.text for row in active.inline_keyboard for item in row}
+
+
+def test_expired_network_controls_recover_to_network_and_home() -> None:
+    controls = [item.text for row in OwnerHandlers._recovery_keyboard("net:refresh_attention").inline_keyboard for item in row]
+    assert {"Network", "Home"} <= set(controls)
 
 
 def test_retention_controls_distinguish_all_three_end_behaviors() -> None:

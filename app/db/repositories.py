@@ -89,6 +89,13 @@ class Repositories:
         query: Document = {"status": status} if status else {}
         return await self.db.channels.find(query).sort("title", ASCENDING).skip(skip).limit(limit).to_list(limit)
 
+    async def channel_ids_by_status(self, status: str) -> list[int]:
+        rows = await self.db.channels.find(
+            {"status": status},
+            {"_id": 0, "telegram_chat_id": 1},
+        ).to_list(None)
+        return [int(row["telegram_chat_id"]) for row in rows]
+
     async def set_channel_tags(self, chat_id: int, tags: list[str]) -> None:
         await self.db.channels.update_one(
             {"telegram_chat_id": chat_id},
@@ -675,6 +682,30 @@ class Repositories:
 
     async def delete_draft_campaign(self, campaign_id: str) -> bool:
         result = await self.db.campaigns.delete_one({"campaign_id": campaign_id, "status": "DRAFT"})
+        return result.deleted_count == 1
+
+    async def delete_archived_campaign(self, campaign_id: str) -> bool:
+        """Permanently remove finished history only when no channel post is live.
+
+        Children are removed before the campaign definition so an interrupted
+        operation remains visible and can safely be retried. Archived campaigns
+        cannot create new deliveries or live state.
+        """
+        campaign = await self.db.campaigns.find_one({"campaign_id": campaign_id, "status": "ARCHIVED"})
+        if not campaign:
+            return False
+        live_count = await self.db.campaign_channel_state.count_documents({"campaign_id": campaign_id})
+        if live_count:
+            raise ValueError(f"this campaign still tracks {live_count} live post{'s' if live_count != 1 else ''}; delete retained posts first")
+
+        campaign_query = {"campaign_id": campaign_id}
+        await self.db.campaign_cycles.delete_many(campaign_query)
+        await self.db.deliveries.delete_many(campaign_query)
+        await self.db.join_events.delete_many(campaign_query)
+        # This should already be empty due to the guard, but deleting it keeps
+        # retries idempotent if legacy data contains empty-state artifacts.
+        await self.db.campaign_channel_state.delete_many(campaign_query)
+        result = await self.db.campaigns.delete_one({"campaign_id": campaign_id, "status": "ARCHIVED"})
         return result.deleted_count == 1
 
     async def save_pending_restore(self, restore_id: str, owner_id: int, backup: Document) -> None:
