@@ -36,3 +36,13 @@ async def test_status_aggregates_await_cursor_before_reading_rows() -> None:
     assert await repositories.channel_status_counts() == {"ACTIVE": 3}
     assert await repositories.campaign_status_counts() == {"SCHEDULED": 2}
     assert await repositories.delivery_summary("cmp", 0) == {"SENT": 4}
+
+
+def test_audience_selector_supports_minimum_and_bounded_size_ranges() -> None:
+    repositories = Repositories.__new__(Repositories)
+
+    assert repositories._active_channel_query({"minimum_members": 1_000})["member_count"] == {"$gte": 1_000}
+    assert repositories._active_channel_query({"minimum_members": 1_000, "maximum_members": 50_000})["member_count"] == {
+        "$gte": 1_000,
+        "$lte": 50_000,
+    }

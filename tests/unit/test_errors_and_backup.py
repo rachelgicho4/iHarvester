@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 import pytest
 
 from app.backups.export import make_backup
-from app.backups.restore import parse_backup
+from app.backups.restore import parse_backup, restore_backup
 from app.delivery.error_classification import ErrorKind, classify_telegram_error
 
 
@@ -31,3 +31,29 @@ async def test_core_backup_has_integrity_validation() -> None:
     backup = parse_backup(payload)
     assert backup["collections"]["channels"][0]["telegram_chat_id"] == -1001
     assert backup["collections"]["channels"][0]["registered_at"].tzinfo == UTC
+
+
+@pytest.mark.asyncio
+async def test_restore_never_resumes_any_live_campaign_state() -> None:
+    class RestoreRepositories:
+        def __init__(self):
+            self.rows = {}
+
+        async def restore_collection(self, name, documents):
+            self.rows[name] = documents
+            return len(documents), 0
+
+    repositories = RestoreRepositories()
+    backup = {
+        "collections": {
+            "channels": [],
+            "settings": [],
+            "campaigns": [{"campaign_id": status, "status": status} for status in ("ACTIVE", "SCHEDULED", "PAUSED", "ENDING", "DRAFT")],
+        }
+    }
+
+    await restore_backup(repositories, backup)
+
+    restored = {row["campaign_id"]: row for row in repositories.rows["campaigns"]}
+    assert all(restored[status]["status"] == "ARCHIVED" for status in ("ACTIVE", "SCHEDULED", "PAUSED", "ENDING"))
+    assert restored["DRAFT"]["status"] == "DRAFT"

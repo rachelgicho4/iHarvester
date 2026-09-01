@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import re
 from datetime import UTC, datetime, timedelta
+from math import ceil
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -61,6 +63,9 @@ _PERIOD_UNITS = {
 }
 _INTERVAL_PRESET_MINUTES = (5, 10, 15, 30, 60, 120, 180, 240, 360, 480, 720, 1440)
 _SAFE_REPOST_MAX_MINUTES = 47 * 60
+_MAX_VARIANTS = 20
+_MAX_DESTINATIONS = 20
+_MAX_CTA_BUTTONS = 20
 
 
 def _period_label(minutes: int) -> str:
@@ -80,7 +85,7 @@ def parse_period_minutes(raw: str, *, field: str) -> int:
     """Parse short owner-entered periods; a month is deliberately 30 days."""
     match = re.fullmatch(r"\s*(\d+)\s*([A-Za-z]+)\s*", raw)
     if not match or match.group(2).lower() not in _PERIOD_UNITS:
-        raise ValueError(f"send {field} as a whole number with m, h, d, or mo (for example `45m`, `2h`, `3d`, or `1mo`)")
+        raise ValueError(f"send {field} as a whole number with m, h, d, or mo (for example 45m, 2h, 3d, or 1mo)")
     minutes = int(match.group(1)) * _PERIOD_UNITS[match.group(2).lower()]
     if minutes < 1:
         raise ValueError(f"{field} must be at least 1 minute")
@@ -203,32 +208,36 @@ def _interval_keyboard(
     return _markup(rows)
 
 
-def campaign_keyboard(campaign_id: str, status: str) -> InlineKeyboardMarkup:
+def campaign_keyboard(campaign_id: str, status: str, *, variant_count: int = 0, has_live_posts: bool = False) -> InlineKeyboardMarkup:
     if status == CampaignStatus.ARCHIVED.value:
-        return _markup(
+        rows = [
+            [InlineKeyboardButton(text="Run again now", callback_data=f"c:{campaign_id}:rerun")],
+            [InlineKeyboardButton(text="Edit a copy", callback_data=f"c:{campaign_id}:duplicate")],
+            [InlineKeyboardButton(text="Full report", callback_data=f"c:{campaign_id}:progress")],
+        ]
+        if has_live_posts:
+            rows.append([InlineKeyboardButton(text="Delete retained posts", callback_data=f"c:{campaign_id}:cleanup")])
+        rows.append(
             [
-                [InlineKeyboardButton(text="Duplicate / Run Again", callback_data=f"c:{campaign_id}:duplicate")],
-                [
-                    InlineKeyboardButton(text="View campaign report", callback_data=f"c:{campaign_id}:progress"),
-                    InlineKeyboardButton(text="Delete retained posts", callback_data=f"c:{campaign_id}:cleanup"),
-                ],
-                [
-                    InlineKeyboardButton(text="Back to campaigns", callback_data="home:campaigns"),
-                    InlineKeyboardButton(text="Home", callback_data="home:back"),
-                ],
+                InlineKeyboardButton(text="Campaigns", callback_data="home:campaigns:0"),
+                InlineKeyboardButton(text="Home", callback_data="home:back"),
             ]
         )
+        return _markup(rows)
     if status in {CampaignStatus.ACTIVE.value, CampaignStatus.SCHEDULED.value, CampaignStatus.ENDING.value, CampaignStatus.PAUSED.value}:
         rows = [
             [
                 InlineKeyboardButton(text="Refresh dashboard", callback_data=f"c:{campaign_id}:open"),
                 InlineKeyboardButton(text="View campaign report", callback_data=f"c:{campaign_id}:progress"),
-            ],
-            [
-                InlineKeyboardButton(text="View failures", callback_data=f"c:{campaign_id}:failures"),
-                InlineKeyboardButton(text="Retry failed", callback_data=f"c:{campaign_id}:retry"),
-            ],
+            ]
         ]
+        if status in {CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}:
+            rows.append(
+                [
+                    InlineKeyboardButton(text="View failures", callback_data=f"c:{campaign_id}:failures"),
+                    InlineKeyboardButton(text="Retry failed", callback_data=f"c:{campaign_id}:retry"),
+                ]
+            )
         if status == CampaignStatus.PAUSED.value:
             rows.append(
                 [
@@ -237,6 +246,8 @@ def campaign_keyboard(campaign_id: str, status: str) -> InlineKeyboardMarkup:
                 ]
             )
         elif status != CampaignStatus.ENDING.value:
+            if status == CampaignStatus.SCHEDULED.value:
+                rows.append([InlineKeyboardButton(text="Edit before it starts", callback_data=f"c:{campaign_id}:todraft")])
             rows.append(
                 [
                     InlineKeyboardButton(text="Pause / freeze", callback_data=f"c:{campaign_id}:pause"),
@@ -249,6 +260,8 @@ def campaign_keyboard(campaign_id: str, status: str) -> InlineKeyboardMarkup:
                     InlineKeyboardButton(text="+1 day", callback_data=f"c:{campaign_id}:extend24"),
                 ]
             )
+            rows.append([InlineKeyboardButton(text="+3 days", callback_data=f"c:{campaign_id}:extend72")])
+            rows.append([InlineKeyboardButton(text="Custom extension", callback_data=f"c:{campaign_id}:extendcustom")])
             rows.append(
                 [
                     InlineKeyboardButton(text="Stop & delete posts", callback_data=f"c:{campaign_id}:end"),
@@ -257,40 +270,51 @@ def campaign_keyboard(campaign_id: str, status: str) -> InlineKeyboardMarkup:
             )
         rows.append(
             [
-                InlineKeyboardButton(text="Back to campaigns", callback_data="home:campaigns"),
+                InlineKeyboardButton(text="Campaigns", callback_data="home:campaigns:0"),
                 InlineKeyboardButton(text="Home", callback_data="home:back"),
             ]
         )
         return _markup(rows)
-    return _markup(
+    rows = [
         [
+            InlineKeyboardButton(text="Add content", callback_data=f"c:{campaign_id}:add"),
+            InlineKeyboardButton(text="Rename", callback_data=f"c:{campaign_id}:rename"),
+        ]
+    ]
+    if variant_count:
+        rows.extend(
             [
-                InlineKeyboardButton(text="Add content", callback_data=f"c:{campaign_id}:add"),
-                InlineKeyboardButton(text="Edit creatives", callback_data=f"c:{campaign_id}:variants"),
-            ],
+                [
+                    InlineKeyboardButton(text="Manage content", callback_data=f"c:{campaign_id}:variants"),
+                    InlineKeyboardButton(text="CTA buttons", callback_data=f"c:{campaign_id}:buttons"),
+                ],
+                [
+                    InlineKeyboardButton(text="Audience", callback_data=f"c:{campaign_id}:targets"),
+                    InlineKeyboardButton(text="Promoted links", callback_data=f"c:{campaign_id}:destination"),
+                ],
+                [
+                    InlineKeyboardButton(text="Preview all", callback_data=f"c:{campaign_id}:preview"),
+                    InlineKeyboardButton(text="Test in a channel", callback_data=f"c:{campaign_id}:test"),
+                ],
+                [InlineKeyboardButton(text="Send campaign", callback_data=f"c:{campaign_id}:send")],
+                [
+                    InlineKeyboardButton(text="Plan for later", callback_data=f"c:{campaign_id}:schedule"),
+                    InlineKeyboardButton(text="End behavior", callback_data=f"c:{campaign_id}:retention"),
+                ],
+            ]
+        )
+        if variant_count >= 2:
+            rows.append([InlineKeyboardButton(text="Rotation mode", callback_data=f"c:{campaign_id}:mode")])
+    rows.extend(
+        [
+            [InlineKeyboardButton(text="Delete draft", callback_data=f"c:{campaign_id}:delete")],
             [
-                InlineKeyboardButton(text="CTA buttons", callback_data=f"c:{campaign_id}:buttons"),
-                InlineKeyboardButton(text="Destinations", callback_data=f"c:{campaign_id}:destination"),
+                InlineKeyboardButton(text="Campaigns", callback_data="home:campaigns:0"),
+                InlineKeyboardButton(text="Home", callback_data="home:back"),
             ],
-            [
-                InlineKeyboardButton(text="Targets", callback_data=f"c:{campaign_id}:targets"),
-                InlineKeyboardButton(text="Plan for later", callback_data=f"c:{campaign_id}:schedule"),
-            ],
-            [
-                InlineKeyboardButton(text="Mode", callback_data=f"c:{campaign_id}:mode"),
-                InlineKeyboardButton(text="Preview", callback_data=f"c:{campaign_id}:preview"),
-            ],
-            [
-                InlineKeyboardButton(text="Test send", callback_data=f"c:{campaign_id}:test"),
-                InlineKeyboardButton(text="Send campaign", callback_data=f"c:{campaign_id}:send"),
-            ],
-            [InlineKeyboardButton(text="Keep or delete final post", callback_data=f"c:{campaign_id}:retention")],
-            [
-                InlineKeyboardButton(text="Delete draft", callback_data=f"c:{campaign_id}:delete"),
-            ],
-            [InlineKeyboardButton(text="Back to campaigns", callback_data="home:campaigns"), InlineKeyboardButton(text="Home", callback_data="home:back")],
         ]
     )
+    return _markup(rows)
 
 
 def content_type_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
@@ -328,11 +352,22 @@ def mode_keyboard(campaign_id: str, variant_count: int) -> InlineKeyboardMarkup:
     return _markup(rows)
 
 
-def retention_keyboard(campaign_id: str, delete_on_end: bool) -> InlineKeyboardMarkup:
+def retention_keyboard(campaign_id: str, delete_on_end: bool, delete_on_next_campaign: bool) -> InlineKeyboardMarkup:
     return _markup(
         [
-            [InlineKeyboardButton(text="Delete final post at campaign end", callback_data=f"ret:{campaign_id}:delete")],
-            [InlineKeyboardButton(text="Keep final post after campaign end", callback_data=f"ret:{campaign_id}:keep")],
+            [InlineKeyboardButton(text=f"{'✓ ' if delete_on_end else ''}Delete final post at campaign end", callback_data=f"ret:{campaign_id}:delete")],
+            [
+                InlineKeyboardButton(
+                    text=f"{'✓ ' if delete_on_next_campaign else ''}Keep until a future campaign replaces it",
+                    callback_data=f"ret:{campaign_id}:replace",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"{'✓ ' if not delete_on_end and not delete_on_next_campaign else ''}Keep until I delete it",
+                    callback_data=f"ret:{campaign_id}:keep",
+                )
+            ],
             *_navigation(f"c:{campaign_id}:open"),
         ]
     )
@@ -348,7 +383,7 @@ def target_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="All active channels", callback_data=f"target:{campaign_id}:all")],
             [
                 InlineKeyboardButton(text="Match tags", callback_data=f"target:{campaign_id}:tags"),
-                InlineKeyboardButton(text="Minimum audience", callback_data=f"target:{campaign_id}:members"),
+                InlineKeyboardButton(text="Audience size", callback_data=f"target:{campaign_id}:members"),
             ],
             [
                 InlineKeyboardButton(text="Manually include IDs", callback_data=f"target:{campaign_id}:include"),
@@ -381,13 +416,13 @@ def quick_duration_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def quick_interval_keyboard(campaign_id: str, duration_minutes: int, default_hours: int) -> InlineKeyboardMarkup:
+def quick_interval_keyboard(campaign_id: str, duration_minutes: int, default_hours: float) -> InlineKeyboardMarkup:
     return _interval_keyboard(
         campaign_id,
         duration_minutes,
         prefix="qmin",
         back_callback=f"c:{campaign_id}:send",
-        preferred_minutes=default_hours * 60 if default_hours else None,
+        preferred_minutes=round(default_hours * 60) if default_hours else None,
     )
 
 
@@ -415,21 +450,28 @@ class OwnerHandlers:
         return user_id in self.owner_ids and chat_type == "private"
 
     @staticmethod
-    def _date(value: Any) -> str:
+    def _date(value: Any, timezone: str = "UTC") -> str:
         if not value:
             return "Not set"
-        return as_utc(value).strftime("%d %b %Y, %H:%M UTC")
+        try:
+            local = as_utc(value).astimezone(ZoneInfo(timezone))
+        except ZoneInfoNotFoundError:
+            timezone = "UTC"
+            local = as_utc(value)
+        return f"{local.strftime('%d %b %Y, %H:%M')} {timezone}"
 
     @staticmethod
     def _bar(completed: int, total: int, width: int = 12) -> str:
         if total <= 0:
-            return "░" * width
+            return "waiting"
         filled = min(width, max(0, round(width * completed / total)))
-        return "█" * filled + "░" * (width - filled)
+        return "🟩" * filled + "⬜" * (width - filled)
 
     @staticmethod
     def _duration_label(seconds: int) -> str:
         seconds = max(0, seconds)
+        if seconds < 60:
+            return f"{seconds}s"
         days, remainder = divmod(seconds, 86_400)
         hours, remainder = divmod(remainder, 3_600)
         minutes, _ = divmod(remainder, 60)
@@ -450,38 +492,68 @@ class OwnerHandlers:
         except TelegramBadRequest:
             pass
 
+    async def _render(self, message: Message, text: str, reply_markup: InlineKeyboardMarkup) -> None:
+        """Reuse callback control messages to keep the owner's chat clean."""
+        if message.from_user and message.from_user.is_bot and message.text:
+            try:
+                await message.edit_text(text, reply_markup=reply_markup)
+                return
+            except TelegramBadRequest as error:
+                if "message is not modified" in str(error).lower():
+                    return
+        await message.answer(text, reply_markup=reply_markup)
+
     async def _show_home(self, message: Message) -> None:
         channels = await self.repositories.channel_status_counts()
         campaigns = await self.repositories.campaign_status_counts()
-        await message.answer(
+        await self._render(
+            message,
             "iHarvester control room\n\n"
             f"Active campaigns: {campaigns.get('ACTIVE', 0)}\n"
             f"Scheduled campaigns: {campaigns.get('SCHEDULED', 0)}\n"
             f"Active source channels: {channels.get('ACTIVE', 0)}\n"
             f"Need attention: {channels.get('NEEDS_ATTENTION', 0)}",
-            reply_markup=home_keyboard(),
+            home_keyboard(),
         )
 
     async def _show_settings(self, message: Message) -> None:
         timezone = await self.repositories.get_setting("owner_timezone", "UTC")
-        interval = await self.repositories.get_setting("quick_interval_hours", 6)
-        interval_text = "Post once" if not interval else f"Every {interval} hour{'s' if interval != 1 else ''}"
-        await message.answer(
+        interval = float(await self.repositories.get_setting("quick_interval_hours", 6))
+        interval_text = "Post once" if not interval else f"Every {_period_label(round(interval * 60))}"
+        backup_enabled = bool(await self.repositories.get_setting("auto_backup_enabled", True))
+        backup_channels = int(await self.repositories.get_setting("auto_backup_every_new_channels", 100))
+        backup_hours = int(await self.repositories.get_setting("auto_backup_interval_hours", 168))
+        await self._render(
+            message,
             "Settings\n\n"
             f"Display timezone: {timezone}\n"
-            f"Quick-send default interval: {interval_text}\n\n"
-            "These preferences are used when you schedule a new campaign with Send campaign.",
-            reply_markup=_markup(
+            f"Quick-send default interval: {interval_text}\n"
+            f"Automatic backups: {'On' if backup_enabled else 'Off'}\n"
+            f"Backup triggers: every {backup_channels} new channels or every {_period_label(backup_hours * 60)}\n\n"
+            "These preferences apply to new campaign setup and automatic safety copies.",
+            _markup(
                 [
                     [
                         InlineKeyboardButton(text="UTC", callback_data="set:timezone:UTC"),
                         InlineKeyboardButton(text="Africa/Nairobi", callback_data="set:timezone:Africa/Nairobi"),
                     ],
+                    [InlineKeyboardButton(text="Custom timezone", callback_data="set:timezone:custom")],
                     [
                         InlineKeyboardButton(text="Default: post once", callback_data="set:interval:0"),
                         InlineKeyboardButton(text="Default: every 6h", callback_data="set:interval:6"),
                     ],
                     [InlineKeyboardButton(text="Default: every 24h", callback_data="set:interval:24")],
+                    [InlineKeyboardButton(text="Custom default interval", callback_data="set:interval:custom")],
+                    [
+                        InlineKeyboardButton(
+                            text="Turn backups off" if backup_enabled else "Turn backups on",
+                            callback_data=f"set:backup:{'off' if backup_enabled else 'on'}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(text="Backup channel trigger", callback_data="set:backup_channels:custom"),
+                        InlineKeyboardButton(text="Backup time trigger", callback_data="set:backup_interval:custom"),
+                    ],
                     *_navigation(),
                 ]
             ),
@@ -492,18 +564,66 @@ class OwnerHandlers:
         button_count = sum(len(item.get("buttons", [])) for item in variants)
         destinations = campaign.get("destinations", [])
         selector = campaign.get("target_selector") or {}
-        targets = "All active channels" if not selector else "Filtered selection"
         snapshot = campaign.get("target_snapshot", [])
         protected_ids = {item["telegram_chat_id"] for item in destinations if item.get("telegram_chat_id") is not None}
-        planned_count = await self.repositories.active_channel_count(selector, exclude_ids=protected_ids)
-        schedule = (
-            f"{self._date(campaign.get('start_at_utc'))} to {self._date(campaign.get('current_end_at_utc'))}"
-            if campaign.get("start_at_utc")
-            else "Not scheduled"
+        status = campaign["status"]
+        # A launched campaign's audience is immutable history.  Only drafts
+        # should be evaluated against the network as it exists today.
+        planned_count = (
+            await self.repositories.active_channel_count(selector, exclude_ids=protected_ids)
+            if status == CampaignStatus.DRAFT.value
+            else len(snapshot)
         )
-        target_text = f"{len(snapshot)} frozen source channels" if snapshot else f"{targets}: {planned_count} planned"
+        if status == CampaignStatus.DRAFT.value and len(variants) < 2 and campaign.get("mode") != CampaignMode.STANDARD.value:
+            await self.repositories.update_campaign(campaign["campaign_id"], {"mode": CampaignMode.STANDARD.value, "updated_at": datetime.now(UTC)})
+            campaign["mode"] = CampaignMode.STANDARD.value
+        display_timezone = campaign.get("owner_timezone") or await self.repositories.get_setting("owner_timezone", "UTC")
+        cleanup = (
+            "Delete final post"
+            if campaign.get("delete_on_end", True)
+            else "Keep until a future campaign replaces it"
+            if campaign.get("delete_on_next_campaign", False)
+            else "Keep until manually deleted"
+        )
+
+        if status == CampaignStatus.DRAFT.value:
+            has_schedule = bool(campaign.get("start_at_utc") and campaign.get("current_end_at_utc"))
+            content_line = f"✓ Content: {len(variants)} creative{'s' if len(variants) != 1 else ''}" if variants else "○ Content: add a post"
+            preview_line = "✓ Preview: ready" if campaign.get("preview_sent") else "○ Preview: required before launch"
+            schedule_line = (
+                f"✓ Timing: {self._date(campaign['start_at_utc'], display_timezone)} → {self._date(campaign['current_end_at_utc'], display_timezone)}"
+                if has_schedule
+                else "○ Timing: choose Send campaign or Plan for later"
+            )
+            if not variants:
+                next_step = "Next: add the post you want to publish."
+            elif not campaign.get("preview_sent"):
+                next_step = "Next: preview all creatives, then choose Send campaign."
+            elif not has_schedule:
+                next_step = "Next: choose Send campaign for an immediate run, or Plan for later."
+            else:
+                next_step = "Ready. Review or launch this fully configured campaign."
+            await self._render(
+                message,
+                f"{campaign['name']}\nDraft • {campaign.get('mode', 'STANDARD').replace('_', ' ').title()}\n\n"
+                "Setup\n"
+                f"{content_line}\n"
+                f"{'✓' if button_count else '○'} CTA buttons: {button_count} (optional)\n"
+                f"✓ Audience: {planned_count} eligible source channel{'s' if planned_count != 1 else ''}\n"
+                f"{'✓' if destinations else '○'} Promoted links: {len(destinations)} (optional)\n"
+                f"{schedule_line}\n"
+                f"✓ End behavior: {cleanup.lower()}\n"
+                f"{preview_line}\n\n{next_step}",
+                campaign_keyboard(campaign["campaign_id"], status, variant_count=len(variants)),
+            )
+            return
+
         totals = await self.repositories.campaign_delivery_totals(campaign["campaign_id"])
-        cycle_count = await self.repositories.campaign_cycle_count(campaign["campaign_id"])
+        cycle_stats = await self.repositories.campaign_cycle_stats(campaign["campaign_id"])
+        metrics = await self.repositories.campaign_delivery_metrics(campaign["campaign_id"])
+        live_count = await self.repositories.campaign_live_state_count(campaign["campaign_id"])
+        join_count = await self.repositories.campaign_join_count(campaign["campaign_id"])
+        latest_cycle = await self.repositories.latest_cycle_report(campaign["campaign_id"])
         delivery_statuses = (
             "PENDING",
             "PROCESSING",
@@ -517,11 +637,17 @@ class OwnerHandlers:
             "CANCELLED",
         )
         sent = totals.get("SENT", 0)
-        failed = totals.get("FAILED_PERMANENT", 0) + totals.get("UNKNOWN_SEND_STATE", 0) + totals.get("CLEANUP_FAILED", 0)
+        permanent_failed = totals.get("FAILED_PERMANENT", 0)
+        unknown = totals.get("UNKNOWN_SEND_STATE", 0)
+        cleanup_failed = totals.get("CLEANUP_FAILED", 0)
+        pending = sum(totals.get(item, 0) for item in ("PENDING", "PROCESSING", "RETRY_WAIT", "PAUSED"))
+        cancelled = totals.get("CANCELLED", 0)
         total_jobs = sum(totals.get(status, 0) for status in delivery_statuses)
         complete_jobs = total_jobs - sum(totals.get(status, 0) for status in ("PENDING", "PROCESSING", "RETRY_WAIT", "PAUSED"))
-        cleaned = totals.get("CLEANED", 0)
-        timeline = "Not scheduled"
+        delivery_progress = (
+            "Waiting for the first delivery cycle" if not total_jobs else f"{self._bar(complete_jobs, total_jobs, 8)}  {complete_jobs}/{total_jobs} jobs"
+        )
+        timeline = "Waiting to start"
         run_time = "Not started"
         if campaign.get("start_at_utc") and campaign.get("current_end_at_utc"):
             start = as_utc(campaign["start_at_utc"])
@@ -529,8 +655,8 @@ class OwnerHandlers:
             finish = as_utc(campaign["archived_at"]) if campaign.get("archived_at") else datetime.now(UTC)
             total_seconds = max(1, int((end - start).total_seconds()))
             elapsed = max(0, min(int((finish - start).total_seconds()), total_seconds))
-            timeline = f"{self._bar(elapsed, total_seconds)} {round(100 * elapsed / total_seconds)}% elapsed"
-            run_time = self._duration_label(elapsed)
+            timeline = f"{self._bar(elapsed, total_seconds, 8)}  {round(100 * elapsed / total_seconds)}%"
+            run_time = self._duration_label(max(0, int((finish - start).total_seconds())))
         phase = (
             "paused/frozen"
             if campaign["status"] == CampaignStatus.PAUSED.value
@@ -538,20 +664,71 @@ class OwnerHandlers:
             if campaign["status"] == CampaignStatus.ACTIVE.value
             else campaign["status"].lower()
         )
-        cleanup = "delete final post" if campaign.get("delete_on_end", True) else "keep final post"
-        await message.answer(
-            f"Campaign: {campaign['name']}\n"
-            f"Status: {campaign['status']}  |  Mode: {campaign.get('mode', 'STANDARD')}\n\n"
+        target_text = f"{len(snapshot)} frozen source channels"
+        report_heading = "Final results" if status == CampaignStatus.ARCHIVED.value else "Live progress"
+        offsets = campaign.get("repost_offsets_seconds")
+        interval = campaign.get("repost_interval_seconds")
+        if offsets is not None:
+            expected_cycles = 1 + len(offsets)
+            repost_plan = "Initial post, then at " + ", ".join(_period_label(int(value) // 60) for value in offsets)
+        elif interval:
+            duration_seconds = max(
+                1,
+                int((as_utc(campaign["current_end_at_utc"]) - as_utc(campaign["start_at_utc"])).total_seconds()),
+            )
+            expected_cycles = (duration_seconds + int(interval) - 1) // int(interval)
+            repost_plan = f"Every {_period_label(int(interval) // 60)}"
+        else:
+            expected_cycles = 1
+            repost_plan = "Post once"
+        next_cycle_text = (
+            "No more reposts; waiting for campaign end"
+            if status == CampaignStatus.ACTIVE.value and int(campaign.get("next_cycle_number", 0)) >= expected_cycles
+            else self._date(campaign.get("next_cycle_at"), display_timezone)
+            if status in {CampaignStatus.ACTIVE.value, CampaignStatus.SCHEDULED.value}
+            else "None while paused/ending"
+            if status in {CampaignStatus.PAUSED.value, CampaignStatus.ENDING.value}
+            else "Complete"
+        )
+        latest_text = "Latest cycle: not created yet"
+        if latest_cycle:
+            latest = latest_cycle.get("delivery_counts", {})
+            target_count = int(latest_cycle.get("target_count", 0))
+            latest_sent = int(latest.get("SENT", 0))
+            reachability = round(100 * latest_sent / target_count) if target_count else 0
+            latest_text = (
+                f"Latest cycle {int(latest_cycle['cycle_number']) + 1}: "
+                f"{latest_sent} sent, {latest.get('PENDING', 0)} pending, {latest.get('PROCESSING', 0)} processing, "
+                f"{latest.get('RETRY_WAIT', 0)} retrying, {latest.get('FAILED_PERMANENT', 0)} failed, "
+                f"{latest.get('UNKNOWN_SEND_STATE', 0)} unknown\n"
+                f"Reachability: {reachability}%  |  Started: {self._date(latest_cycle.get('started_at'), display_timezone)}  |  "
+                f"Completed: {self._date(latest_cycle.get('completed_at'), display_timezone)}"
+            )
+        await self._render(
+            message,
+            f"{campaign['name']}\n"
+            f"{status.title()} • {campaign.get('mode', 'STANDARD').replace('_', ' ').title()}\n\n"
             f"Creatives: {len(variants)}  |  CTA buttons: {button_count}\n"
             f"Destinations: {len(destinations)}\n"
             f"Targets: {target_text}\n"
-            f"Schedule: {schedule}\n"
+            f"Window: {self._date(campaign.get('start_at_utc'), display_timezone)} → "
+            f"{self._date(campaign.get('current_end_at_utc'), display_timezone)}\n"
             f"End behavior: {cleanup}\n\n"
-            f"Delivery jobs  {self._bar(complete_jobs, total_jobs)} {complete_jobs}/{total_jobs} complete\n"
-            f"Sent: {sent}  |  Failed: {failed}  |  Deleted: {cleaned}  |  Cycles: {cycle_count}\n"
-            f"Timeline  {timeline}  |  Run time: {run_time}\n"
-            f"State: {phase}. Campaigns may overlap on the same source channels; each campaign only replaces or cleans up its own posts.",
-            reply_markup=campaign_keyboard(campaign["campaign_id"], campaign["status"]),
+            f"Repost plan: {repost_plan}\n"
+            f"Next cycle: {next_cycle_text}\n\n"
+            f"{report_heading}\n"
+            f"Deliveries: {delivery_progress}\n"
+            f"Sent: {sent}  |  Pending: {pending}  |  Failed: {permanent_failed}  |  Unknown: {unknown}\n"
+            f"Deleted posts: {metrics.get('replaced_messages', 0) + metrics.get('cleaned_messages', 0)}"
+            f"  |  Cleanup failed: {cleanup_failed}  |  Cancelled: {cancelled}\n"
+            f"Cycles: {cycle_stats.get('completed', 0)}/{expected_cycles} complete "
+            f"({cycle_stats.get('planned', 0)} created)  |  Attempts: {metrics.get('attempts', 0)}\n"
+            f"Posts currently live: {live_count}  |  Tracked joins: {join_count}\n"
+            f"Excluded destinations: {len(campaign.get('protected_destination_ids', []))}\n"
+            f"{latest_text}\n"
+            f"Campaign time: {timeline}  |  Run time: {run_time}\n\n"
+            f"State: {phase}.",
+            campaign_keyboard(campaign["campaign_id"], status, variant_count=len(variants), has_live_posts=live_count > 0),
         )
 
     async def _show_network(self, message: Message) -> None:
@@ -565,9 +742,10 @@ class OwnerHandlers:
             f"Total discovered: {sum(counts.values())}\n\n"
             "Add me as a channel admin to register automatically, or forward a channel post here to repair/register it."
         )
-        await message.answer(
+        await self._render(
+            message,
             text,
-            reply_markup=_markup(
+            _markup(
                 [
                     [
                         InlineKeyboardButton(text=f"Active ({counts.get('ACTIVE', 0)})", callback_data="net:list:ACTIVE:0"),
@@ -587,9 +765,10 @@ class OwnerHandlers:
         page_size = 8
         rows = await self.repositories.list_channels(status, skip=page * page_size, limit=page_size)
         if not rows:
-            await message.answer(
+            await self._render(
+                message,
                 "No channels in this group.",
-                reply_markup=_markup(
+                _markup(
                     [
                         [InlineKeyboardButton(text="Back to Network", callback_data="net:home")],
                     ]
@@ -610,12 +789,12 @@ class OwnerHandlers:
         if nav:
             controls.append(nav)
         controls.append([InlineKeyboardButton(text="Back to Network", callback_data="net:home")])
-        await message.answer("\n".join(lines), reply_markup=_markup(controls))
+        await self._render(message, "\n".join(lines), _markup(controls))
 
     async def _show_channel(self, message: Message, chat_id: int) -> None:
         channel = await self.repositories.get_channel(chat_id)
         if not channel:
-            await message.answer("That channel is no longer in the registry.")
+            await self._render(message, "That channel is no longer in the registry.", _markup(_navigation("net:home")))
             return
         permissions = channel.get("permissions", {})
         text = (
@@ -629,9 +808,10 @@ class OwnerHandlers:
             f"Tags: {', '.join(channel.get('tags', [])) or 'none'}"
         )
         enabled = channel.get("status") != "INACTIVE_MANUAL"
-        await message.answer(
+        await self._render(
+            message,
             text,
-            reply_markup=_markup(
+            _markup(
                 [
                     [
                         InlineKeyboardButton(text="Refresh access", callback_data=f"chan:{chat_id}:refresh"),
@@ -687,14 +867,16 @@ class OwnerHandlers:
             rows.append([InlineKeyboardButton(text=f"Remove: {button.text}", callback_data=f"rm:{cid}:{variant_index}:{button.id}")])
         rows.append([InlineKeyboardButton(text="Send real preview", callback_data=f"preview:{cid}:{variant_index}")])
         rows.append([InlineKeyboardButton(text="Back to campaign", callback_data=f"c:{cid}:open")])
-        await message.answer(
+        await self._render(
+            message,
             f"CTA button editor - variant {variant_index + 1}\n\n{canvas}\n\n"
             "Use beside-last for a horizontal button and new-row for a vertical button. Names are saved unchanged.",
-            reply_markup=_markup(rows),
+            _markup(rows),
         )
 
     async def start(self, message: Message) -> None:
         if self._allowed(message.from_user.id if message.from_user else None, message.chat.type):
+            await self.repositories.clear_owner_session(message.from_user.id)
             await self._show_home(message)
 
     async def backup(self, message: Message) -> None:
@@ -702,14 +884,19 @@ class OwnerHandlers:
             return
         payload = await make_backup(self.repositories)
         await message.answer_document(
-            BufferedInputFile(payload, filename="iharvester-core-backup.json.gz"), caption="Core backup: channels, campaign definitions, and settings."
+            BufferedInputFile(payload, filename="iharvester-core-backup.json.gz"),
+            caption="Core backup: channels, campaign definitions, and settings.",
+            reply_markup=home_keyboard(),
         )
 
     async def restore(self, message: Message) -> None:
         if not self._allowed(message.from_user.id if message.from_user else None, message.chat.type):
             return
         await self.repositories.set_owner_session(message.from_user.id, {"action": "await_restore_file"})
-        await message.answer("Attach an iHarvester .json.gz backup. I will validate it before restoring.")
+        await message.answer(
+            "Attach an iHarvester .json.gz backup. I will validate it before restoring.",
+            reply_markup=_markup(_navigation()),
+        )
 
     async def callback(self, query: CallbackQuery, bot: Bot) -> None:
         if not query.message or not self._allowed(query.from_user.id, query.message.chat.type):
@@ -750,6 +937,9 @@ class OwnerHandlers:
                 _, campaign_id, index = data.split(":", 2)
                 campaign = await self.campaigns.editable_campaign(campaign_id)
                 await self._show_button_editor(query.message, campaign, int(index))
+            elif data.startswith("var:"):
+                _, campaign_id, index, action = data.split(":", 3)
+                await self._variant_action(query, campaign_id, int(index), action)
             elif data.startswith("btn:"):
                 _, campaign_id, index, placement = data.split(":", 3)
                 await self.repositories.set_owner_session(
@@ -827,40 +1017,95 @@ class OwnerHandlers:
                 _, restore_id, action = data.split(":", 2)
                 await self._restore_confirm(query, restore_id, action)
             else:
-                await query.message.answer("That control has expired. Open the current screen again with /start.")
+                await query.message.answer(
+                    "That control has expired. Choose where to continue.",
+                    reply_markup=self._recovery_keyboard(data),
+                )
         except (ValueError, KeyError, ValidationError) as error:
-            await query.message.answer(f"Could not complete that action: {error}")
+            await query.message.answer(f"Could not complete that action: {error}", reply_markup=self._recovery_keyboard(data))
         except Exception:
             logger.exception("Owner callback failed", extra={"callback_data": data, "owner_id": query.from_user.id})
-            await query.message.answer("Could not complete that action due to an internal error. Nothing was launched; please retry after the issue is fixed.")
-        await query.answer()
+            await query.message.answer(
+                "I could not confirm that action because of an internal error. "
+                "Open the campaign to check its saved state; duplicate launches are blocked safely.",
+                reply_markup=self._recovery_keyboard(data),
+            )
+        try:
+            await query.answer()
+        except Exception:
+            # Callback acknowledgements expire quickly. The state-changing
+            # action above is already complete and must not be replayed merely
+            # because Telegram no longer accepts the cosmetic acknowledgement.
+            logger.warning("Could not acknowledge completed owner callback", extra={"callback_data": data})
+
+    @staticmethod
+    def _recovery_keyboard(callback_data: str) -> InlineKeyboardMarkup:
+        parts = callback_data.split(":")
+        rows: list[list[InlineKeyboardButton]] = []
+        campaign_prefixes = {
+            "c",
+            "mode",
+            "m",
+            "ct",
+            "edit",
+            "btn",
+            "album",
+            "layout",
+            "rm",
+            "preview",
+            "var",
+            "target",
+            "ret",
+            "dest",
+            "times",
+            "gaps",
+            "sint",
+            "sch",
+            "dur",
+            "qmin",
+            "qint",
+            "confirm",
+        }
+        campaign_part = 2 if parts and parts[0] in {"times", "gaps"} else 1
+        if len(parts) > campaign_part and parts[0] in campaign_prefixes and parts[campaign_part]:
+            rows.append([InlineKeyboardButton(text="Return to campaign", callback_data=f"c:{parts[campaign_part]}:open")])
+        rows.append(
+            [
+                InlineKeyboardButton(text="Campaigns", callback_data="home:campaigns:0"),
+                InlineKeyboardButton(text="Home", callback_data="home:back"),
+            ]
+        )
+        return _markup(rows)
 
     async def _home(self, query: CallbackQuery, action: str) -> None:
         # Moving between top-level areas is an explicit cancellation point for
         # a pending text-entry step.  Otherwise an old message sent after
         # navigating home could accidentally be consumed by that old step.
-        if action != "create":
+        action_name, _, page_value = action.partition(":")
+        if action_name != "create":
             await self.repositories.clear_owner_session(query.from_user.id)
-        if action == "create":
+        if action_name == "create":
             await self.repositories.set_owner_session(query.from_user.id, {"action": "await_campaign_name"})
             await query.message.answer("What should this campaign be called?", reply_markup=_markup(_navigation()))
-        elif action == "network":
+        elif action_name == "network":
             await self._show_network(query.message)
-        elif action == "campaigns":
-            rows = await self.repositories.list_campaigns()
+        elif action_name == "campaigns":
+            page = max(0, int(page_value or 0))
+            page_size = 8
+            rows = await self.repositories.list_campaigns(page_size, skip=page * page_size)
             if not rows:
-                await query.message.answer("No campaigns yet. Create your first one when ready.", reply_markup=home_keyboard())
+                await self._render(query.message, "No campaigns on this page.", home_keyboard())
                 return
             buttons: list[list[InlineKeyboardButton]] = []
             for row in rows:
                 campaign_id = row["campaign_id"]
                 status = row["status"]
-                buttons.append([InlineKeyboardButton(text=f"{row['name']} ({status})", callback_data=f"c:{campaign_id}:open")])
+                icon = {"DRAFT": "📝", "SCHEDULED": "🕒", "ACTIVE": "🟢", "PAUSED": "⏸", "ENDING": "⌛", "ARCHIVED": "✓"}.get(status, "•")
+                buttons.append([InlineKeyboardButton(text=f"{icon} {row['name']}", callback_data=f"c:{campaign_id}:open")])
                 if status == CampaignStatus.DRAFT.value:
                     buttons.append(
                         [
                             InlineKeyboardButton(text="Send", callback_data=f"c:{campaign_id}:send"),
-                            InlineKeyboardButton(text="Edit", callback_data=f"c:{campaign_id}:edit"),
                             InlineKeyboardButton(text="Delete", callback_data=f"c:{campaign_id}:delete"),
                         ]
                     )
@@ -877,18 +1122,50 @@ class OwnerHandlers:
                 elif status == CampaignStatus.ARCHIVED.value:
                     buttons.append(
                         [
-                            InlineKeyboardButton(text="Run again", callback_data=f"c:{campaign_id}:duplicate"),
+                            InlineKeyboardButton(text="Run again", callback_data=f"c:{campaign_id}:rerun"),
                             InlineKeyboardButton(text="Report", callback_data=f"c:{campaign_id}:progress"),
                         ]
                     )
-            buttons.append([InlineKeyboardButton(text="Back", callback_data="home:back")])
-            await query.message.answer("Campaigns", reply_markup=_markup(buttons))
-        elif action == "back":
+            nav: list[InlineKeyboardButton] = []
+            if page:
+                nav.append(InlineKeyboardButton(text="Previous", callback_data=f"home:campaigns:{page - 1}"))
+            if len(rows) == page_size:
+                nav.append(InlineKeyboardButton(text="Next", callback_data=f"home:campaigns:{page + 1}"))
+            if nav:
+                buttons.append(nav)
+            buttons.append([InlineKeyboardButton(text="Home", callback_data="home:back")])
+            await self._render(query.message, f"Campaigns • page {page + 1}\nTap a campaign for its full controls.", _markup(buttons))
+        elif action_name == "back":
             await self._show_home(query.message)
-        elif action == "backups":
-            await query.message.answer("Use /backup to export a core backup, or /restore then attach a backup file.")
-        elif action == "settings":
+        elif action_name == "backups":
+            await self._render(
+                query.message,
+                "Backups\n\nExport channels, campaign definitions, and settings, or restore a validated iHarvester backup.",
+                _markup(
+                    [
+                        [InlineKeyboardButton(text="Download core backup", callback_data="home:backup_download")],
+                        [InlineKeyboardButton(text="Restore from file", callback_data="home:restore_upload")],
+                        *_navigation(),
+                    ]
+                ),
+            )
+        elif action_name == "backup_download":
+            payload = await make_backup(self.repositories)
+            await query.message.answer_document(
+                BufferedInputFile(payload, filename="iharvester-core-backup.json.gz"),
+                caption="Core backup created.",
+                reply_markup=_markup(_navigation("home:backups")),
+            )
+        elif action_name == "restore_upload":
+            await self.repositories.set_owner_session(query.from_user.id, {"action": "await_restore_file"})
+            await query.message.answer(
+                "Attach an iHarvester .json.gz backup. I will validate it before restoring.",
+                reply_markup=_markup(_navigation()),
+            )
+        elif action_name == "settings":
             await self._show_settings(query.message)
+        else:
+            raise ValueError("that home control is no longer valid")
 
     async def _campaign_action(self, query: CallbackQuery, campaign_id: str, action: str) -> None:
         campaign = await self.repositories.get_campaign(campaign_id)
@@ -899,18 +1176,38 @@ class OwnerHandlers:
             await self._show_campaign(query.message, campaign)
         elif action == "add":
             await query.message.answer("What kind of post are you creating?", reply_markup=content_type_keyboard(campaign_id))
+        elif action == "rename":
+            await self.campaigns.editable_campaign(campaign_id)
+            await self.repositories.set_owner_session(query.from_user.id, {"action": "await_campaign_rename", "campaign_id": campaign_id})
+            await query.message.answer(
+                "Send the new campaign name.",
+                reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
+            )
         elif action == "variants":
             variants = campaign.get("variants", [])
             if not variants:
                 await query.message.answer("No creatives yet.", reply_markup=content_type_keyboard(campaign_id))
             else:
-                rows = [
-                    [InlineKeyboardButton(text=f"Variant {index + 1}: {item['kind']}", callback_data=f"edit:{campaign_id}:{index}")]
-                    for index, item in enumerate(variants)
-                ]
+                rows: list[list[InlineKeyboardButton]] = []
+                for index, item in enumerate(variants):
+                    rows.append(
+                        [
+                            InlineKeyboardButton(
+                                text=f"Creative {index + 1}: {item['kind'].replace('_', ' ').title()}",
+                                callback_data=f"var:{campaign_id}:{index}:preview",
+                            )
+                        ]
+                    )
+                    rows.append(
+                        [
+                            InlineKeyboardButton(text="Replace", callback_data=f"var:{campaign_id}:{index}:replace"),
+                            InlineKeyboardButton(text="CTA", callback_data=f"var:{campaign_id}:{index}:buttons"),
+                            InlineKeyboardButton(text="Delete", callback_data=f"var:{campaign_id}:{index}:delete"),
+                        ]
+                    )
                 rows.append([InlineKeyboardButton(text="Add another creative", callback_data=f"c:{campaign_id}:add")])
                 rows.append([InlineKeyboardButton(text="Back", callback_data=f"c:{campaign_id}:open")])
-                await query.message.answer("Choose a creative to edit its CTA buttons.", reply_markup=_markup(rows))
+                await query.message.answer("Manage campaign content", reply_markup=_markup(rows))
         elif action in {"buttons", "button"}:
             await self._show_button_editor(query.message, campaign, max(0, len(campaign.get("variants", [])) - 1))
         elif action == "destination":
@@ -928,14 +1225,20 @@ class OwnerHandlers:
                         {"mode": CampaignMode.STANDARD.value, "updated_at": datetime.now(UTC)},
                     )
                     campaign["mode"] = CampaignMode.STANDARD.value
-                await query.message.answer("This campaign has one creative, so I set it to Standard. Add another creative to unlock Rotate and Mix + Rotate.")
-                await self._show_campaign(query.message, campaign)
+                notice = await query.message.answer(
+                    "This campaign has one creative, so I set it to Standard. Add another creative to unlock Rotate and Mix + Rotate."
+                )
+                await self._show_campaign(notice, campaign)
                 return
             await query.message.answer("Choose how variants rotate across source channels.", reply_markup=mode_keyboard(campaign_id, variant_count))
         elif action == "schedule":
-            await self.repositories.set_owner_session(query.from_user.id, {"action": "await_schedule_start", "campaign_id": campaign_id})
+            timezone = await self.repositories.get_setting("owner_timezone", "UTC")
+            await self.repositories.set_owner_session(
+                query.from_user.id,
+                {"action": "await_schedule_start", "campaign_id": campaign_id, "timezone": timezone},
+            )
             await query.message.answer(
-                "For a future start, send `YYYY-MM-DD HH:MM` in UTC, for example `2026-09-02 09:30`.",
+                f"For a future start, send YYYY-MM-DD HH:MM in {timezone}, for example 2026-09-02 09:30.",
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
             )
         elif action == "send":
@@ -946,35 +1249,45 @@ class OwnerHandlers:
                 reply_markup=quick_duration_keyboard(campaign_id),
             )
         elif action == "preview":
-            await self._preview_variant(query, campaign_id, 0)
+            notice = await self._preview_all(query.message, query.from_user.id, campaign_id)
+            await self._show_campaign(notice, await self.repositories.get_campaign(campaign_id))
         elif action == "test":
             await self.repositories.set_owner_session(query.from_user.id, {"action": "await_test_channel", "campaign_id": campaign_id})
             await query.message.answer(
-                "Send one owner-controlled test channel ID. The first creative will be posted there.",
+                "Send 1-3 owner-controlled test channel IDs, separated by commas. Every saved creative will be posted to each channel once.",
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
             )
         elif action == "launch":
             await self._show_launch_confirmation(query.message, campaign_id)
         elif action == "extend6":
             await self.campaigns.extend(campaign_id, query.from_user.id, 6 * 3600)
-            await query.message.answer("Campaign extended by 6 hours.")
             await self._show_campaign(query.message, await self.repositories.get_campaign(campaign_id))
         elif action == "extend24":
             await self.campaigns.extend(campaign_id, query.from_user.id, 24 * 3600)
-            await query.message.answer("Campaign extended by 1 day.")
             await self._show_campaign(query.message, await self.repositories.get_campaign(campaign_id))
+        elif action == "extend72":
+            await self.campaigns.extend(campaign_id, query.from_user.id, 72 * 3600)
+            await self._show_campaign(query.message, await self.repositories.get_campaign(campaign_id))
+        elif action == "extendcustom":
+            await self.repositories.set_owner_session(query.from_user.id, {"action": "await_campaign_extension", "campaign_id": campaign_id})
+            await query.message.answer(
+                "Send the extension, for example 45m, 3h, 3d, or 1mo.",
+                reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
+            )
         elif action == "pause":
             paused = await self.campaigns.pause(campaign_id, query.from_user.id)
-            await query.message.answer("Campaign frozen. Queued messages are held, and the remaining campaign window will shift forward when you resume.")
             await self._show_campaign(query.message, paused)
         elif action == "resume":
             resumed = await self.campaigns.resume(campaign_id, query.from_user.id)
-            await query.message.answer("Campaign resumed. Its remaining schedule and end time were extended by the frozen time.")
             await self._show_campaign(query.message, resumed)
         elif action == "retention":
             await query.message.answer(
                 "After the last repost, what should happen at campaign end? Stop & delete always overrides this choice.",
-                reply_markup=retention_keyboard(campaign_id, campaign.get("delete_on_end", True)),
+                reply_markup=retention_keyboard(
+                    campaign_id,
+                    campaign.get("delete_on_end", True),
+                    campaign.get("delete_on_next_campaign", False),
+                ),
             )
         elif action == "end":
             await query.message.answer(
@@ -992,20 +1305,25 @@ class OwnerHandlers:
             changed = await self.repositories.mark_retained_campaign_ending(campaign_id)
             if not changed:
                 raise ValueError("there are no retained posts available for cleanup on this campaign")
-            await query.message.answer(
+            notice = await query.message.answer(
                 "Retained campaign posts are queued for deletion. Refresh the dashboard in a few seconds to see the final cleanup result."
             )
-            await self._show_campaign(query.message, await self.repositories.get_campaign(campaign_id))
+            await self._show_campaign(notice, await self.repositories.get_campaign(campaign_id))
         elif action == "duplicate":
             copied = await self.campaigns.duplicate(campaign_id, query.from_user.id)
-            await query.message.answer("Created a new editable draft from the archived campaign.")
             await self._show_campaign(query.message, copied)
+        elif action == "rerun":
+            copied = await self.campaigns.prepare_rerun(campaign_id, query.from_user.id)
+            await self._show_launch_confirmation(query.message, copied["campaign_id"])
+        elif action == "todraft":
+            draft = await self.campaigns.return_to_draft(campaign_id, query.from_user.id)
+            await self._show_campaign(query.message, draft)
         elif action == "refactor":
             copied = await self.campaigns.fork_to_draft(campaign_id, query.from_user.id)
-            await query.message.answer(
+            notice = await query.message.answer(
                 "The running campaign remains unchanged. I created an editable draft copy so you can safely replace content, buttons, targets, or schedule.",
             )
-            await self._show_campaign(query.message, copied)
+            await self._show_campaign(notice, copied)
         elif action == "delete":
             if campaign["status"] != CampaignStatus.DRAFT.value:
                 raise ValueError("only drafts can be deleted; end a live campaign instead")
@@ -1023,51 +1341,68 @@ class OwnerHandlers:
         elif action == "progress":
             await self._show_campaign(query.message, campaign)
         elif action == "failures":
-            cycle = max(0, int(campaign.get("next_cycle_number", 1)) - 1)
-            failures = await self.repositories.failed_deliveries(campaign_id, cycle)
+            # Keep the drill-down safely below Telegram's message-size limit;
+            # the newest failures are the most actionable ones.
+            failures = await self.repositories.failed_deliveries(campaign_id, limit=8)
             if not failures:
                 await query.message.answer(
-                    "No failed or unknown deliveries in the current cycle.", reply_markup=campaign_keyboard(campaign_id, campaign["status"])
+                    "No failed, unknown, or cleanup-failed deliveries in this campaign.",
+                    reply_markup=campaign_keyboard(campaign_id, campaign["status"], variant_count=len(campaign.get("variants", []))),
                 )
                 return
-            lines = [f"Current cycle failures ({len(failures)} shown)", ""]
+            lines = [f"Campaign failures ({len(failures)} shown)", ""]
             for item in failures:
                 channel = await self.repositories.get_channel(item["channel_id"])
                 title = channel.get("title") if channel else str(item["channel_id"])
-                lines.append(f"- {title}: {item['status'].replace('_', ' ').title()} ({item.get('error_category', 'no category')})")
-            await query.message.answer("\n".join(lines), reply_markup=campaign_keyboard(campaign_id, campaign["status"]))
+                lines.append(
+                    f"- {title} ({item['channel_id']})\n"
+                    f"  {item['status'].replace('_', ' ').title()} • {item.get('error_category', 'no category')}\n"
+                    f"  Attempts: {item.get('attempts', 0)} • Last: {self._date(item.get('updated_at'), campaign.get('owner_timezone', 'UTC'))}\n"
+                    f"  {item.get('error_summary', 'No additional Telegram error summary was stored.')}"
+                )
+            await query.message.answer(
+                "\n".join(lines),
+                reply_markup=campaign_keyboard(campaign_id, campaign["status"], variant_count=len(campaign.get("variants", []))),
+            )
         elif action == "retry":
-            cycle = max(0, int(campaign.get("next_cycle_number", 1)) - 1)
-            count = await self.repositories.retry_failed_deliveries(campaign_id, cycle)
+            count = await self.repositories.retry_failed_deliveries(campaign_id)
             noun = "delivery" if count == 1 else "deliveries"
-            await query.message.answer(f"Queued {count} failed {noun} for one owner-requested retry. Unknown send results were not retried.")
-            await self._show_campaign(query.message, await self.repositories.get_campaign(campaign_id))
+            notice = await query.message.answer(
+                f"Queued {count} failed {noun} across this campaign for one owner-requested retry. "
+                "Unknown send results were not retried."
+            )
+            await self._show_campaign(notice, await self.repositories.get_campaign(campaign_id))
+        else:
+            raise ValueError("that campaign control is no longer valid")
 
     async def _set_mode(self, query: CallbackQuery, campaign_id: str, mode: str) -> None:
         campaign = await self.campaigns.editable_campaign(campaign_id)
         if mode != CampaignMode.STANDARD.value and len(campaign.get("variants", [])) < 2:
             raise ValueError("Rotate and Mix + Rotate need at least two creatives.")
-        await self.repositories.update_campaign(campaign_id, {"mode": CampaignMode(mode).value, "preview_sent": False, "updated_at": datetime.now(UTC)})
+        await self.repositories.update_campaign(campaign_id, {"mode": CampaignMode(mode).value, "updated_at": datetime.now(UTC)})
         campaign["mode"] = mode
-        await query.message.answer(f"Mode set to {mode}. Review/preview again before launch.")
         await self._show_campaign(query.message, campaign)
 
     async def _set_retention(self, query: CallbackQuery, campaign_id: str, action: str) -> None:
         campaign = await self.repositories.get_campaign(campaign_id)
         if not campaign or campaign["status"] in {CampaignStatus.ENDING.value, CampaignStatus.ARCHIVED.value}:
             raise ValueError("end behavior can only be changed before a campaign is ending or archived")
-        if action not in {"delete", "keep"}:
+        if action not in {"delete", "replace", "keep"}:
             raise ValueError("invalid end behavior")
         delete_on_end = action == "delete"
+        delete_on_next_campaign = action == "replace"
         if delete_on_end and not self._campaign_supports_final_cleanup(campaign):
             raise ValueError("this repost plan has a gap over 47 hours, so choose Keep final post or add a nearer final repost")
-        await self.repositories.update_campaign(campaign_id, {"delete_on_end": delete_on_end, "updated_at": datetime.now(UTC)})
-        campaign["delete_on_end"] = delete_on_end
-        await query.message.answer(
-            "The final post will be deleted at campaign end."
-            if delete_on_end
-            else "The final post will remain after campaign end until you stop/delete it or remove it manually."
+        await self.repositories.update_campaign(
+            campaign_id,
+            {
+                "delete_on_end": delete_on_end,
+                "delete_on_next_campaign": delete_on_next_campaign,
+                "updated_at": datetime.now(UTC),
+            },
         )
+        campaign["delete_on_end"] = delete_on_end
+        campaign["delete_on_next_campaign"] = delete_on_next_campaign
         await self._show_campaign(query.message, campaign)
 
     async def _set_button_layout(self, query: CallbackQuery, campaign_id: str, index: int, layout: str) -> None:
@@ -1077,7 +1412,6 @@ class OwnerHandlers:
         await self.repositories.update_campaign(
             campaign_id, {"variants": [item.model_dump(mode="json") for item in variants], "preview_sent": False, "updated_at": datetime.now(UTC)}
         )
-        await query.message.answer(f"Button layout set to {layout}.")
         campaign["variants"] = [item.model_dump(mode="json") for item in variants]
         await self._show_button_editor(query.message, campaign, index)
 
@@ -1092,26 +1426,105 @@ class OwnerHandlers:
             campaign_id, {"variants": [item.model_dump(mode="json") for item in variants], "preview_sent": False, "updated_at": datetime.now(UTC)}
         )
         campaign["variants"] = [item.model_dump(mode="json") for item in variants]
-        await query.message.answer("Button removed.")
         await self._show_button_editor(query.message, campaign, index)
 
     async def _preview_variant(self, query: CallbackQuery, campaign_id: str, index: int) -> None:
-        await self._send_preview(query.message, query.from_user.id, campaign_id, index)
+        notice = await self._send_preview(query.message, query.from_user.id, campaign_id, index)
+        campaign = await self.repositories.get_campaign(campaign_id)
+        if campaign:
+            await self._show_button_editor(notice, campaign, index)
 
-    async def _send_preview(self, message: Message, owner_id: int, campaign_id: str, index: int) -> None:
+    async def _variant_action(self, query: CallbackQuery, campaign_id: str, index: int, action: str) -> None:
+        campaign = await self.campaigns.editable_campaign(campaign_id)
+        variants = campaign.get("variants", [])
+        if index < 0 or index >= len(variants):
+            raise ValueError("that creative no longer exists")
+        if action == "preview":
+            notice = await self._send_preview(query.message, query.from_user.id, campaign_id, index)
+            await self._show_campaign(notice, await self.repositories.get_campaign(campaign_id))
+        elif action == "buttons":
+            await self._show_button_editor(query.message, campaign, index)
+        elif action == "replace":
+            await self.repositories.set_owner_session(
+                query.from_user.id,
+                {"action": "await_replace_creative", "campaign_id": campaign_id, "variant_index": index},
+            )
+            await query.message.answer(
+                "Send or forward the replacement post. Its formatting and media will be preserved; existing CTA buttons stay attached.",
+                reply_markup=_markup(_navigation(f"c:{campaign_id}:variants")),
+            )
+        elif action == "delete":
+            await query.message.answer(
+                f"Delete creative {index + 1}?",
+                reply_markup=_markup(
+                    [
+                        [
+                            InlineKeyboardButton(text="Delete creative", callback_data=f"var:{campaign_id}:{index}:remove"),
+                            InlineKeyboardButton(text="Cancel", callback_data=f"c:{campaign_id}:variants"),
+                        ]
+                    ]
+                ),
+            )
+        elif action == "remove":
+            variants.pop(index)
+            update: Document = {
+                "variants": variants,
+                "preview_sent": False,
+                "previewed_variant_ids": [],
+                "updated_at": datetime.now(UTC),
+            }
+            if len(variants) < 2:
+                update["mode"] = CampaignMode.STANDARD.value
+            await self.repositories.update_campaign(campaign_id, update)
+            notice = await query.message.answer("Creative deleted. Rotation was reset to Standard if fewer than two remain.")
+            await self._show_campaign(notice, await self.repositories.get_campaign(campaign_id))
+        else:
+            raise ValueError("unknown creative action")
+
+    async def _send_preview(self, message: Message, owner_id: int, campaign_id: str, index: int) -> Message:
         campaign = await self.repositories.get_campaign(campaign_id)
         if not campaign or index >= len(campaign.get("variants", [])):
             raise ValueError("add a creative first")
         await self.sender.send_variant(owner_id, campaign["variants"][index])
-        await self.repositories.update_campaign(campaign_id, {"preview_sent": True, "updated_at": datetime.now(UTC)})
-        await message.answer("That is a real Telegram preview using the saved content and CTA keyboard.")
+        previewed = set(campaign.get("previewed_variant_ids", []))
+        previewed.add(campaign["variants"][index]["id"])
+        current_ids = {variant["id"] for variant in campaign["variants"]}
+        await self.repositories.update_campaign(
+            campaign_id,
+            {
+                "previewed_variant_ids": sorted(previewed & current_ids),
+                "preview_sent": current_ids <= previewed,
+                "updated_at": datetime.now(UTC),
+            },
+        )
+        return await message.answer("That is a real Telegram preview using the saved content and CTA keyboard.")
+
+    async def _preview_all(self, message: Message, owner_id: int, campaign_id: str) -> Message:
+        campaign = await self.repositories.get_campaign(campaign_id)
+        variants = campaign.get("variants", []) if campaign else []
+        if not variants:
+            raise ValueError("add a creative first")
+        for variant in variants:
+            await self.sender.send_variant(owner_id, variant)
+        await self.repositories.update_campaign(
+            campaign_id,
+            {
+                "previewed_variant_ids": [variant["id"] for variant in variants],
+                "preview_sent": True,
+                "updated_at": datetime.now(UTC),
+            },
+        )
+        return await message.answer(
+            f"Previewed all {len(variants)} creative{'s' if len(variants) != 1 else ''} with their saved formatting and CTA keyboards."
+        )
 
     async def _show_launch_confirmation(self, message: Message, campaign_id: str) -> None:
         campaign, errors, source_count, protected_count, eligible_count = await self.campaigns.launch_summary(campaign_id)
         if errors:
-            await message.answer(
+            await self._render(
+                message,
                 "Launch checklist\n\n" + "\n".join(f"- {error}" for error in errors),
-                reply_markup=campaign_keyboard(campaign_id, campaign["status"]),
+                campaign_keyboard(campaign_id, campaign["status"], variant_count=len(campaign.get("variants", []))),
             )
             return
         interval = campaign.get("repost_interval_seconds")
@@ -1123,18 +1536,40 @@ class OwnerHandlers:
             if interval
             else "at " + ", ".join(_period_label(offset // 60) for offset in offsets)
         )
-        cleanup_text = "delete final post" if campaign.get("delete_on_end", True) else "keep final post"
-        await message.answer(
+        cleanup_text = (
+            "delete final post"
+            if campaign.get("delete_on_end", True)
+            else "keep until replaced by a future campaign"
+            if campaign.get("delete_on_next_campaign", False)
+            else "keep until manually deleted"
+        )
+        display_timezone = campaign.get("owner_timezone", "UTC")
+        estimated_cycle_seconds = max(1, ceil(eligible_count / self.campaigns.send_rps))
+        reused_invite_count = (
+            sum(1 for destination in campaign.get("destinations", []) if destination.get("campaign_invite_link"))
+            if campaign.get("derived_from_campaign_id")
+            else 0
+        )
+        tracking_notice = (
+            f"\nInvite attribution: {reused_invite_count} saved campaign link{'s are' if reused_invite_count != 1 else ' is'} reused; "
+            "replace under Promoted links when you need a new campaign-unique link."
+            if reused_invite_count
+            else ""
+        )
+        await self._render(
+            message,
             "Ready to launch\n\n"
             f"This campaign will target {eligible_count} source channels.\n"
             f"{protected_count} promoted destination channels are excluded automatically.\n"
-            f"Start: {self._date(campaign['start_at_utc'])}\n"
-            f"End: {self._date(campaign['current_end_at_utc'])}\n"
+            f"Start: {self._date(campaign['start_at_utc'], display_timezone)}\n"
+            f"End: {self._date(campaign['current_end_at_utc'], display_timezone)}\n"
             f"Repost: {repost_text}\n"
             f"End behavior: {cleanup_text}\n"
             f"Mode: {campaign['mode']} ({len(campaign['variants'])} creative{'s' if len(campaign['variants']) != 1 else ''})\n"
-            f"Active sources before destination protection: {source_count}",
-            reply_markup=_markup(
+            f"Active sources before destination protection: {source_count}\n"
+            f"Estimated first cycle: {self._duration_label(estimated_cycle_seconds)} at the configured send rate"
+            f"{tracking_notice}",
+            _markup(
                 [
                     [
                         InlineKeyboardButton(text="Launch now", callback_data=f"confirm:{campaign_id}:launch"),
@@ -1155,15 +1590,16 @@ class OwnerHandlers:
         else:
             lines.append("None yet. Add each promoted channel/link here.")
         cid = campaign["campaign_id"]
-        await message.answer(
-            "\n".join(lines),
-            reply_markup=_markup(
-                [
-                    [InlineKeyboardButton(text="+ Add destination", callback_data=f"dest:{cid}:add")],
-                    [InlineKeyboardButton(text="Back", callback_data=f"c:{cid}:open")],
-                ]
-            ),
+        controls: list[list[InlineKeyboardButton]] = []
+        for index, destination in enumerate(destinations):
+            controls.append([InlineKeyboardButton(text=f"Remove {destination['display_name']}", callback_data=f"dest:{cid}:remove-{index}")])
+        controls.extend(
+            [
+                [InlineKeyboardButton(text="+ Add destination", callback_data=f"dest:{cid}:add")],
+                [InlineKeyboardButton(text="Back", callback_data=f"c:{cid}:open")],
+            ]
         )
+        await self._render(message, "\n".join(lines), _markup(controls))
 
     async def _destination_action(self, query: CallbackQuery, campaign_id: str, action: str) -> None:
         await self.campaigns.editable_campaign(campaign_id)
@@ -1180,19 +1616,30 @@ class OwnerHandlers:
             await self._save_destination(campaign_id, session["name"], session["url"], None)
             await self.repositories.clear_owner_session(query.from_user.id)
             campaign = await self.repositories.get_campaign(campaign_id)
-            await query.message.answer("Destination saved. A link-only destination cannot be automatically excluded until its channel is registered.")
+            notice = await query.message.answer("Destination saved. A link-only destination cannot be automatically excluded until its channel is registered.")
+            await self._show_destinations(notice, campaign)
+        elif action.startswith("remove-"):
+            campaign = await self.campaigns.editable_campaign(campaign_id)
+            destinations = list(campaign.get("destinations", []))
+            index = int(action.removeprefix("remove-"))
+            if index < 0 or index >= len(destinations):
+                raise ValueError("that destination no longer exists")
+            destinations.pop(index)
+            await self.repositories.update_campaign(campaign_id, {"destinations": destinations, "updated_at": datetime.now(UTC)})
+            campaign["destinations"] = destinations
             await self._show_destinations(query.message, campaign)
+        else:
+            raise ValueError("that destination control is no longer valid")
 
     async def _target_action(self, query: CallbackQuery, campaign_id: str, action: str) -> None:
         await self.campaigns.editable_campaign(campaign_id)
         if action == "all":
-            await self.repositories.update_campaign(campaign_id, {"target_selector": {}, "preview_sent": False, "updated_at": datetime.now(UTC)})
-            await query.message.answer("Targets set to all active source channels. Destination channels will still be excluded.")
+            await self.repositories.update_campaign(campaign_id, {"target_selector": {}, "updated_at": datetime.now(UTC)})
             await self._show_campaign(query.message, await self.repositories.get_campaign(campaign_id))
         else:
             prompts = {
-                "tags": "Send comma-separated tags to include, for example `movies, kenya`.",
-                "members": "Send the minimum member count, for example `1000`.",
+                "tags": "Send comma-separated tags to include, for example: movies, kenya.",
+                "members": "Send an audience range such as 1000-50000, a minimum such as 1000+, or just 1000 for a minimum.",
                 "include": "Send comma-separated numeric channel IDs to include.",
                 "exclude": "Send comma-separated numeric channel IDs to exclude.",
             }
@@ -1206,8 +1653,7 @@ class OwnerHandlers:
         if value == "custom":
             await self.repositories.set_owner_session(query.from_user.id, {**session, "action": "await_schedule_interval_custom"})
             await query.message.answer(
-                "Send the repost interval, for example `5m`, `2h`, or `1d`. It must be shorter than the campaign; "
-                "a final partial gap simply ends at campaign end.",
+                "Send the repost interval, for example 5m, 2h, or 1d. It must be shorter than the campaign; a final partial gap simply ends at campaign end.",
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
             )
             return
@@ -1216,8 +1662,8 @@ class OwnerHandlers:
         self._validate_repost_interval(duration_minutes, interval_minutes)
         await self._save_schedule(campaign_id, session["start"], session["end"], interval_minutes)
         await self.repositories.clear_owner_session(query.from_user.id)
-        await query.message.answer("Schedule saved.")
-        await self._show_campaign(query.message, await self.repositories.get_campaign(campaign_id))
+        notice = await query.message.answer("Schedule saved.")
+        await self._show_campaign(notice, await self.repositories.get_campaign(campaign_id))
 
     async def _specific_repost_times(self, query: CallbackQuery, campaign_id: str, flow: str) -> None:
         session = await self.repositories.owner_session(query.from_user.id)
@@ -1228,7 +1674,7 @@ class OwnerHandlers:
         action = "await_quick_repost_times" if flow == "qmin" else "await_schedule_repost_times"
         await self.repositories.set_owner_session(query.from_user.id, {**session, "action": action})
         await query.message.answer(
-            "Enter 1-20 exact elapsed repost times after launch, separated by commas. For example `1d, 4d, 6d` means "
+            "Enter 1-20 exact elapsed repost times after launch, separated by commas. For example 1d, 4d, 6d means "
             "an initial post now, then reposts at day 1, day 4, and day 6. Times can be uneven. If a final time runs "
             f"past the {_period_label(duration_minutes)} campaign, it is moved just before the end.",
             reply_markup=_markup(_navigation(f"c:{campaign_id}:send" if flow == "qmin" else f"c:{campaign_id}:open")),
@@ -1243,7 +1689,7 @@ class OwnerHandlers:
         action = "await_quick_repost_gaps" if flow == "qmin" else "await_schedule_repost_gaps"
         await self.repositories.set_owner_session(query.from_user.id, {**session, "action": action})
         await query.message.answer(
-            "Enter 1-20 custom gaps between posts, separated by commas. For example `1d, 3d, 2d` means "
+            "Enter 1-20 custom gaps between posts, separated by commas. For example 1d, 3d, 2d means "
             "post now, then repost after 1 day, then 3 days later, then 2 days later. "
             f"If the final gap would run past the {_period_label(duration_minutes)} campaign, it is shortened to land just before the end.",
             reply_markup=_markup(_navigation(f"c:{campaign_id}:send" if flow == "qmin" else f"c:{campaign_id}:open")),
@@ -1256,7 +1702,7 @@ class OwnerHandlers:
         await self.campaigns.editable_campaign(campaign_id)
         await self.repositories.set_owner_session(query.from_user.id, {"action": "await_quick_duration", "campaign_id": campaign_id})
         await query.message.answer(
-            "Send the campaign duration, for example `45m`, `2h`, `3d`, or `1mo`. One month is 30 days.",
+            "Send the campaign duration, for example 45m, 2h, 3d, or 1mo. One month is 30 days.",
             reply_markup=_markup(_navigation(f"c:{campaign_id}:send")),
         )
 
@@ -1264,7 +1710,7 @@ class OwnerHandlers:
         await self.campaigns.editable_campaign(campaign_id)
         if minutes < 1:
             raise ValueError("campaign duration must be at least 1 minute")
-        default_hours = int(await self.repositories.get_setting("quick_interval_hours", 6))
+        default_hours = float(await self.repositories.get_setting("quick_interval_hours", 6))
         await self.repositories.set_owner_session(
             owner_id,
             {"action": "await_quick_interval", "campaign_id": campaign_id, "duration_minutes": minutes},
@@ -1282,8 +1728,7 @@ class OwnerHandlers:
         if value == "custom":
             await self.repositories.set_owner_session(query.from_user.id, {**session, "action": "await_quick_interval_custom"})
             await query.message.answer(
-                "Send the repost interval, for example `5m`, `2h`, or `1d`. It must be shorter than the campaign; "
-                "the campaign ends after its final partial gap.",
+                "Send the repost interval, for example 5m, 2h, or 1d. It must be shorter than the campaign; the campaign ends after its final partial gap.",
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:send")),
             )
             return
@@ -1307,8 +1752,18 @@ class OwnerHandlers:
         await self.repositories.clear_owner_session(owner_id)
         if repost_plan_adjusted:
             await message.answer("The requested repost plan ran past campaign end, so its final repost was moved just before the end of the campaign.")
-        await self._send_preview(message, owner_id, campaign_id, 0)
-        await self._show_launch_confirmation(message, campaign_id)
+        try:
+            notice = await self._preview_all(message, owner_id, campaign_id)
+        except Exception:
+            logger.exception("Quick-send preview failed", extra={"campaign_id": campaign_id})
+            campaign = await self.repositories.get_campaign(campaign_id)
+            await message.answer(
+                "Timing was saved, but Telegram could not complete the owner preview. Nothing was launched. "
+                "Open the draft and use Preview all to retry.",
+                reply_markup=campaign_keyboard(campaign_id, CampaignStatus.DRAFT.value, variant_count=len(campaign.get("variants", [])) if campaign else 0),
+            )
+            return
+        await self._show_launch_confirmation(notice, campaign_id)
 
     @staticmethod
     def _duration_minutes(start: datetime, end: datetime) -> int:
@@ -1346,13 +1801,42 @@ class OwnerHandlers:
         return duration_minutes <= _SAFE_REPOST_MAX_MINUTES or bool(interval and interval <= _SAFE_REPOST_MAX_MINUTES * 60)
 
     async def _settings_action(self, query: CallbackQuery, action: str, value: str) -> None:
+        if action == "timezone" and value == "custom":
+            await self.repositories.set_owner_session(query.from_user.id, {"action": "await_setting_timezone"})
+            await query.message.answer(
+                "Send an IANA timezone, for example Africa/Lagos, Europe/London, or America/New_York.",
+                reply_markup=_markup(_navigation("home:settings")),
+            )
+            return
         if action == "timezone" and value in {"UTC", "Africa/Nairobi"}:
             await self.repositories.set_setting("owner_timezone", value)
+        elif action == "interval" and value == "custom":
+            await self.repositories.set_owner_session(query.from_user.id, {"action": "await_setting_interval"})
+            await query.message.answer(
+                "Send a default repost period such as 45m, 6h, or 2d.",
+                reply_markup=_markup(_navigation("home:settings")),
+            )
+            return
         elif action == "interval" and value in {"0", "6", "24"}:
-            await self.repositories.set_setting("quick_interval_hours", int(value))
+            await self.repositories.set_setting("quick_interval_hours", float(value))
+        elif action == "backup" and value in {"on", "off"}:
+            await self.repositories.set_setting("auto_backup_enabled", value == "on")
+        elif action == "backup_channels" and value == "custom":
+            await self.repositories.set_owner_session(query.from_user.id, {"action": "await_setting_backup_channels"})
+            await query.message.answer(
+                "Send how many newly discovered channels should trigger a backup, for example 100.",
+                reply_markup=_markup(_navigation("home:settings")),
+            )
+            return
+        elif action == "backup_interval" and value == "custom":
+            await self.repositories.set_owner_session(query.from_user.id, {"action": "await_setting_backup_interval"})
+            await query.message.answer(
+                "Send the maximum time between backups, for example 7d or 12h.",
+                reply_markup=_markup(_navigation("home:settings")),
+            )
+            return
         else:
             raise ValueError("invalid setting")
-        await query.message.answer("Setting saved.")
         await self._show_settings(query.message)
 
     async def _network_action(self, query: CallbackQuery, data: str) -> None:
@@ -1367,68 +1851,98 @@ class OwnerHandlers:
             )
         elif parts[1] == "list" and len(parts) == 4:
             await self._show_network_list(query.message, parts[2], int(parts[3]))
+        else:
+            raise ValueError("that network control is no longer valid")
 
     async def _channel_action(self, query: CallbackQuery, bot: Bot, chat_id: int, action: str) -> None:
         if action in {"refresh", "Refresh"}:
             success = await refresh_channel(bot, self.repositories, chat_id)
-            await query.message.answer("Channel refreshed." if success else "Channel needs attention; check bot admin/posting rights.")
-            await self._show_channel(query.message, chat_id)
+            notice = await query.message.answer("Channel refreshed." if success else "Channel needs attention; check bot admin/posting rights.")
+            await self._show_channel(notice, chat_id)
         elif action == "tag":
             await self.repositories.set_owner_session(query.from_user.id, {"action": "await_channel_tag", "channel_id": chat_id})
             await query.message.answer("Send one or more comma-separated tags.", reply_markup=_markup(_navigation("net:home")))
         elif action == "disable":
             await self.repositories.set_channel_manual_enabled(chat_id, False)
-            await query.message.answer("Source channel paused. It will not be selected by new campaigns.")
+            notice = await query.message.answer("Source channel paused. It will not be selected by new campaigns.")
+            await self._show_channel(notice, chat_id)
         elif action == "enable":
-            await self.repositories.set_channel_manual_enabled(chat_id, True)
-            await query.message.answer("Source channel enabled again.")
+            success = await refresh_channel(bot, self.repositories, chat_id)
+            notice = await query.message.answer(
+                "Source channel enabled and access verified."
+                if success
+                else "The channel remains unavailable. Restore the bot's admin/post permission, then refresh it."
+            )
+            await self._show_channel(notice, chat_id)
         elif action == "view":
             await self._show_channel(query.message, chat_id)
+        else:
+            raise ValueError("that channel control is no longer valid")
 
     async def _confirm(self, query: CallbackQuery, campaign_id: str, action: str) -> None:
         if action == "launch":
             activated = await self.campaigns.activate(campaign_id)
-            await query.message.answer(
+            notice = await query.message.answer(
                 f"{activated['name']} is now {activated['status']}. It targets {len(activated['target_snapshot'])} source channels. "
                 "The first deliveries are being queued now and normally appear within a few seconds."
             )
-            await self._show_campaign(query.message, activated)
+            await self._show_campaign(notice, activated)
         elif action == "end":
             changed = await self.campaigns.end_early(campaign_id)
-            await query.message.answer(
+            notice = await query.message.answer(
                 "Campaign ending: future cycles are stopped and live posts will be cleaned up." if changed else "Campaign was already ending or archived."
             )
             campaign = await self.repositories.get_campaign(campaign_id)
             if campaign:
-                await self._show_campaign(query.message, campaign)
+                await self._show_campaign(notice, campaign)
         elif action == "delete":
             deleted = await self.campaigns.delete_draft(campaign_id)
-            await query.message.answer("Draft deleted." if deleted else "That draft has already been removed.")
-            await self._show_home(query.message)
+            notice = await query.message.answer("Draft deleted." if deleted else "That draft has already been removed.")
+            await self._show_home(notice)
+        else:
+            raise ValueError("that confirmation is no longer valid")
 
     async def _restore_confirm(self, query: CallbackQuery, restore_id: str, action: str) -> None:
         if action == "cancel":
             await self.repositories.delete_pending_restore(restore_id, query.from_user.id)
-            await query.message.answer("Restore cancelled.")
+            await query.message.answer("Restore cancelled.", reply_markup=home_keyboard())
             return
+        if action != "confirm":
+            raise ValueError("that restore control is no longer valid")
         pending = await self.repositories.get_pending_restore(restore_id, query.from_user.id)
         if not pending:
             raise ValueError("restore request expired")
         result = await restore_backup(self.repositories, pending["backup"])
         await self.repositories.delete_pending_restore(restore_id, query.from_user.id)
-        await query.message.answer(f"Restore complete: {result}")
+        await query.message.answer(f"Restore complete: {result}", reply_markup=home_keyboard())
 
     async def message(self, message: Message, bot: Bot) -> None:
         if not self._allowed(message.from_user.id if message.from_user else None, message.chat.type):
             return
         session = await self.repositories.owner_session(message.from_user.id)
         if not session:
-            await register_forwarded_channel(message, bot, self.repositories)
+            if not await register_forwarded_channel(message, bot, self.repositories):
+                await message.answer(
+                    "No setup step is waiting for this message. Use the controls below, or forward a channel post to register it.",
+                    reply_markup=home_keyboard(),
+                )
             return
         try:
             await self._handle_session_message(message, bot, session)
         except (ValueError, ValidationError) as error:
-            await message.answer(f"That did not work: {error}. Please try again, or use /start to begin a new action.")
+            await message.answer(
+                f"That did not work: {error}. Correct the value and try again, or leave this step with the controls below.",
+                reply_markup=self._session_recovery_keyboard(session),
+            )
+
+    @staticmethod
+    def _session_recovery_keyboard(session: Document) -> InlineKeyboardMarkup:
+        campaign_id = session.get("campaign_id")
+        if campaign_id:
+            return _markup(_navigation(f"c:{campaign_id}:open"))
+        if session.get("action") in {"await_channel_forward", "await_channel_tag"}:
+            return _markup(_navigation("net:home"))
+        return _markup(_navigation())
 
     async def _handle_session_message(self, message: Message, bot: Bot, session: Document) -> None:
         action = session.get("action")
@@ -1456,7 +1970,10 @@ class OwnerHandlers:
             )
             return
         if action == "await_campaign_name":
-            campaign = await self.campaigns.create_draft(owner_id, message.text or "")
+            name = (message.text or "").strip()
+            if not name:
+                raise ValueError("send a campaign name as text")
+            campaign = await self.campaigns.create_draft(owner_id, name)
             await self.repositories.clear_owner_session(owner_id)
             await message.answer("Draft created. Start by choosing what kind of post to send.", reply_markup=content_type_keyboard(campaign["campaign_id"]))
             return
@@ -1472,12 +1989,56 @@ class OwnerHandlers:
             await message.answer(f"Tags saved: {', '.join(tags) or 'none'}")
             await self._show_channel(message, session["channel_id"])
             return
+        if action == "await_setting_timezone":
+            timezone = (message.text or "").strip()
+            try:
+                ZoneInfo(timezone)
+            except ZoneInfoNotFoundError as error:
+                raise ValueError("use a valid IANA timezone such as Africa/Nairobi") from error
+            await self.repositories.set_setting("owner_timezone", timezone)
+            await self.repositories.clear_owner_session(owner_id)
+            await message.answer(f"Timezone saved as {timezone}.")
+            await self._show_settings(message)
+            return
+        if action == "await_setting_interval":
+            minutes = parse_period_minutes(message.text or "", field="default repost interval")
+            await self.repositories.set_setting("quick_interval_hours", minutes / 60)
+            await self.repositories.clear_owner_session(owner_id)
+            await message.answer(f"Default repost interval saved as {_period_label(minutes)}.")
+            await self._show_settings(message)
+            return
+        if action == "await_setting_backup_channels":
+            threshold = int((message.text or "").strip())
+            if threshold < 1:
+                raise ValueError("backup channel trigger must be at least 1")
+            await self.repositories.set_setting("auto_backup_every_new_channels", threshold)
+            await self.repositories.clear_owner_session(owner_id)
+            await message.answer(f"A registry backup will be triggered every {threshold} new channels.")
+            await self._show_settings(message)
+            return
+        if action == "await_setting_backup_interval":
+            minutes = parse_period_minutes(message.text or "", field="backup interval")
+            hours = max(1, (minutes + 59) // 60)
+            await self.repositories.set_setting("auto_backup_interval_hours", hours)
+            await self.repositories.clear_owner_session(owner_id)
+            await message.answer(f"Automatic backup interval saved as {_period_label(hours * 60)}.")
+            await self._show_settings(message)
+            return
         campaign_id = session.get("campaign_id")
         if not campaign_id:
             await self.repositories.clear_owner_session(owner_id)
             return
         if action == "await_creative":
             await self._capture_creative(message, session)
+        elif action == "await_campaign_rename":
+            name = (message.text or "").strip()
+            if not name:
+                raise ValueError("send a campaign name as text")
+            campaign = await self.campaigns.rename_draft(campaign_id, name)
+            await self.repositories.clear_owner_session(owner_id)
+            await self._show_campaign(message, campaign)
+        elif action == "await_replace_creative":
+            await self._replace_creative(message, session)
         elif action == "await_album":
             await self._capture_album_item(message, session)
         elif action == "await_button_label":
@@ -1486,7 +2047,7 @@ class OwnerHandlers:
                 raise ValueError("send a button label")
             await self.repositories.set_owner_session(owner_id, {**session, "action": "await_button_url", "label": label})
             await message.answer(
-                "Now send its direct destination URL, for example `https://t.me/example`.",
+                "Now send its direct destination URL, for example https://t.me/example.",
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
             )
         elif action == "await_button_url":
@@ -1524,15 +2085,30 @@ class OwnerHandlers:
             await self._show_destinations(message, await self.repositories.get_campaign(campaign_id))
         elif action.startswith("await_target_"):
             await self._save_target(message, session)
+        elif action == "await_campaign_extension":
+            minutes = parse_period_minutes(message.text or "", field="campaign extension")
+            await self.campaigns.extend(campaign_id, owner_id, minutes * 60)
+            await self.repositories.clear_owner_session(owner_id)
+            await message.answer(f"Campaign extended by {_period_label(minutes)}.")
+            await self._show_campaign(message, await self.repositories.get_campaign(campaign_id))
         elif action == "await_schedule_start":
-            start = self._parse_utc(message.text or "")
-            await self.repositories.set_owner_session(owner_id, {"action": "await_schedule_end", "campaign_id": campaign_id, "start": start})
+            timezone = session.get("timezone", "UTC")
+            start = self._parse_owner_time(message.text or "", timezone)
+            await self.repositories.set_owner_session(
+                owner_id,
+                {
+                    "action": "await_schedule_end",
+                    "campaign_id": campaign_id,
+                    "start": start,
+                    "timezone": timezone,
+                },
+            )
             await message.answer(
-                "When should it end? Send `YYYY-MM-DD HH:MM` in UTC.",
+                f"When should it end? Send YYYY-MM-DD HH:MM in {timezone}.",
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
             )
         elif action == "await_schedule_end":
-            end = self._parse_utc(message.text or "")
+            end = self._parse_owner_time(message.text or "", session.get("timezone", "UTC"))
             if end <= session["start"]:
                 raise ValueError("end time must be after start time")
             await self.repositories.set_owner_session(
@@ -1592,9 +2168,26 @@ class OwnerHandlers:
             campaign = await self.repositories.get_campaign(campaign_id)
             if not campaign or not campaign.get("variants"):
                 raise ValueError("add a creative before testing")
-            await self.sender.send_variant(int((message.text or "").strip()), campaign["variants"][0])
+            test_channel_ids = [int(value.strip()) for value in (message.text or "").split(",") if value.strip()]
+            if not 1 <= len(test_channel_ids) <= 3 or len(set(test_channel_ids)) != len(test_channel_ids):
+                raise ValueError("send 1-3 unique numeric test channel IDs")
+            successful = failed = 0
+            for test_channel_id in test_channel_ids:
+                for variant in campaign["variants"]:
+                    try:
+                        await self.sender.send_variant(test_channel_id, variant)
+                        successful += 1
+                    except Exception:
+                        failed += 1
+                        logger.exception(
+                            "Owner test send failed",
+                            extra={"campaign_id": campaign_id, "test_channel_id": test_channel_id},
+                        )
             await self.repositories.clear_owner_session(owner_id)
-            await message.answer("Test send completed.")
+            await message.answer(
+                f"Test send finished: {successful} accepted, {failed} failed across "
+                f"{len(test_channel_ids)} channel{'s' if len(test_channel_ids) != 1 else ''}."
+            )
             await self._show_campaign(message, campaign)
 
     async def _capture_creative(self, message: Message, session: Document) -> None:
@@ -1611,12 +2204,23 @@ class OwnerHandlers:
             raise ValueError("this option needs a video with a caption")
         creative = capture_creative(message)
         campaign = await self.campaigns.editable_campaign(session["campaign_id"])
+        if len(campaign.get("variants", [])) >= _MAX_VARIANTS:
+            raise ValueError(f"a campaign can contain at most {_MAX_VARIANTS} creatives")
         variants = [*campaign.get("variants", []), creative.model_dump(mode="json")]
         await self.repositories.update_campaign(session["campaign_id"], {"variants": variants, "preview_sent": False, "updated_at": datetime.now(UTC)})
         await self.repositories.clear_owner_session(message.from_user.id)
-        await self.sender.send_variant(message.from_user.id, creative.model_dump(mode="json"))
+        preview_ok = True
+        try:
+            await self.sender.send_variant(message.from_user.id, creative.model_dump(mode="json"))
+        except Exception:
+            preview_ok = False
+            logger.exception("Saved creative preview failed", extra={"campaign_id": session["campaign_id"]})
         await message.answer(
-            "Creative saved. The post above is replayable; now add CTA buttons or continue configuring the campaign.",
+            (
+                "Creative saved. The post above is replayable; now add CTA buttons or continue configuring the campaign."
+                if preview_ok
+                else "Creative saved, but Telegram could not render its owner preview. Use Preview all after checking the content."
+            ),
             reply_markup=_markup(
                 [
                     [InlineKeyboardButton(text="+ Add CTA button", callback_data=f"btn:{session['campaign_id']}:{len(variants) - 1}:first")],
@@ -1628,6 +2232,36 @@ class OwnerHandlers:
                 ]
             ),
         )
+
+    async def _replace_creative(self, message: Message, session: Document) -> None:
+        campaign = await self.campaigns.editable_campaign(session["campaign_id"])
+        variants = [Creative.model_validate(item) for item in campaign.get("variants", [])]
+        index = int(session["variant_index"])
+        if index < 0 or index >= len(variants):
+            raise ValueError("that creative no longer exists")
+        replacement = capture_creative(message)
+        replacement.buttons = variants[index].buttons
+        replacement.button_layout = variants[index].button_layout
+        variants[index] = replacement
+        stored = [item.model_dump(mode="json") for item in variants]
+        await self.repositories.update_campaign(
+            session["campaign_id"],
+            {
+                "variants": stored,
+                "preview_sent": False,
+                "previewed_variant_ids": [],
+                "updated_at": datetime.now(UTC),
+            },
+        )
+        await self.repositories.clear_owner_session(message.from_user.id)
+        try:
+            await self._send_preview(message, message.from_user.id, session["campaign_id"], index)
+            replacement_text = "Creative replaced. Its existing CTA buttons and placement were preserved."
+        except Exception:
+            logger.exception("Replacement creative preview failed", extra={"campaign_id": session["campaign_id"]})
+            replacement_text = "Creative replaced and its CTA layout was preserved, but Telegram could not render the preview. Use Preview all to retry."
+        await message.answer(replacement_text)
+        await self._show_campaign(message, await self.repositories.get_campaign(session["campaign_id"]))
 
     async def _capture_album_item(self, message: Message, session: Document) -> None:
         captured = capture_creative(message)
@@ -1665,6 +2299,8 @@ class OwnerHandlers:
         if len(media) < 2:
             raise ValueError("an album needs at least two items")
         campaign = await self.campaigns.editable_campaign(campaign_id)
+        if len(campaign.get("variants", [])) >= _MAX_VARIANTS:
+            raise ValueError(f"a campaign can contain at most {_MAX_VARIANTS} creatives")
         creative = Creative(
             id=opaque_id("var"),
             kind="MEDIA_GROUP",
@@ -1675,9 +2311,18 @@ class OwnerHandlers:
         variants = [*campaign.get("variants", []), creative.model_dump(mode="json")]
         await self.repositories.update_campaign(campaign_id, {"variants": variants, "preview_sent": False, "updated_at": datetime.now(UTC)})
         await self.repositories.clear_owner_session(query.from_user.id)
-        await self.sender.send_variant(query.from_user.id, creative.model_dump(mode="json"))
+        preview_ok = True
+        try:
+            await self.sender.send_variant(query.from_user.id, creative.model_dump(mode="json"))
+        except Exception:
+            preview_ok = False
+            logger.exception("Saved album preview failed", extra={"campaign_id": campaign_id})
         await query.message.answer(
-            "Album saved. Telegram renders its CTA as a compact message after the album when buttons are added.",
+            (
+                "Album saved. Telegram renders its CTA as a compact message after the album when buttons are added."
+                if preview_ok
+                else "Album saved, but Telegram could not render its owner preview. Use Preview all to retry."
+            ),
             reply_markup=_markup(
                 [
                     [InlineKeyboardButton(text="+ Add CTA button", callback_data=f"btn:{campaign_id}:{len(variants) - 1}:first")],
@@ -1691,6 +2336,8 @@ class OwnerHandlers:
         variants = [Creative.model_validate(item) for item in campaign.get("variants", [])]
         index = int(session["variant_index"])
         creative = variants[index]
+        if len(creative.buttons) >= _MAX_CTA_BUTTONS:
+            raise ValueError(f"a creative can contain at most {_MAX_CTA_BUTTONS} CTA buttons")
         placement = session["placement"]
         if placement == "right" and creative.buttons:
             row = max(button.row for button in creative.buttons)
@@ -1712,24 +2359,45 @@ class OwnerHandlers:
 
     async def _save_destination(self, campaign_id: str, name: str, url: str, chat_id: int | None) -> None:
         campaign = await self.campaigns.editable_campaign(campaign_id)
-        destination = Destination(display_name=name, raw_url=url, telegram_chat_id=chat_id)
+        if len(campaign.get("destinations", [])) >= _MAX_DESTINATIONS:
+            raise ValueError(f"a campaign can contain at most {_MAX_DESTINATIONS} promoted destinations")
+        is_invite = bool(re.match(r"^https://t\.me/(?:\+|joinchat/)", url, flags=re.IGNORECASE))
+        destination = Destination(
+            display_name=name,
+            raw_url=url,
+            telegram_chat_id=chat_id,
+            campaign_invite_link=url if is_invite else None,
+            join_tracking_enabled=is_invite,
+        )
         await self.repositories.update_campaign(
             campaign_id,
-            {"destinations": [*campaign.get("destinations", []), destination.model_dump(mode="json")], "preview_sent": False, "updated_at": datetime.now(UTC)},
+            {"destinations": [*campaign.get("destinations", []), destination.model_dump(mode="json")], "updated_at": datetime.now(UTC)},
         )
 
     async def _save_target(self, message: Message, session: Document) -> None:
         kind = session["action"].removeprefix("await_target_")
         raw = (message.text or "").strip()
-        campaign = await self.campaigns.editable_campaign(session["campaign_id"])
-        selector = dict(campaign.get("target_selector") or {})
+        await self.campaigns.editable_campaign(session["campaign_id"])
+        selector: Document = {}
         if kind == "tags":
             selector["tags_any"] = sorted({item.strip().lower() for item in raw.split(",") if item.strip()})
         elif kind == "members":
-            selector["minimum_members"] = int(raw)
+            audience_range = re.fullmatch(r"(\d+)\s*-\s*(\d+)", raw)
+            audience_minimum = re.fullmatch(r"(\d+)\+?", raw)
+            if audience_range:
+                selector["minimum_members"] = int(audience_range.group(1))
+                selector["maximum_members"] = int(audience_range.group(2))
+                if selector["maximum_members"] < selector["minimum_members"]:
+                    raise ValueError("maximum audience must be at least the minimum")
+            elif audience_minimum:
+                selector["minimum_members"] = int(audience_minimum.group(1))
+            else:
+                raise ValueError("use an audience range such as 1000-50000 or a minimum such as 1000+")
         else:
             selector[f"{kind}_ids"] = [int(item.strip()) for item in raw.split(",") if item.strip()]
-        await self.repositories.update_campaign(session["campaign_id"], {"target_selector": selector, "preview_sent": False, "updated_at": datetime.now(UTC)})
+        if not next(iter(selector.values()), None) and kind != "members":
+            raise ValueError("send at least one tag or channel ID")
+        await self.repositories.update_campaign(session["campaign_id"], {"target_selector": selector, "updated_at": datetime.now(UTC)})
         await self.repositories.clear_owner_session(message.from_user.id)
         await message.answer("Target selection saved. Destination channels will remain protected.")
         await self._show_campaign(message, await self.repositories.get_campaign(session["campaign_id"]))
@@ -1753,6 +2421,9 @@ class OwnerHandlers:
         )
         campaign = await self.campaigns.editable_campaign(campaign_id)
         delete_on_end = bool(campaign.get("delete_on_end", True)) and final_cleanup_available
+        delete_on_next_campaign = bool(campaign.get("delete_on_next_campaign", False)) or (
+            bool(campaign.get("delete_on_end", True)) and not final_cleanup_available
+        )
         timezone = await self.repositories.get_setting("owner_timezone", "UTC")
         await self.repositories.update_campaign(
             campaign_id,
@@ -1764,8 +2435,9 @@ class OwnerHandlers:
                 "repost_offsets_seconds": [minutes * 60 for minutes in repost_offsets_minutes] if repost_offsets_minutes is not None else None,
                 "delete_on_repost": True,
                 "delete_on_end": delete_on_end,
+                "delete_on_next_campaign": delete_on_next_campaign,
                 "owner_timezone": timezone,
-                "preview_sent": False,
+                "rerun_ready": False,
                 "updated_at": datetime.now(UTC),
             },
         )
@@ -1783,6 +2455,8 @@ class OwnerHandlers:
         )
 
     @staticmethod
-    def _parse_utc(raw: str) -> datetime:
+    def _parse_owner_time(raw: str, timezone: str) -> datetime:
         value = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
-        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=ZoneInfo(timezone))
+        return value.astimezone(UTC)

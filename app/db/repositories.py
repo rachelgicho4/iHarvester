@@ -51,8 +51,15 @@ class Repositories:
                 query["telegram_chat_id"] = {"$in": include}
             if exclude := selector.get("exclude_ids"):
                 query.setdefault("telegram_chat_id", {})["$nin"] = exclude
-            if minimum_members := selector.get("minimum_members"):
-                query["member_count"] = {"$gte": minimum_members}
+            minimum_members = selector.get("minimum_members")
+            maximum_members = selector.get("maximum_members")
+            if minimum_members is not None or maximum_members is not None:
+                audience: Document = {}
+                if minimum_members is not None:
+                    audience["$gte"] = minimum_members
+                if maximum_members is not None:
+                    audience["$lte"] = maximum_members
+                query["member_count"] = audience
         return query
 
     async def active_channel_count(self, selector: Document | None = None, *, exclude_ids: set[int] | None = None) -> int:
@@ -101,8 +108,82 @@ class Repositories:
     async def get_campaign(self, campaign_id: str) -> Document | None:
         return await self.db.campaigns.find_one({"campaign_id": campaign_id})
 
+    async def recent_pending_rerun(self, source_campaign_id: str, owner_id: int, since: Any) -> Document | None:
+        """Debounce rapid repeated taps on an archived campaign's rerun button."""
+        return await self.db.campaigns.find_one(
+            {
+                "rerun_of_campaign_id": source_campaign_id,
+                "created_by": owner_id,
+                "status": "DRAFT",
+                "rerun_ready": True,
+                "created_at": {"$gte": since},
+            },
+            sort=[("created_at", -1)],
+        )
+
     async def update_campaign(self, campaign_id: str, update: Document) -> bool:
         result = await self.db.campaigns.update_one({"campaign_id": campaign_id}, {"$set": update})
+        return result.modified_count == 1
+
+    async def advance_running_campaign(self, campaign_id: str, update: Document) -> bool:
+        """Advance cycle state without reviving a concurrently paused/ending run."""
+        result = await self.db.campaigns.update_one(
+            {"campaign_id": campaign_id, "status": {"$in": ["SCHEDULED", "ACTIVE"]}},
+            {"$set": update},
+        )
+        return result.modified_count == 1
+
+    async def activate_draft(self, campaign_id: str, update: Document) -> Document | None:
+        """Atomically win activation so repeated Launch callbacks cannot race."""
+        return await self.db.campaigns.find_one_and_update(
+            {"campaign_id": campaign_id, "status": "DRAFT"},
+            {"$set": update},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    async def return_scheduled_to_draft(self, campaign_id: str, update: Document) -> Document | None:
+        return await self.db.campaigns.find_one_and_update(
+            {"campaign_id": campaign_id, "status": "SCHEDULED"},
+            {"$set": update},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    async def pause_running_campaign(self, campaign_id: str, update: Document) -> Document | None:
+        return await self.db.campaigns.find_one_and_update(
+            {"campaign_id": campaign_id, "status": {"$in": ["SCHEDULED", "ACTIVE"]}},
+            {"$set": update},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    async def resume_paused_campaign(self, campaign_id: str, update: Document) -> Document | None:
+        return await self.db.campaigns.find_one_and_update(
+            {"campaign_id": campaign_id, "status": "PAUSED"},
+            {"$set": update},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    async def extend_running_campaign(self, campaign_id: str, update: Document, event: Document) -> Document | None:
+        return await self.db.campaigns.find_one_and_update(
+            {"campaign_id": campaign_id, "status": {"$in": ["SCHEDULED", "ACTIVE"]}},
+            {"$set": update, "$push": {"extensions": event}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    async def end_campaign_early(self, campaign_id: str) -> bool:
+        now = utcnow()
+        result = await self.db.campaigns.update_one(
+            {"campaign_id": campaign_id, "status": {"$in": ["SCHEDULED", "ACTIVE", "PAUSED"]}},
+            {
+                "$set": {
+                    "status": "ENDING",
+                    "delete_on_end": True,
+                    "delete_on_next_campaign": False,
+                    "end_reason": "ended_early",
+                    "ending_at": now,
+                    "updated_at": now,
+                }
+            },
+        )
         return result.modified_count == 1
 
     async def due_campaigns(self, now: Any) -> list[Document]:
@@ -220,26 +301,59 @@ class Repositories:
 
     async def mark_campaign_ending(self, campaign_id: str, reason: str) -> bool:
         result = await self.db.campaigns.update_one(
-            {"campaign_id": campaign_id, "status": {"$in": ["SCHEDULED", "ACTIVE", "PAUSED"]}},
+            {"campaign_id": campaign_id, "status": {"$in": ["SCHEDULED", "ACTIVE"]}},
             {"$set": {"status": "ENDING", "end_reason": reason, "ending_at": utcnow()}},
         )
         return result.modified_count == 1
 
     async def mark_retained_campaign_ending(self, campaign_id: str) -> bool:
-        """Reopen an intentionally retained archived post for safe cleanup."""
+        """Reopen any archived campaign that still has live state for cleanup."""
         result = await self.db.campaigns.update_one(
-            {"campaign_id": campaign_id, "status": "ARCHIVED", "delete_on_end": False},
+            {"campaign_id": campaign_id, "status": "ARCHIVED"},
             {
                 "$set": {
                     "status": "ENDING",
                     "delete_on_end": True,
+                    "delete_on_next_campaign": False,
                     "end_reason": "retained_posts_cleanup",
                     "ending_at": utcnow(),
                     "updated_at": utcnow(),
                 }
             },
         )
-        return result.modified_count == 1
+        changed = result.modified_count == 1
+        if changed:
+            await self.db.deliveries.update_many(
+                {
+                    "campaign_id": campaign_id,
+                    "operation": "CLEANUP",
+                    "status": DeliveryStatus.CLEANUP_FAILED.value,
+                },
+                {
+                    "$set": {
+                        "status": DeliveryStatus.PENDING.value,
+                        "attempts": 0,
+                        "worker_id": None,
+                        "lease_until": None,
+                        "next_retry_at": None,
+                        "error_category": None,
+                        "updated_at": utcnow(),
+                    }
+                },
+            )
+        return changed
+
+    async def campaign_send_work_is_quiescent(self, campaign_id: str) -> bool:
+        """Ending waits for sends already inside a Telegram request to settle."""
+        outstanding = await self.db.deliveries.count_documents(
+            {
+                "campaign_id": campaign_id,
+                "operation": {"$ne": "CLEANUP"},
+                "status": DeliveryStatus.PROCESSING.value,
+            },
+            limit=1,
+        )
+        return outstanding == 0
 
     async def cancel_pending_campaign_deliveries(self, campaign_id: str) -> None:
         await self.db.deliveries.update_many(
@@ -292,6 +406,62 @@ class Repositories:
             await self.db.deliveries.bulk_write(operations[offset : offset + 500], ordered=False)
         return len(states)
 
+    async def materialize_superseded_cleanup(self, channel_id: int, current_campaign_id: str) -> int:
+        """Queue cleanup for retained posts only on the channel a new campaign reached."""
+        states = await self.db.campaign_channel_state.find({"channel_id": channel_id, "campaign_id": {"$ne": current_campaign_id}}).to_list(None)
+        queued = 0
+        now = utcnow()
+        for state in states:
+            campaign = await self.db.campaigns.find_one(
+                {
+                    "campaign_id": state["campaign_id"],
+                    "status": "ARCHIVED",
+                    "delete_on_end": False,
+                    "delete_on_next_campaign": True,
+                },
+                {"campaign_id": 1},
+            )
+            if not campaign:
+                continue
+            key = {"campaign_id": state["campaign_id"], "cycle_number": -1, "channel_id": channel_id}
+            document = {
+                **key,
+                "operation": "CLEANUP",
+                "message_ids": state["current_message_ids"],
+                "dispatch_rank": channel_id & ((1 << 63) - 1),
+                "status": DeliveryStatus.PENDING.value,
+                "attempts": 0,
+                "worker_id": None,
+                "lease_until": None,
+                "next_retry_at": None,
+                "cleanup_reason": "superseded_by_campaign",
+                "superseded_by_campaign_id": current_campaign_id,
+                "created_at": now,
+                "updated_at": now,
+            }
+            result = await self.db.deliveries.update_one(key, {"$setOnInsert": document}, upsert=True)
+            if result.upserted_id is not None:
+                queued += 1
+                continue
+            retry = await self.db.deliveries.update_one(
+                {**key, "status": DeliveryStatus.CLEANUP_FAILED.value},
+                {
+                    "$set": {
+                        "message_ids": state["current_message_ids"],
+                        "status": DeliveryStatus.PENDING.value,
+                        "attempts": 0,
+                        "worker_id": None,
+                        "lease_until": None,
+                        "next_retry_at": None,
+                        "error_category": None,
+                        "superseded_by_campaign_id": current_campaign_id,
+                        "updated_at": now,
+                    }
+                },
+            )
+            queued += retry.modified_count
+        return queued
+
     async def cleanup_is_complete(self, campaign_id: str) -> bool:
         outstanding = await self.db.deliveries.count_documents(
             {
@@ -325,28 +495,115 @@ class Repositories:
     async def campaign_cycle_count(self, campaign_id: str) -> int:
         return await self.db.campaign_cycles.count_documents({"campaign_id": campaign_id})
 
-    async def failed_deliveries(self, campaign_id: str, cycle_number: int, *, limit: int = 20) -> list[Document]:
-        return (
-            await self.db.deliveries.find(
-                {
-                    "campaign_id": campaign_id,
-                    "cycle_number": cycle_number,
-                    "status": {"$in": [DeliveryStatus.FAILED_PERMANENT.value, DeliveryStatus.UNKNOWN_SEND_STATE.value]},
-                }
-            )
-            .sort("updated_at", -1)
-            .limit(limit)
-            .to_list(limit)
-        )
+    async def latest_cycle_report(self, campaign_id: str) -> Document | None:
+        cycle = await self.db.campaign_cycles.find_one({"campaign_id": campaign_id}, sort=[("cycle_number", -1)])
+        if not cycle:
+            return None
+        cycle["delivery_counts"] = await self.delivery_summary(campaign_id, int(cycle["cycle_number"]))
+        return cycle
 
-    async def retry_failed_deliveries(self, campaign_id: str, cycle_number: int) -> int:
-        """An owner-initiated retry never touches ambiguous send states."""
-        result = await self.db.deliveries.update_many(
+    async def finish_cycle_if_complete(self, campaign_id: str, cycle_number: int) -> bool:
+        if cycle_number < 0:
+            return False
+        outstanding = await self.db.deliveries.count_documents(
             {
                 "campaign_id": campaign_id,
                 "cycle_number": cycle_number,
-                "status": DeliveryStatus.FAILED_PERMANENT.value,
+                "status": {
+                    "$in": [
+                        DeliveryStatus.PENDING.value,
+                        DeliveryStatus.PROCESSING.value,
+                        DeliveryStatus.RETRY_WAIT.value,
+                        DeliveryStatus.PAUSED.value,
+                    ]
+                },
             },
+            limit=1,
+        )
+        if outstanding:
+            return False
+        result = await self.db.campaign_cycles.update_one(
+            {"campaign_id": campaign_id, "cycle_number": cycle_number, "status": {"$ne": "COMPLETED"}},
+            {"$set": {"status": "COMPLETED", "completed_at": utcnow(), "updated_at": utcnow()}},
+        )
+        return result.modified_count == 1
+
+    async def finish_complete_cycles(self, campaign_id: str) -> int:
+        cycle_numbers = await self.db.deliveries.distinct("cycle_number", {"campaign_id": campaign_id, "cycle_number": {"$gte": 0}})
+        completed = 0
+        for cycle_number in cycle_numbers:
+            completed += int(await self.finish_cycle_if_complete(campaign_id, int(cycle_number)))
+        return completed
+
+    async def campaign_cycle_stats(self, campaign_id: str) -> Document:
+        cursor = await self.db.campaign_cycles.aggregate(
+            [
+                {"$match": {"campaign_id": campaign_id}},
+                {
+                    "$group": {
+                        "_id": None,
+                        "planned": {"$sum": 1},
+                        "completed": {"$sum": {"$cond": [{"$eq": ["$status", "COMPLETED"]}, 1, 0]}},
+                        "first_started_at": {"$min": "$started_at"},
+                        "last_completed_at": {"$max": "$completed_at"},
+                    }
+                },
+            ]
+        )
+        rows = await cursor.to_list(1)
+        return rows[0] if rows else {"planned": 0, "completed": 0}
+
+    async def campaign_delivery_metrics(self, campaign_id: str) -> Document:
+        cursor = await self.db.deliveries.aggregate(
+            [
+                {"$match": {"campaign_id": campaign_id}},
+                {
+                    "$group": {
+                        "_id": None,
+                        "attempts": {"$sum": {"$ifNull": ["$attempts", 0]}},
+                        "replaced_messages": {"$sum": {"$ifNull": ["$replaced_message_count", 0]}},
+                        "cleaned_messages": {"$sum": {"$ifNull": ["$cleaned_message_count", 0]}},
+                        "first_created_at": {"$min": "$created_at"},
+                        "last_updated_at": {"$max": "$updated_at"},
+                    }
+                },
+            ]
+        )
+        rows = await cursor.to_list(1)
+        return rows[0] if rows else {"attempts": 0, "replaced_messages": 0, "cleaned_messages": 0}
+
+    async def campaign_live_state_count(self, campaign_id: str) -> int:
+        return await self.db.campaign_channel_state.count_documents({"campaign_id": campaign_id})
+
+    async def campaign_join_count(self, campaign_id: str) -> int:
+        return await self.db.join_events.count_documents({"campaign_id": campaign_id})
+
+    async def failed_deliveries(self, campaign_id: str, cycle_number: int | None = None, *, limit: int = 20) -> list[Document]:
+        query: Document = {
+            "campaign_id": campaign_id,
+            "status": {
+                "$in": [
+                    DeliveryStatus.FAILED_PERMANENT.value,
+                    DeliveryStatus.UNKNOWN_SEND_STATE.value,
+                    DeliveryStatus.CLEANUP_FAILED.value,
+                ]
+            },
+        }
+        if cycle_number is not None:
+            query["cycle_number"] = cycle_number
+        return await self.db.deliveries.find(query).sort("updated_at", -1).limit(limit).to_list(limit)
+
+    async def retry_failed_deliveries(self, campaign_id: str, cycle_number: int | None = None) -> int:
+        """An owner-initiated retry never touches ambiguous send states."""
+        query: Document = {
+            "campaign_id": campaign_id,
+            "status": DeliveryStatus.FAILED_PERMANENT.value,
+        }
+        if cycle_number is not None:
+            query["cycle_number"] = cycle_number
+        affected_cycles = await self.db.deliveries.distinct("cycle_number", query)
+        result = await self.db.deliveries.update_many(
+            query,
             {
                 "$set": {
                     "status": DeliveryStatus.PENDING.value,
@@ -358,6 +615,11 @@ class Repositories:
                 }
             },
         )
+        if result.modified_count and affected_cycles:
+            await self.db.campaign_cycles.update_many(
+                {"campaign_id": campaign_id, "cycle_number": {"$in": affected_cycles}},
+                {"$set": {"status": "RUNNING", "completed_at": None, "updated_at": utcnow()}},
+            )
         return result.modified_count
 
     async def export_collections(self, full: bool) -> dict[str, list[Document]]:
@@ -388,8 +650,8 @@ class Repositories:
     async def clear_owner_session(self, owner_id: int) -> None:
         await self.db.owner_sessions.delete_one({"owner_id": owner_id})
 
-    async def list_campaigns(self, limit: int = 20) -> list[Document]:
-        return await self.db.campaigns.find({}).sort("updated_at", -1).limit(limit).to_list(limit)
+    async def list_campaigns(self, limit: int = 20, *, skip: int = 0) -> list[Document]:
+        return await self.db.campaigns.find({}).sort("updated_at", -1).skip(skip).limit(limit).to_list(limit)
 
     async def campaign_status_counts(self) -> Document:
         cursor = await self.db.campaigns.aggregate(
@@ -437,10 +699,15 @@ class Repositories:
 
     async def register_update(self, update_id: int) -> bool:
         try:
-            await self.db.processed_updates.insert_one({"update_id": update_id, "received_at": utcnow()})
+            now = utcnow()
+            await self.db.processed_updates.insert_one({"update_id": update_id, "received_at": now, "expires_at": now + timedelta(days=7)})
             return True
         except DuplicateKeyError:
             return False
+
+    async def unregister_update(self, update_id: int) -> None:
+        """Allow Telegram to retry an update whose handler did not complete."""
+        await self.db.processed_updates.delete_one({"update_id": update_id})
 
     async def restore_collection(self, name: str, documents: list[Document]) -> tuple[int, int]:
         restored = skipped = 0

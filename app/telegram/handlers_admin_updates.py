@@ -17,20 +17,50 @@ async def refresh_channel(bot: Bot, repositories: Repositories, chat_id: int, ch
         member: ChatMember = await bot.get_chat_member(chat_id, bot.id)
         member_count = await bot.get_chat_member_count(chat_id)
     except Exception:
-        await repositories.set_channel_status(chat_id, ChannelStatus.NEEDS_ATTENTION, last_error_code="REFRESH_FAILED")
+        if chat:
+            await repositories.upsert_channel(
+                {
+                    "telegram_chat_id": chat.id,
+                    "title": chat.title or str(chat.id),
+                    "username": chat.username,
+                    "type": "channel",
+                    "is_public": bool(chat.username),
+                    "member_count": None,
+                    "status": ChannelStatus.NEEDS_ATTENTION.value,
+                    "permissions": {
+                        "is_admin": False,
+                        "can_post_messages": False,
+                        "can_delete_messages": False,
+                        "can_invite_users": False,
+                    },
+                    "last_error_code": "REFRESH_FAILED",
+                    "last_verified_at": utcnow(),
+                }
+            )
+        else:
+            await repositories.set_channel_status(chat_id, ChannelStatus.NEEDS_ATTENTION, last_error_code="REFRESH_FAILED")
         return False
     is_admin = member.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
     can_post = bool(getattr(member, "can_post_messages", is_admin))
     status = ChannelStatus.ACTIVE if is_admin and can_post else ChannelStatus.UNAVAILABLE
-    await repositories.upsert_channel({
-        "telegram_chat_id": chat.id, "title": chat.title or str(chat.id), "username": chat.username,
-        "type": "channel", "is_public": bool(chat.username), "member_count": member_count, "status": status.value,
-        "permissions": {
-            "is_admin": is_admin, "can_post_messages": can_post,
-            "can_delete_messages": bool(getattr(member, "can_delete_messages", False)),
-            "can_invite_users": bool(getattr(member, "can_invite_users", False)),
-        }, "last_verified_at": utcnow(),
-    })
+    await repositories.upsert_channel(
+        {
+            "telegram_chat_id": chat.id,
+            "title": chat.title or str(chat.id),
+            "username": chat.username,
+            "type": "channel",
+            "is_public": bool(chat.username),
+            "member_count": member_count,
+            "status": status.value,
+            "permissions": {
+                "is_admin": is_admin,
+                "can_post_messages": can_post,
+                "can_delete_messages": bool(getattr(member, "can_delete_messages", False)),
+                "can_invite_users": bool(getattr(member, "can_invite_users", False)),
+            },
+            "last_verified_at": utcnow(),
+        }
+    )
     return status == ChannelStatus.ACTIVE
 
 
@@ -48,8 +78,10 @@ class ChannelAdminHandlers:
             await refresh_channel(bot, self.repositories, update.chat.id, update.chat)
         else:
             await self.repositories.set_channel_status(
-                update.chat.id, ChannelStatus.UNAVAILABLE,
-                last_error_code=f"BOT_STATUS_{new_status}", last_admin_update_at=utcnow(),
+                update.chat.id,
+                ChannelStatus.UNAVAILABLE,
+                last_error_code=f"BOT_STATUS_{new_status}",
+                last_admin_update_at=utcnow(),
             )
 
 
@@ -61,11 +93,14 @@ async def register_forwarded_channel(message: Message, bot: Bot, repositories: R
     if not source_chat or source_chat.type != "channel":
         return False
     success = await refresh_channel(bot, repositories, source_chat.id, source_chat)
-    controls = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Register/Refresh", callback_data=f"reg:{source_chat.id}:refresh"),
-        InlineKeyboardButton(text="Tag", callback_data=f"reg:{source_chat.id}:tag"),
-    ], [InlineKeyboardButton(text="Back", callback_data="home:network")]])
-    await message.answer(
-        f"{'Registered' if success else 'Saved for attention'}: {source_chat.title or source_chat.id}", reply_markup=controls
+    controls = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Register/Refresh", callback_data=f"reg:{source_chat.id}:refresh"),
+                InlineKeyboardButton(text="Tag", callback_data=f"reg:{source_chat.id}:tag"),
+            ],
+            [InlineKeyboardButton(text="Back", callback_data="home:network")],
+        ]
     )
+    await message.answer(f"{'Registered' if success else 'Saved for attention'}: {source_chat.title or source_chat.id}", reply_markup=controls)
     return True

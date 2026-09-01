@@ -35,6 +35,49 @@ class MemoryRepositories:
         self.campaign.update(update)
         return True
 
+    async def advance_running_campaign(self, campaign_id, update):
+        if self.campaign.get("status") not in {"SCHEDULED", "ACTIVE"}:
+            return False
+        self.campaign.update(update)
+        return True
+
+    async def activate_draft(self, campaign_id, update):
+        if self.campaign.get("status") != "DRAFT":
+            return None
+        self.campaign.update(update)
+        return self.campaign
+
+    async def return_scheduled_to_draft(self, campaign_id, update):
+        if self.campaign.get("status") != "SCHEDULED":
+            return None
+        self.campaign.update(update)
+        return self.campaign
+
+    async def pause_running_campaign(self, campaign_id, update):
+        if self.campaign.get("status") not in {"SCHEDULED", "ACTIVE"}:
+            return None
+        self.campaign.update(update)
+        return self.campaign
+
+    async def resume_paused_campaign(self, campaign_id, update):
+        if self.campaign.get("status") != "PAUSED":
+            return None
+        self.campaign.update(update)
+        return self.campaign
+
+    async def extend_running_campaign(self, campaign_id, update, event):
+        if self.campaign.get("status") not in {"SCHEDULED", "ACTIVE"}:
+            return None
+        self.campaign.update(update)
+        self.campaign.setdefault("extensions", []).append(event)
+        return self.campaign
+
+    async def end_campaign_early(self, campaign_id):
+        if self.campaign.get("status") not in {"SCHEDULED", "ACTIVE", "PAUSED"}:
+            return False
+        self.campaign.update({"status": "ENDING", "delete_on_end": True, "delete_on_next_campaign": False})
+        return True
+
     async def mark_campaign_ending(self, campaign_id, reason):
         self.ending.append(reason)
         return True
@@ -144,6 +187,9 @@ async def test_activate_accepts_legacy_naive_mongo_timestamps() -> None:
     assert activated["target_snapshot"] == [-1001]
     assert len(repositories.cycles) == 1
     assert len(repositories.deliveries) == 1
+    with pytest.raises(ValueError, match="editable draft"):
+        await CampaignService(repositories, send_rps=20).activate("cmp_naive_dates")
+    assert len(repositories.cycles) == 1
 
 
 @pytest.mark.asyncio
@@ -181,6 +227,7 @@ async def test_pause_and_resume_hold_work_and_extend_the_campaign_window(monkeyp
         "status": "ACTIVE",
         "start_at_utc": now - timedelta(hours=1),
         "current_end_at_utc": now + timedelta(hours=1),
+        "next_cycle_at": now + timedelta(minutes=15),
     }
     repositories = MemoryRepositories(campaign, [])
     service = CampaignService(repositories, send_rps=20)
@@ -193,4 +240,104 @@ async def test_pause_and_resume_hold_work_and_extend_the_campaign_window(monkeyp
 
     assert resumed["status"] == "ACTIVE"
     assert resumed["current_end_at_utc"] == now + timedelta(hours=1, minutes=30)
+    assert resumed["next_cycle_at"] == now + timedelta(minutes=45)
     assert repositories.paused_deliveries == repositories.resumed_deliveries == 1
+
+
+@pytest.mark.asyncio
+async def test_extend_preserves_cadence_and_records_audit_event() -> None:
+    now = datetime.now(UTC)
+    campaign = {
+        "campaign_id": "cmp_extend",
+        "status": "ACTIVE",
+        "start_at_utc": now,
+        "current_end_at_utc": now + timedelta(hours=2),
+        "next_cycle_at": now + timedelta(minutes=30),
+        "repost_interval_seconds": 1800,
+        "delete_on_end": True,
+    }
+    repositories = MemoryRepositories(campaign, [])
+
+    extended = await CampaignService(repositories, 20).extend("cmp_extend", owner_id=7, seconds=6 * 3600)
+
+    assert extended["current_end_at_utc"] == now + timedelta(hours=8)
+    assert extended["next_cycle_at"] == now + timedelta(minutes=30)
+    assert extended["extensions"][0]["owner_id"] == 7
+    assert extended["extensions"][0]["seconds"] == 6 * 3600
+
+
+@pytest.mark.asyncio
+async def test_end_early_is_atomic_and_always_selects_cleanup() -> None:
+    campaign = {
+        "campaign_id": "cmp_end",
+        "status": "ACTIVE",
+        "delete_on_end": False,
+        "delete_on_next_campaign": True,
+    }
+    repositories = MemoryRepositories(campaign, [])
+    service = CampaignService(repositories, 20)
+
+    assert await service.end_early("cmp_end")
+    assert campaign["status"] == "ENDING"
+    assert campaign["delete_on_end"] is True
+    assert campaign["delete_on_next_campaign"] is False
+    assert not await service.end_early("cmp_end")
+
+
+@pytest.mark.asyncio
+async def test_cycle_advance_cannot_revive_a_concurrently_paused_campaign() -> None:
+    now = datetime.now(UTC)
+    campaign = {
+        "campaign_id": "cmp_pause_race",
+        "status": "ACTIVE",
+        "mode": "STANDARD",
+        "start_at_utc": now - timedelta(seconds=1),
+        "current_end_at_utc": now + timedelta(hours=1),
+        "repost_interval_seconds": None,
+        "target_snapshot": [-1001],
+        "cohort_map": {"-1001": 0},
+        "shuffle_seed": base64.urlsafe_b64encode(b"x" * 32).decode(),
+        "variants": [{}],
+        "next_cycle_number": 0,
+    }
+
+    class PausingRepositories(MemoryRepositories):
+        async def create_cycle(self, cycle, deliveries):
+            created = await super().create_cycle(cycle, deliveries)
+            self.campaign["status"] = "PAUSED"
+            return created
+
+    repositories = PausingRepositories(campaign, [])
+    assert await CampaignService(repositories, 20).plan_due_cycle(campaign, now)
+    assert repositories.campaign["status"] == "PAUSED"
+    assert repositories.campaign["next_cycle_number"] == 0
+
+
+@pytest.mark.asyncio
+async def test_transient_immediate_cycle_failure_does_not_report_atomic_activation_as_failed() -> None:
+    now = datetime.now(UTC)
+    creative = Creative(id="var_1", kind="TEXT", text="Hello")
+    campaign = {
+        "campaign_id": "cmp_activation_recovery",
+        "status": "DRAFT",
+        "mode": "STANDARD",
+        "variants": [creative.model_dump(mode="json")],
+        "destinations": [],
+        "target_selector": {},
+        "start_at_utc": now - timedelta(seconds=1),
+        "current_end_at_utc": now + timedelta(hours=1),
+        "repost_interval_seconds": None,
+        "delete_on_repost": True,
+        "delete_on_end": True,
+        "preview_sent": True,
+    }
+
+    class FailingCycleRepositories(MemoryRepositories):
+        async def create_cycle(self, cycle, deliveries):
+            raise RuntimeError("temporary MongoDB interruption")
+
+    repositories = FailingCycleRepositories(campaign, [{"telegram_chat_id": -1001}])
+    activated = await CampaignService(repositories, send_rps=20).activate(campaign["campaign_id"])
+
+    assert activated["status"] == "ACTIVE"
+    assert activated["next_cycle_number"] == 0

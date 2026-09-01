@@ -14,8 +14,14 @@ logger = logging.getLogger(__name__)
 
 class Scheduler:
     def __init__(
-        self, *, instance_id: str, repositories: Repositories, lease_manager: LeaseManager,
-        campaign_service: CampaignService, lease_seconds: int, tick_seconds: float,
+        self,
+        *,
+        instance_id: str,
+        repositories: Repositories,
+        lease_manager: LeaseManager,
+        campaign_service: CampaignService,
+        lease_seconds: int,
+        tick_seconds: float,
     ) -> None:
         self.instance_id = instance_id
         self.repositories = repositories
@@ -45,13 +51,27 @@ class Scheduler:
             return
         now = utcnow()
         for campaign in await self.repositories.due_campaigns(now):
-            if campaign["status"] == "ENDING":
-                await self._finish_ending_campaign(campaign)
-            else:
-                await self.campaign_service.plan_due_cycle(campaign, now)
+            try:
+                if campaign["status"] == "ENDING":
+                    await self._finish_ending_campaign(campaign)
+                else:
+                    if campaign.get("resume_recovery_needed"):
+                        await self.repositories.resume_campaign_deliveries(campaign["campaign_id"])
+                        await self.repositories.advance_running_campaign(
+                            campaign["campaign_id"],
+                            {"resume_recovery_needed": False, "updated_at": now},
+                        )
+                    await self.campaign_service.plan_due_cycle(campaign, now)
+            except Exception:
+                logger.exception("Campaign scheduler item failed", extra={"campaign_id": campaign.get("campaign_id")})
 
     async def _finish_ending_campaign(self, campaign: dict[str, Any]) -> None:
         await self.repositories.cancel_pending_campaign_deliveries(campaign["campaign_id"])
+        await self.repositories.finish_complete_cycles(campaign["campaign_id"])
+        # A worker may already be inside Telegram's send request. Wait until
+        # it persists the returned message IDs so cleanup cannot miss them.
+        if not await self.repositories.campaign_send_work_is_quiescent(campaign["campaign_id"]):
+            return
         if campaign.get("delete_on_end", True):
             await self.repositories.materialize_cleanup_deliveries(campaign["campaign_id"])
         # When retention was chosen, the live state is deliberately retained:

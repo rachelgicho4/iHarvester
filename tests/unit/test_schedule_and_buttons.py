@@ -13,6 +13,7 @@ from app.telegram.handlers_owner import (
     parse_repost_offsets_minutes,
     quick_duration_keyboard,
     quick_interval_keyboard,
+    retention_keyboard,
 )
 from app.telegram.keyboards import auto_button_rows
 
@@ -44,11 +45,35 @@ def test_custom_rows_are_respected() -> None:
 
 def test_guided_creator_uses_callback_controls_not_pipe_delimited_commands() -> None:
     content_controls = [item.text for row in content_type_keyboard("cmp").inline_keyboard for item in row]
-    campaign_controls = [item.text for row in campaign_keyboard("cmp", "DRAFT").inline_keyboard for item in row]
-    archived_controls = [item.text for row in campaign_keyboard("cmp", "ARCHIVED").inline_keyboard for item in row]
+    campaign_controls = [item.text for row in campaign_keyboard("cmp", "DRAFT", variant_count=2).inline_keyboard for item in row]
+    archived_controls = [item.text for row in campaign_keyboard("cmp", "ARCHIVED", has_live_posts=True).inline_keyboard for item in row]
     assert {"Text", "Photo", "Photo + caption", "Video", "Video + caption", "Forward ready post"} <= set(content_controls)
-    assert {"CTA buttons", "Destinations", "Targets", "Plan for later", "Send campaign", "Delete draft", "Home"} <= set(campaign_controls)
-    assert {"Duplicate / Run Again", "View campaign report", "Delete retained posts"} <= set(archived_controls)
+    assert {"Rename", "CTA buttons", "Promoted links", "Audience", "Plan for later", "Send campaign", "Delete draft", "Home"} <= set(campaign_controls)
+    assert {"Run again now", "Edit a copy", "Full report", "Delete retained posts"} <= set(archived_controls)
+
+
+def test_every_campaign_state_has_safe_navigation_and_short_callback_data() -> None:
+    active = campaign_keyboard("cmp_123", "ACTIVE", variant_count=2)
+    keyboards = [
+        campaign_keyboard("cmp_123", "DRAFT", variant_count=2),
+        campaign_keyboard("cmp_123", "SCHEDULED", variant_count=2),
+        active,
+        campaign_keyboard("cmp_123", "PAUSED", variant_count=2),
+        campaign_keyboard("cmp_123", "ENDING", variant_count=2),
+        campaign_keyboard("cmp_123", "ARCHIVED", variant_count=2, has_live_posts=True),
+    ]
+    for keyboard in keyboards:
+        buttons = [item for row in keyboard.inline_keyboard for item in row]
+        assert "Home" in {item.text for item in buttons}
+        assert all(not item.callback_data or len(item.callback_data.encode()) <= 64 for item in buttons)
+    assert "+3 days" in {item.text for row in active.inline_keyboard for item in row}
+
+
+def test_retention_controls_distinguish_all_three_end_behaviors() -> None:
+    labels = [item.text for row in retention_keyboard("cmp", False, True).inline_keyboard for item in row]
+    assert "✓ Keep until a future campaign replaces it" in labels
+    assert "Keep until I delete it" in labels
+    assert "Delete final post at campaign end" in labels
 
 
 def test_quick_send_controls_offer_custom_duration_and_compatible_intervals() -> None:

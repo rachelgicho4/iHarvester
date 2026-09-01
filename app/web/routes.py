@@ -40,5 +40,9 @@ def install_routes(app: object) -> None:
         update = Update.model_validate(await request.json(), context={"bot": runtime.bot})
         if not await runtime.repositories.register_update(update.update_id):
             return Response(status_code=200)
-        await runtime.dispatcher.feed_update(runtime.bot, update)
+        try:
+            await runtime.dispatcher.feed_update(runtime.bot, update)
+        except Exception:
+            await runtime.repositories.unregister_update(update.update_id)
+            raise
         return Response(status_code=200)

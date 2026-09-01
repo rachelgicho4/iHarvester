@@ -34,9 +34,13 @@ Everything is in the bot's private chat with an allowed owner ID:
 1. Press **Create Campaign**, name the draft, and capture formatted text or a supported media post.
 2. Choose **Text**, **Photo**, **Photo + caption**, **Video**, **Video + caption**, **Album**, or **Forward ready post**. Forwarded content retains its Telegram formatting and media IDs.
 3. Add a CTA by entering its label and URL in separate prompts. Use **Add beside last** for a horizontal button or **Add new row** for a vertical one; labels are never rewritten or truncated by iHarvester.
-4. Add destinations, source targets, mode, and schedule through their own guided controls. The Network screen shows active, unavailable, paused, and attention-required channel counts, and accepts a forwarded channel post for manual repair/registration.
+4. Add destinations, source targets (all active, tags, audience-size range/minimum, or manual IDs), mode, and schedule through their own guided controls. The Network screen shows active, unavailable, paused, and attention-required channel counts, and accepts a forwarded channel post for manual repair/registration.
 5. Choose **Send campaign**, then pick a duration preset or enter a custom duration such as `45m`, `2h`, `3d`, or `1mo` (30 days). Choose an even repost interval, 1-20 **Specific times after launch** such as `1d, 4d, 6d`, or 1-20 **custom repost gaps** such as `1d, 3d, 2d`. Each repost replaces the previous campaign post. iHarvester renders a real preview and presents the final launch confirmation with the exact planned targets and protected destination exclusions.
 6. **Launch** freezes the active target snapshot and automatically excludes all known destination channel IDs.
+
+Drafts show a compact setup checklist; running campaigns show delivery and time progress, latest-cycle reachability, failures, cleanup, live-post, and tracked-join counts. Content, CTA buttons, destinations, targets, timing, and end behavior remain editable while a campaign is a draft. Scheduled campaigns can return to draft before they start.
+
+Archived campaigns offer two separate reuse paths. **Run again now** preserves the prior content, CTA layout, destinations, target rules, mode, duration, exact cadence, and end behavior, then asks for one launch confirmation. **Edit a copy** opens the same prefilled configuration as a normal editable draft.
 
 For fallback channel registration, forward a post from a source channel to the bot and select **Register/Refresh**. `/backup` creates a compressed core export; `/restore` validates an attached export and asks for confirmation before upserting it.
 
@@ -46,8 +50,11 @@ For fallback channel registration, forward a post from a source channel to the b
 - Mix + Rotate freezes count-balanced cohorts, rotates variants by cohort, and independently reshuffles physical delivery order each cycle.
 - Reposts delete the known previous campaign message for that channel immediately before sending a replacement.
 - End time/early end prevents future sends, cleans known live posts, then archives immutable results. An archive is repeated only by creating a new draft.
+- End behavior can delete the final post at campaign end, retain it until a later campaign successfully replaces it in that channel, or retain it until manual cleanup. Overlapping active campaigns never delete one another's posts.
 - A message-send timeout is recorded as `UNKNOWN_SEND_STATE`, not blindly retried, because Telegram can have accepted the send before a timeout reached the bot.
 - Deletion cleanup uses a conservative 47-hour validation rule. A long campaign must repost within 47 hours if it promises cleanup.
+- Automatic core backups coalesce the configured channel-growth and time triggers. Their enablement, threshold, and interval are editable in **Settings**.
+- Generic HTTP access logging is disabled in production commands so the secret webhook path is not written to platform logs.
 
 ## Configuration
 

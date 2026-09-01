@@ -38,7 +38,7 @@ async def restore_backup(repositories: Repositories, backup: dict[str, Any]) -> 
     # Historical active campaigns intentionally return as archives rather than silently resuming old broadcasts.
     campaigns = backup["collections"].get("campaigns", [])
     for campaign in campaigns:
-        if campaign.get("status") in {"ACTIVE", "SCHEDULED", "ENDING"}:
+        if campaign.get("status") in {"ACTIVE", "SCHEDULED", "PAUSED", "ENDING"}:
             campaign["status"] = "ARCHIVED"
             campaign["end_reason"] = "restored_interrupted"
     for name in ("channels", "campaigns", "settings"):

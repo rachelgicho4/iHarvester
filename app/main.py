@@ -11,6 +11,7 @@ import uvicorn
 from aiogram import Bot, Dispatcher
 from fastapi import FastAPI
 
+from app.backups.automatic import AutomaticBackupWorker
 from app.campaigns.scheduler import Scheduler
 from app.campaigns.service import CampaignService
 from app.config import Settings
@@ -63,9 +64,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service = CampaignService(repositories, settings.broadcast_send_rps)
         dispatcher.include_router(ChannelAdminHandlers(repositories).router)
         dispatcher.include_router(JoinEventHandlers(repositories).router)
-        dispatcher.include_router(OwnerHandlers(
-            owner_ids=settings.owner_ids, repositories=repositories, campaigns=service, sender=sender,
-        ).router)
+        dispatcher.include_router(
+            OwnerHandlers(
+                owner_ids=settings.owner_ids,
+                repositories=repositories,
+                campaigns=service,
+                sender=sender,
+            ).router
+        )
         runtime = Runtime(settings, database, repositories, bot, dispatcher, sender)
         app.state.runtime = runtime
         stage = "MongoDB connection"
@@ -73,38 +79,64 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await database.ping()
             stage = "MongoDB index initialization"
             await ensure_indexes(database)
+            setting_defaults = {
+                "owner_timezone": settings.default_timezone,
+                "auto_backup_enabled": settings.auto_backup_enabled,
+                "auto_backup_every_new_channels": settings.auto_backup_every_new_channels,
+                "auto_backup_interval_hours": settings.auto_backup_interval_hours,
+            }
+            for key, value in setting_defaults.items():
+                if await repositories.get_setting(key) is None:
+                    await repositories.set_setting(key, value)
             stage = "Telegram bot authentication"
             await bot.get_me()
             allowed_updates = dispatcher.resolve_used_update_types()
             if settings.run_mode == "webhook":
                 stage = "Telegram webhook registration"
                 await bot.set_webhook(
-                    settings.webhook_url, secret_token=settings.webhook_secret_token, allowed_updates=allowed_updates,
+                    settings.webhook_url,
+                    secret_token=settings.webhook_secret_token,
+                    allowed_updates=allowed_updates,
                     drop_pending_updates=False,
                 )
             else:
                 await bot.delete_webhook(drop_pending_updates=False)
             instance_id = opaque_id("instance")
+            lease_manager = LeaseManager(database)
             scheduler = Scheduler(
-                instance_id=instance_id, repositories=repositories, lease_manager=LeaseManager(database),
-                campaign_service=service, lease_seconds=settings.scheduler_lease_seconds,
+                instance_id=instance_id,
+                repositories=repositories,
+                lease_manager=lease_manager,
+                campaign_service=service,
+                lease_seconds=settings.scheduler_lease_seconds,
                 tick_seconds=settings.scheduler_tick_seconds,
             )
             send_limiter = AsyncTokenBucket(settings.broadcast_send_rps)
             mutation_limiter = AsyncTokenBucket(settings.broadcast_global_api_rps)
             runtime.tasks.append(asyncio.create_task(scheduler.run(runtime.stopping), name="scheduler"))
+            backup_worker = AutomaticBackupWorker(
+                instance_id=instance_id,
+                repositories=repositories,
+                lease_manager=lease_manager,
+                bot=bot,
+                owner_ids=settings.owner_ids,
+                every_new_channels=settings.auto_backup_every_new_channels,
+                interval_hours=settings.auto_backup_interval_hours,
+            )
+            runtime.tasks.append(asyncio.create_task(backup_worker.run(runtime.stopping), name="automatic-backup"))
             for number in range(settings.broadcast_workers):
                 worker = DeliveryWorker(
-                    worker_id=f"{instance_id}-{number}", repositories=repositories, sender=sender,
-                    send_limiter=send_limiter, mutation_limiter=mutation_limiter,
+                    worker_id=f"{instance_id}-{number}",
+                    repositories=repositories,
+                    sender=sender,
+                    send_limiter=send_limiter,
+                    mutation_limiter=mutation_limiter,
                     delivery_lease_seconds=settings.delivery_lease_seconds,
                     max_transient_attempts=settings.max_transient_attempts,
                 )
                 runtime.tasks.append(asyncio.create_task(worker.run(runtime.stopping), name=f"delivery-{number}"))
             if settings.run_mode == "polling":
-                runtime.tasks.append(asyncio.create_task(
-                    dispatcher.start_polling(bot, allowed_updates=allowed_updates, handle_signals=False), name="polling"
-                ))
+                runtime.tasks.append(asyncio.create_task(dispatcher.start_polling(bot, allowed_updates=allowed_updates, handle_signals=False), name="polling"))
             runtime.ready = True
             yield
         except Exception:
@@ -132,7 +164,13 @@ app = create_app()
 def run() -> None:
     # uvicorn installs its own SIGTERM handling; one application worker is intentional.
     _ = signal.SIGTERM
-    uvicorn.run("app.main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), workers=1)
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        workers=1,
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":

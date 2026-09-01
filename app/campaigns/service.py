@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import base64
+import logging
 import secrets
+from copy import deepcopy
 from datetime import timedelta
 from typing import Any
 
 from app.campaigns.models import CampaignMode, CampaignStatus, Creative, Destination, Schedule
 from app.campaigns.scheduling import can_create_cycle, scheduled_cycle_time
 from app.campaigns.shuffle import cohort_map, dispatch_rank, variant_for
-from app.campaigns.validation import protected_destination_ids, validate_launch
+from app.campaigns.validation import SAFE_DELETE_WINDOW, protected_destination_ids, validate_launch
 from app.db.repositories import Document, Repositories
 from app.utils.ids import opaque_id
 from app.utils.time import as_utc, utcnow
+
+logger = logging.getLogger(__name__)
 
 
 class CampaignService:
@@ -23,9 +27,10 @@ class CampaignService:
 
     async def create_draft(self, owner_id: int, name: str) -> Document:
         now = utcnow()
+        name = self._campaign_name(name)
         campaign = {
             "campaign_id": opaque_id("cmp"),
-            "name": name.strip() or "Untitled campaign",
+            "name": name,
             "status": CampaignStatus.DRAFT.value,
             "mode": CampaignMode.STANDARD.value,
             "variants": [],
@@ -37,12 +42,30 @@ class CampaignService:
             # This default is explicit so a choice made before scheduling is
             # not lost when the schedule is later saved.
             "delete_on_end": True,
+            "delete_on_next_campaign": False,
             "created_by": owner_id,
             "created_at": now,
+            "updated_at": now,
             "version": 1,
         }
         await self.repositories.create_campaign(campaign)
         return campaign
+
+    async def rename_draft(self, campaign_id: str, name: str) -> Document:
+        campaign = await self._draft(campaign_id)
+        campaign["name"] = self._campaign_name(name)
+        campaign["updated_at"] = utcnow()
+        await self.repositories.update_campaign(campaign_id, {"name": campaign["name"], "updated_at": campaign["updated_at"]})
+        return campaign
+
+    @staticmethod
+    def _campaign_name(value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("Campaign name cannot be empty.")
+        if len(name) > 100:
+            raise ValueError("Campaign name must be 100 characters or fewer.")
+        return name
 
     async def configure_draft(
         self,
@@ -83,6 +106,7 @@ class CampaignService:
                 "repost_offsets_seconds": schedule.repost_offsets_seconds,
                 "delete_on_repost": schedule.delete_on_repost,
                 "delete_on_end": schedule.delete_on_end,
+                "delete_on_next_campaign": False if schedule.delete_on_end else campaign.get("delete_on_next_campaign", False),
                 "owner_timezone": schedule.owner_timezone,
                 "preview_sent": preview_sent,
                 "updated_at": utcnow(),
@@ -92,6 +116,12 @@ class CampaignService:
 
     async def activate(self, campaign_id: str) -> Document:
         campaign = await self._draft(campaign_id)
+        now = utcnow()
+        if campaign.get("rerun_ready"):
+            duration = timedelta(seconds=max(60, int(campaign.get("rerun_duration_seconds", 3600))))
+            campaign["start_at_utc"] = now
+            campaign["original_end_at_utc"] = now + duration
+            campaign["current_end_at_utc"] = now + duration
         variants = [Creative.model_validate(variant) for variant in campaign["variants"]]
         destinations = [Destination.model_validate(destination) for destination in campaign["destinations"]]
         schedule = Schedule(
@@ -105,7 +135,6 @@ class CampaignService:
         )
         sources = await self.repositories.active_channels(campaign.get("target_selector"))
         source_ids = {source["telegram_chat_id"] for source in sources}
-        now = utcnow()
         errors = validate_launch(
             variants=variants,
             destinations=destinations,
@@ -135,15 +164,27 @@ class CampaignService:
             "activated_at": now,
             "next_cycle_number": 0,
             "next_cycle_at": schedule.start_at_utc,
+            "start_at_utc": schedule.start_at_utc,
+            "original_end_at_utc": schedule.end_at_utc,
+            "current_end_at_utc": schedule.end_at_utc,
+            "rerun_ready": False,
             "updated_at": now,
         }
-        await self.repositories.update_campaign(campaign_id, update)
-        campaign.update(update)
+        activated = await self.repositories.activate_draft(campaign_id, update)
+        if not activated:
+            raise ValueError("This campaign was already launched or changed. Open it again to see its current state.")
+        campaign = activated
         # Do not make the first post depend on the next scheduler tick. This
         # creates durable cycle-0 deliveries during the owner's confirmation;
         # background scheduling remains responsible for later reposts.
         if status == CampaignStatus.ACTIVE:
-            await self.plan_due_cycle(campaign, now)
+            try:
+                await self.plan_due_cycle(campaign, now)
+            except Exception:
+                # Activation is already committed atomically.  The scheduler
+                # can safely retry idempotent cycle materialization, so do not
+                # tell the owner that a successfully activated run failed.
+                logger.exception("Immediate first-cycle planning failed; scheduler will retry", extra={"campaign_id": campaign_id})
         return await self.repositories.get_campaign(campaign_id) or campaign
 
     async def editable_campaign(self, campaign_id: str) -> Document:
@@ -250,12 +291,8 @@ class CampaignService:
         interval = campaign.get("repost_interval_seconds")
         if repost_offsets is not None:
             next_cycle = cycle_number + 1
-            next_cycle_at = (
-                scheduled_cycle_time(start, next_cycle, interval, repost_offsets)
-                if next_cycle <= len(repost_offsets)
-                else end
-            )
-            await self.repositories.update_campaign(
+            next_cycle_at = scheduled_cycle_time(start, next_cycle, interval, repost_offsets) if next_cycle <= len(repost_offsets) else end
+            await self.repositories.advance_running_campaign(
                 campaign["campaign_id"],
                 {
                     "status": CampaignStatus.ACTIVE.value,
@@ -265,7 +302,7 @@ class CampaignService:
                 },
             )
         elif interval:
-            await self.repositories.update_campaign(
+            await self.repositories.advance_running_campaign(
                 campaign["campaign_id"],
                 {
                     "status": CampaignStatus.ACTIVE.value,
@@ -276,7 +313,7 @@ class CampaignService:
             )
         else:
             # Single-post campaigns remain active until their end-time cleanup.
-            await self.repositories.update_campaign(
+            await self.repositories.advance_running_campaign(
                 campaign["campaign_id"],
                 {
                     "status": CampaignStatus.ACTIVE.value,
@@ -294,32 +331,61 @@ class CampaignService:
         if seconds <= 0:
             raise ValueError("Extension must be positive.")
         new_end = as_utc(campaign["current_end_at_utc"]) + timedelta(seconds=seconds)
-        event = {"at": utcnow(), "owner_id": owner_id, "seconds": seconds, "new_end_at_utc": new_end}
-        await self.repositories.db.campaigns.update_one(
-            {"campaign_id": campaign_id},
-            {"$set": {"current_end_at_utc": new_end, "updated_at": utcnow()}, "$push": {"extensions": event}},
-        )
-        campaign["current_end_at_utc"] = new_end
-        return campaign
+        cleanup_still_safe = self._cleanup_safe_after_extension(campaign, new_end)
+        retention_adjusted = bool(campaign.get("delete_on_end", True)) and not cleanup_still_safe
+        event = {
+            "at": utcnow(),
+            "owner_id": owner_id,
+            "seconds": seconds,
+            "new_end_at_utc": new_end,
+            "retention_adjusted": retention_adjusted,
+        }
+        update: Document = {"current_end_at_utc": new_end, "updated_at": utcnow()}
+        if retention_adjusted:
+            update.update({"delete_on_end": False, "delete_on_next_campaign": True})
+        extended = await self.repositories.extend_running_campaign(campaign_id, update, event)
+        if not extended:
+            raise ValueError("The campaign changed state before it could be extended. Open it again to see its current state.")
+        return extended
+
+    @staticmethod
+    def _cleanup_safe_after_extension(campaign: Document, new_end: Any) -> bool:
+        start = as_utc(campaign["start_at_utc"])
+        offsets = campaign.get("repost_offsets_seconds")
+        if offsets is not None:
+            last_post = start + timedelta(seconds=int(offsets[-1])) if offsets else start
+            return as_utc(new_end) - last_post <= SAFE_DELETE_WINDOW
+        interval = campaign.get("repost_interval_seconds")
+        if interval:
+            return timedelta(seconds=int(interval)) <= SAFE_DELETE_WINDOW
+        return as_utc(new_end) - start <= SAFE_DELETE_WINDOW
 
     async def end_early(self, campaign_id: str) -> bool:
         # Owner-requested stop always means stop and delete this campaign's
         # known live messages, even if its normal end behavior was "keep".
-        await self.repositories.update_campaign(campaign_id, {"delete_on_end": True, "updated_at": utcnow()})
-        return await self.repositories.mark_campaign_ending(campaign_id, "ended_early")
+        return await self.repositories.end_campaign_early(campaign_id)
 
     async def pause(self, campaign_id: str, owner_id: int) -> Document:
         campaign = await self.repositories.get_campaign(campaign_id)
         if not campaign or campaign["status"] not in {CampaignStatus.ACTIVE.value, CampaignStatus.SCHEDULED.value}:
             raise ValueError("Only active or scheduled campaigns can be paused.")
         now = utcnow()
-        await self.repositories.pause_campaign_deliveries(campaign_id)
-        await self.repositories.update_campaign(
+        # Hide the campaign from workers/scheduler first. Any delivery claimed
+        # concurrently will then return itself to PAUSED instead of sending.
+        paused = await self.repositories.pause_running_campaign(
             campaign_id,
-            {"status": CampaignStatus.PAUSED.value, "paused_at": now, "paused_by": owner_id, "updated_at": now},
+            {
+                "status": CampaignStatus.PAUSED.value,
+                "paused_at": now,
+                "paused_by": owner_id,
+                "resume_recovery_needed": False,
+                "updated_at": now,
+            },
         )
-        campaign.update({"status": CampaignStatus.PAUSED.value, "paused_at": now})
-        return campaign
+        if not paused:
+            raise ValueError("The campaign changed state before it could be paused. Open it again to see its current state.")
+        await self.repositories.pause_campaign_deliveries(campaign_id)
+        return paused
 
     async def resume(self, campaign_id: str, owner_id: int) -> Document:
         campaign = await self.repositories.get_campaign(campaign_id)
@@ -330,59 +396,78 @@ class CampaignService:
         freeze_seconds = max(0, int((now - paused_at).total_seconds()))
         start = as_utc(campaign["start_at_utc"]) + timedelta(seconds=freeze_seconds)
         end = as_utc(campaign["current_end_at_utc"]) + timedelta(seconds=freeze_seconds)
+        next_cycle_at = as_utc(campaign["next_cycle_at"]) + timedelta(seconds=freeze_seconds) if campaign.get("next_cycle_at") else None
         status = CampaignStatus.SCHEDULED if start > now else CampaignStatus.ACTIVE
-        await self.repositories.resume_campaign_deliveries(campaign_id)
-        await self.repositories.update_campaign(
+        # Publish the resumed status before making queued jobs claimable. This
+        # avoids a worker seeing PAUSED and immediately parking a resumed job.
+        resumed = await self.repositories.resume_paused_campaign(
             campaign_id,
             {
                 "status": status.value,
                 "start_at_utc": start,
                 "current_end_at_utc": end,
+                "next_cycle_at": next_cycle_at,
                 "paused_at": None,
                 "last_resumed_by": owner_id,
                 "last_freeze_seconds": freeze_seconds,
+                "resume_recovery_needed": True,
                 "updated_at": now,
             },
         )
-        campaign.update({"status": status.value, "start_at_utc": start, "current_end_at_utc": end, "paused_at": None})
-        return campaign
+        if not resumed:
+            raise ValueError("The campaign was already resumed or changed. Open it again to see its current state.")
+        await self.repositories.resume_campaign_deliveries(campaign_id)
+        await self.repositories.advance_running_campaign(campaign_id, {"resume_recovery_needed": False, "updated_at": now})
+        resumed["resume_recovery_needed"] = False
+        return resumed
+
+    async def return_to_draft(self, campaign_id: str, owner_id: int) -> Document:
+        """Make a not-yet-started schedule editable again without losing its setup."""
+        campaign = await self.repositories.get_campaign(campaign_id)
+        if not campaign or campaign["status"] != CampaignStatus.SCHEDULED.value:
+            raise ValueError("Only a scheduled campaign that has not started can return to draft.")
+        now = utcnow()
+        update = {
+            "status": CampaignStatus.DRAFT.value,
+            "target_snapshot": [],
+            "protected_destination_ids": [],
+            "cohort_map": {},
+            "cohort_seed": None,
+            "shuffle_seed": None,
+            "activated_at": None,
+            "next_cycle_number": None,
+            "next_cycle_at": None,
+            "returned_to_draft_by": owner_id,
+            "returned_to_draft_at": now,
+            "updated_at": now,
+        }
+        result = await self.repositories.return_scheduled_to_draft(campaign_id, update)
+        if not result:
+            raise ValueError("The campaign started before it could return to draft. Open it again to see its state.")
+        return result
 
     async def duplicate(self, campaign_id: str, owner_id: int) -> Document:
+        """Create a fully configured editable successor of archived history."""
         original = await self.repositories.get_campaign(campaign_id)
         if not original or original["status"] != CampaignStatus.ARCHIVED.value:
             raise ValueError("Only archived campaigns can be duplicated.")
+        copied = self._derived_draft(original, owner_id, name=f"{original['name']} (copy)")
+        await self.repositories.create_campaign(copied)
+        return copied
+
+    async def prepare_rerun(self, campaign_id: str, owner_id: int) -> Document:
+        """Prepare a one-confirmation rerun with the previous definition intact."""
+        original = await self.repositories.get_campaign(campaign_id)
+        if not original or original["status"] != CampaignStatus.ARCHIVED.value:
+            raise ValueError("Only an archived campaign can be run again.")
         now = utcnow()
-        copied = {
-            key: value
-            for key, value in original.items()
-            if key
-            in {
-                "name",
-                "mode",
-                "variants",
-                "destinations",
-                "target_selector",
-                "delete_on_repost",
-                "delete_on_end",
-                "owner_timezone",
-                "repost_interval_seconds",
-                "repost_offsets_seconds",
-            }
-        }
-        copied.update(
-            {
-                "campaign_id": opaque_id("cmp"),
-                "name": f"{original['name']} (copy)",
-                "status": CampaignStatus.DRAFT.value,
-                "target_snapshot": [],
-                "protected_destination_ids": [],
-                "cohort_map": {},
-                "created_by": owner_id,
-                "created_at": now,
-                "derived_from_campaign_id": original["campaign_id"],
-                "version": 1,
-            }
-        )
+        pending = await self.repositories.recent_pending_rerun(campaign_id, owner_id, now - timedelta(minutes=10))
+        if pending:
+            return pending
+        copied = self._derived_draft(original, owner_id, name=original["name"])
+        copied["rerun_of_campaign_id"] = original["campaign_id"]
+        copied["rerun_ready"] = True
+        copied["rerun_duration_seconds"] = max(60, int((as_utc(copied["current_end_at_utc"]) - as_utc(copied["start_at_utc"])).total_seconds()))
         await self.repositories.create_campaign(copied)
         return copied
 
@@ -391,24 +476,55 @@ class CampaignService:
         original = await self.repositories.get_campaign(campaign_id)
         if not original:
             raise ValueError("Campaign no longer exists.")
-        now = utcnow()
-        copied = {
-            key: value
-            for key, value in original.items()
-            if key in {
-                "mode", "variants", "destinations", "target_selector", "delete_on_repost",
-                "delete_on_end", "owner_timezone", "repost_interval_seconds", "repost_offsets_seconds",
-            }
-        }
-        copied.update({
-            "campaign_id": opaque_id("cmp"), "name": f"{original['name']} (edited copy)",
-            "status": CampaignStatus.DRAFT.value, "target_snapshot": [], "protected_destination_ids": [],
-            "cohort_map": {}, "created_by": owner_id, "created_at": now,
-            "derived_from_campaign_id": original["campaign_id"], "version": 1,
-            "preview_sent": False,
-        })
+        copied = self._derived_draft(original, owner_id, name=f"{original['name']} (edited copy)")
         await self.repositories.create_campaign(copied)
         return copied
+
+    @staticmethod
+    def _fresh_window(original: Document, now: Any) -> tuple[Any, Any]:
+        start_value = original.get("start_at_utc")
+        end_value = original.get("current_end_at_utc") or original.get("original_end_at_utc")
+        duration = timedelta(hours=1)
+        if start_value and end_value:
+            duration = max(timedelta(minutes=1), as_utc(end_value) - as_utc(start_value))
+        return now, now + duration
+
+    def _derived_draft(self, original: Document, owner_id: int, *, name: str) -> Document:
+        now = utcnow()
+        start, end = self._fresh_window(original, now)
+        variants = deepcopy(original.get("variants", []))
+        mode = original.get("mode", CampaignMode.STANDARD.value)
+        if len(variants) < 2:
+            mode = CampaignMode.STANDARD.value
+        return {
+            "campaign_id": opaque_id("cmp"),
+            "name": name,
+            "status": CampaignStatus.DRAFT.value,
+            "mode": mode,
+            "variants": variants,
+            "destinations": deepcopy(original.get("destinations", [])),
+            "target_selector": deepcopy(original.get("target_selector", {})),
+            "target_snapshot": [],
+            "protected_destination_ids": [],
+            "cohort_map": {},
+            "start_at_utc": start,
+            "original_end_at_utc": end,
+            "current_end_at_utc": end,
+            "repost_interval_seconds": original.get("repost_interval_seconds"),
+            "repost_offsets_seconds": deepcopy(original.get("repost_offsets_seconds")),
+            "delete_on_repost": original.get("delete_on_repost", True),
+            "delete_on_end": original.get("delete_on_end", True),
+            "delete_on_next_campaign": original.get("delete_on_next_campaign", False),
+            "owner_timezone": original.get("owner_timezone", "UTC"),
+            # The exact saved definition has already been rendered by the
+            # source run. Any creative/CTA edit resets this flag.
+            "preview_sent": bool(variants),
+            "created_by": owner_id,
+            "created_at": now,
+            "updated_at": now,
+            "derived_from_campaign_id": original["campaign_id"],
+            "version": 1,
+        }
 
     async def delete_draft(self, campaign_id: str) -> bool:
         return await self.repositories.delete_draft_campaign(campaign_id)
