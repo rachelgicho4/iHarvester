@@ -6,7 +6,7 @@ Set these Koyeb Secrets: `BOT_TOKEN`, `OWNER_USER_IDS`, `MONGODB_URI`, `WEBHOOK_
 
 The provided Dockerfile installs a hash-locked `requirements.txt` and a current CA bundle. If you deliberately deploy with Koyeb's **Buildpack** rather than the Dockerfile, the same requirements file is available; set the run command to `uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1 --no-access-log`. Disabling the generic access log prevents the secret webhook path from being written to deployment logs.
 
-Deploy, wait for `/readyz` to return 200, then use Telegram. Koyeb's UI is sufficient; no local shell deployment commands are required.
+Deploy, wait for `/readyz` to return 200, then use Telegram. For manual campaign-variant sharing, send `/setinline` to `@BotFather`, select the iHarvester bot, and set a placeholder such as `Enter an iHarvester share code`. This is a Telegram account setting, not a Koyeb environment variable. Koyeb's UI is sufficient; no local shell deployment commands are required.
 
 ## Free Instance note
 

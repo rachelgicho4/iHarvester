@@ -11,7 +11,8 @@ It deliberately remains one Python service plus MongoDB: no Redis, Celery, dashb
 3. Under **Exposed ports**, select `8000` with protocol `HTTP`; Koyeb supplies that value as `PORT`. Choose an always-on paid instance with one minimum instance. Koyeb Free scales to zero after idle time, which is unsuitable for a campaign scheduler.
 4. Add `BOT_TOKEN`, `OWNER_USER_IDS`, `MONGODB_URI`, `WEBHOOK_PATH_SECRET`, and `WEBHOOK_SECRET_TOKEN` as Koyeb Secrets. Set `RUN_MODE=webhook` and `MONGODB_DB_NAME=telegram_campaign_orchestrator`.
 5. Koyeb supplies `KOYEB_PUBLIC_DOMAIN`; iHarvester derives its public webhook base URL from it. Deploy and check `/readyz`.
-6. Open the bot in Telegram, press **Start**, and promote it to administrator in the source channels.
+6. In `@BotFather`, run `/setinline`, select the iHarvester bot, and set a placeholder such as `Enter an iHarvester share code`. This enables owner-only manual variant sharing; no additional environment variable is needed.
+7. Open the bot in Telegram, press **Start**, and promote it to administrator in the source channels.
 
 Koyeb's default TCP health check is sufficient; an HTTP `/healthz` check is optional if the port settings expose the customization control. The service sets its Telegram webhook on startup. Keep `WEB_CONCURRENCY=1` / one application worker; the MongoDB scheduler lease remains a safety net during deployment overlaps.
 
@@ -43,6 +44,8 @@ Drafts show a compact setup checklist; running campaigns show delivery, timeline
 
 Archived campaigns offer two separate reuse paths. **Run again now** preserves the prior content, CTA layout, destinations, target rules, mode, duration, exact cadence, and end behavior, then asks for one launch confirmation. **Edit a copy** opens the same prefilled configuration as a normal editable draft.
 
+Every supported variant also has **Share manually**. It creates an immutable, owner-only code tied to that exact content revision. Use the supplied chat chooser or type `@YourIHarvesterBot HV-XXXX-XXXX` in another broadcast bot's chat, then select the result to insert the frozen text/photo/video/document with its original entities and URL keyboard. Codes are reusable until revoked; editing a campaign creates a different snapshot instead of silently changing an old code. If the receiving bot strips keyboards when it republishes, use **Copy CTA fallback** to transfer the preserved row, label, and URL layout manually. Telegram inline mode cannot represent an album or video note as one selectable result, so save a single album item as its own photo/video variant when it needs manual inline sharing.
+
 For fallback channel registration, forward a post from a source channel to the bot and select **Register/Refresh**. `/backup` creates a compressed core export; `/restore` validates an attached export and asks for confirmation before upserting it.
 
 ## Safety behavior worth knowing
@@ -56,6 +59,7 @@ For fallback channel registration, forward a post from a source channel to the b
 - A message-send timeout is recorded as `UNKNOWN_SEND_STATE`, not blindly retried, because Telegram can have accepted the send before a timeout reached the bot.
 - Deletion cleanup uses a conservative 47-hour validation rule. A long campaign must repost within 47 hours if it promises cleanup.
 - Automatic core backups coalesce the configured channel-growth and time triggers. Their enablement, threshold, and interval are editable in **Settings**.
+- Manual-share lookups are restricted to `OWNER_USER_IDS`, returned with owner-personal zero-cache inline results, and remain frozen even if the source campaign is edited. Revoked records are purged automatically after 30 days; deleting the campaign removes its share records immediately.
 - Generic HTTP access logging is disabled in production commands so the secret webhook path is not written to platform logs.
 
 ## Configuration

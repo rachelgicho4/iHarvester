@@ -9,6 +9,7 @@ from pymongo import ASCENDING, ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError
 
 from app.campaigns.models import ChannelStatus, DeliveryStatus
+from app.campaigns.sharing import new_share_code
 from app.db.client import Database
 from app.utils.time import utcnow
 
@@ -131,6 +132,103 @@ class Repositories:
     async def update_campaign(self, campaign_id: str, update: Document) -> bool:
         result = await self.db.campaigns.update_one({"campaign_id": campaign_id}, {"$set": update})
         return result.modified_count == 1
+
+    async def get_or_create_variant_share(
+        self,
+        *,
+        owner_id: int,
+        campaign_id: str,
+        campaign_name: str,
+        variant_id: str,
+        variant_index: int,
+        variant_revision: int | None,
+        snapshot_hash: str,
+        creative: Document,
+    ) -> Document:
+        """Reuse one active code per exact snapshot and tolerate concurrent taps."""
+        active_query = {
+            "owner_id": owner_id,
+            "campaign_id": campaign_id,
+            "variant_id": variant_id,
+            "snapshot_hash": snapshot_hash,
+            "revoked_at": None,
+        }
+        if existing := await self.db.variant_shares.find_one(active_query):
+            return existing
+        now = utcnow()
+        for _ in range(10):
+            document: Document = {
+                **active_query,
+                "share_code": new_share_code(),
+                "campaign_name": campaign_name,
+                "variant_index": variant_index,
+                "variant_revision": variant_revision,
+                "creative": creative,
+                "created_at": now,
+                "updated_at": now,
+                "query_count": 0,
+            }
+            try:
+                await self.db.variant_shares.insert_one(document)
+                return document
+            except DuplicateKeyError:
+                # Either the random code collided, or another callback created
+                # the same active snapshot between find_one and insert_one.
+                if existing := await self.db.variant_shares.find_one(active_query):
+                    return existing
+        raise RuntimeError("could not allocate a unique manual-share code")
+
+    async def get_variant_share(self, share_code: str, owner_id: int) -> Document | None:
+        return await self.db.variant_shares.find_one(
+            {"share_code": share_code, "owner_id": owner_id, "revoked_at": None}
+        )
+
+    async def active_variant_shares(self, owner_id: int, campaign_id: str, variant_id: str) -> list[Document]:
+        return await self.db.variant_shares.find(
+            {
+                "owner_id": owner_id,
+                "campaign_id": campaign_id,
+                "variant_id": variant_id,
+                "revoked_at": None,
+            }
+        ).sort("created_at", -1).to_list(None)
+
+    async def record_variant_share_query(self, share_code: str, owner_id: int) -> None:
+        await self.db.variant_shares.update_one(
+            {"share_code": share_code, "owner_id": owner_id, "revoked_at": None},
+            {"$set": {"last_queried_at": utcnow(), "updated_at": utcnow()}, "$inc": {"query_count": 1}},
+        )
+
+    async def revoke_variant_share(self, share_code: str, owner_id: int) -> bool:
+        now = utcnow()
+        result = await self.db.variant_shares.update_one(
+            {"share_code": share_code, "owner_id": owner_id, "revoked_at": None},
+            {"$set": {"revoked_at": now, "updated_at": now, "purge_at": now + timedelta(days=30)}},
+        )
+        return result.modified_count == 1
+
+    async def revoke_variant_shares(
+        self,
+        *,
+        owner_id: int,
+        campaign_id: str,
+        variant_id: str,
+        except_snapshot_hash: str | None = None,
+    ) -> int:
+        query: Document = {
+            "owner_id": owner_id,
+            "campaign_id": campaign_id,
+            "variant_id": variant_id,
+            "revoked_at": None,
+        }
+        if except_snapshot_hash:
+            query["snapshot_hash"] = {"$ne": except_snapshot_hash}
+        now = utcnow()
+        result = await self.db.variant_shares.update_many(
+            query,
+            {"$set": {"revoked_at": now, "updated_at": now, "purge_at": now + timedelta(days=30)}},
+        )
+        return result.modified_count
 
     async def advance_running_campaign(self, campaign_id: str, update: Document) -> bool:
         """Advance cycle state without reviving a concurrently paused/ending run."""
@@ -724,6 +822,8 @@ class Repositories:
 
     async def delete_draft_campaign(self, campaign_id: str) -> bool:
         result = await self.db.campaigns.delete_one({"campaign_id": campaign_id, "status": "DRAFT"})
+        if result.deleted_count:
+            await self.db.variant_shares.delete_many({"campaign_id": campaign_id})
         return result.deleted_count == 1
 
     async def delete_archived_campaign(self, campaign_id: str) -> bool:
@@ -748,6 +848,8 @@ class Repositories:
         # retries idempotent if legacy data contains empty-state artifacts.
         await self.db.campaign_channel_state.delete_many(campaign_query)
         result = await self.db.campaigns.delete_one({"campaign_id": campaign_id, "status": "ARCHIVED"})
+        if result.deleted_count:
+            await self.db.variant_shares.delete_many(campaign_query)
         return result.deleted_count == 1
 
     async def save_pending_restore(self, restore_id: str, owner_id: int, backup: Document) -> None:

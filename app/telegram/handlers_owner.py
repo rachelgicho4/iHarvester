@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 from collections import Counter
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from math import ceil
 from typing import Any
@@ -14,16 +15,33 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    CopyTextButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultsButton,
+    Message,
+    SwitchInlineQueryChosenChat,
+)
 from pydantic import ValidationError
 
 from app.backups.export import make_backup
 from app.backups.restore import parse_backup, restore_backup
 from app.campaigns.models import Button, CampaignMode, CampaignStatus, ChannelStatus, Creative, Destination
 from app.campaigns.service import CampaignService
+from app.campaigns.sharing import creative_snapshot_hash, normalize_share_code
 from app.db.repositories import Document, Repositories
 from app.telegram.formatting import capture_creative
 from app.telegram.handlers_admin_updates import refresh_channel, register_forwarded_channel
+from app.telegram.inline_sharing import (
+    UnsupportedInlineCreative,
+    button_layout_manifest,
+    inline_result_for_share,
+    inline_support_error,
+)
 from app.telegram.keyboards import home_keyboard
 from app.telegram.sender import TelegramSender
 from app.utils.ids import opaque_id
@@ -476,11 +494,15 @@ class OwnerHandlers:
         self.router.message.register(self.start, CommandStart())
         self.router.message.register(self.backup, Command("backup"))
         self.router.message.register(self.restore, Command("restore"))
+        self.router.inline_query.register(self.inline_query)
         self.router.callback_query.register(self.callback, F.data)
         self.router.message.register(self.message)
 
     def _allowed(self, user_id: int | None, chat_type: str) -> bool:
         return user_id in self.owner_ids and chat_type == "private"
+
+    def _allowed_inline(self, user_id: int | None) -> bool:
+        return user_id in self.owner_ids
 
     @staticmethod
     def _date(value: Any, timezone: str = "UTC") -> str:
@@ -977,6 +999,44 @@ class OwnerHandlers:
             reply_markup=_markup(_navigation()),
         )
 
+    async def inline_query(self, query: InlineQuery) -> None:
+        """Resolve one owner-authorized, immutable variant snapshot by code."""
+        if not self._allowed_inline(query.from_user.id):
+            await query.answer(results=[], cache_time=0, is_personal=True)
+            return
+        raw_code = (query.query or "").strip().strip("\"'")
+        code = normalize_share_code(raw_code.split(maxsplit=1)[0] if raw_code else "")
+        share = await self.repositories.get_variant_share(code, query.from_user.id) if code else None
+        if not share:
+            await query.answer(
+                results=[],
+                cache_time=0,
+                is_personal=True,
+                button=InlineQueryResultsButton(text="Open iHarvester", start_parameter="shares"),
+            )
+            return
+        try:
+            result = inline_result_for_share(share)
+        except UnsupportedInlineCreative:
+            logger.warning(
+                "Unsupported creative reached inline lookup",
+                extra={"share_code": code, "creative_kind": share.get("creative", {}).get("kind")},
+            )
+            await query.answer(
+                results=[],
+                cache_time=0,
+                is_personal=True,
+                button=InlineQueryResultsButton(text="Open iHarvester", start_parameter="shares"),
+            )
+            return
+        await query.answer(results=[result], cache_time=0, is_personal=True)
+        try:
+            await self.repositories.record_variant_share_query(code, query.from_user.id)
+        except Exception:
+            # Usage telemetry must never turn a successfully answered inline
+            # query into a webhook retry of the same one-shot query ID.
+            logger.exception("Could not record manual-share inline lookup", extra={"share_code": code})
+
     async def callback(self, query: CallbackQuery, bot: Bot) -> None:
         if not query.message or not self._allowed(query.from_user.id, query.message.chat.type):
             await query.answer("Owner-only private control.", show_alert=True)
@@ -1019,6 +1079,9 @@ class OwnerHandlers:
             elif data.startswith("var:"):
                 _, campaign_id, index, action = data.split(":", 3)
                 await self._variant_action(query, campaign_id, int(index), action)
+            elif data.startswith("share:"):
+                _, campaign_id, index, action, share_code = data.split(":", 4)
+                await self._share_action(query, campaign_id, int(index), action, share_code)
             elif data.startswith("btn:"):
                 _, campaign_id, index, placement = data.split(":", 3)
                 await self.repositories.set_owner_session(
@@ -1142,6 +1205,7 @@ class OwnerHandlers:
             "rm",
             "preview",
             "var",
+            "share",
             "target",
             "ret",
             "dest",
@@ -1577,7 +1641,8 @@ class OwnerHandlers:
                     InlineKeyboardButton(
                         text=f"Variant {index + 1} • {item['kind'].replace('_', ' ').title()}",
                         callback_data=f"var:{campaign_id}:{index}:preview",
-                    )
+                    ),
+                    InlineKeyboardButton(text="Share manually", callback_data=f"var:{campaign_id}:{index}:share"),
                 ]
             )
             if status == CampaignStatus.DRAFT.value:
@@ -1617,6 +1682,182 @@ class OwnerHandlers:
             _markup(rows),
         )
 
+    async def _show_variant_share(self, message: Message, owner_id: int, campaign: Document, index: int) -> None:
+        variants = campaign.get("variants", [])
+        if index < 0 or index >= len(variants):
+            raise ValueError("that variant no longer exists")
+        creative = deepcopy(variants[index])
+        campaign_id = campaign["campaign_id"]
+        if support_error := inline_support_error(creative):
+            rows: list[list[InlineKeyboardButton]] = []
+            manifest = button_layout_manifest(creative)
+            if creative.get("buttons") and len(manifest) <= 256:
+                rows.append(
+                    [InlineKeyboardButton(text="Copy CTA layout", copy_text=CopyTextButton(text=manifest))]
+                )
+            elif creative.get("buttons"):
+                rows.append(
+                    [InlineKeyboardButton(text="Show CTA layout", callback_data=f"var:{campaign_id}:{index}:manifest")]
+                )
+            rows.extend(_navigation(f"c:{campaign_id}:variants"))
+            await self._render(
+                message,
+                f"Variant {index + 1} cannot be inserted inline as one exact post.\n\n{support_error}",
+                _markup(rows),
+            )
+            return
+
+        bot_user = await self.sender.bot.get_me()
+        if not bot_user.username:
+            raise ValueError("this bot needs a public username before inline sharing can be used")
+        if not bot_user.supports_inline_queries:
+            rows: list[list[InlineKeyboardButton]] = []
+            if creative.get("buttons"):
+                manifest = button_layout_manifest(creative)
+                rows.append(
+                    [
+                        InlineKeyboardButton(text="Copy CTA fallback", copy_text=CopyTextButton(text=manifest))
+                        if len(manifest) <= 256
+                        else InlineKeyboardButton(text="Show CTA fallback", callback_data=f"var:{campaign_id}:{index}:manifest")
+                    ]
+                )
+            rows.extend(_navigation(f"c:{campaign_id}:variants"))
+            await self._render(
+                message,
+                "Inline sharing needs a one-time BotFather setting.\n\n"
+                "Open @BotFather, send /setinline, select this bot, and use a placeholder such as "
+                "‘Enter an iHarvester share code’. Then return here and tap Share manually again.",
+                _markup(rows),
+            )
+            return
+
+        snapshot_hash = creative_snapshot_hash(creative)
+        variant_id = str(creative["id"])
+        revision_value = campaign.get("variant_current_revisions", {}).get(variant_id)
+        variant_revision = int(revision_value) if revision_value is not None else None
+        share = await self.repositories.get_or_create_variant_share(
+            owner_id=owner_id,
+            campaign_id=campaign_id,
+            campaign_name=str(campaign.get("name") or "Campaign"),
+            variant_id=variant_id,
+            variant_index=index,
+            variant_revision=variant_revision,
+            snapshot_hash=snapshot_hash,
+            creative=creative,
+        )
+        active_shares = await self.repositories.active_variant_shares(owner_id, campaign_id, variant_id)
+        older_count = sum(item.get("snapshot_hash") != snapshot_hash for item in active_shares)
+        code = share["share_code"]
+        inline_command = f"@{bot_user.username} {code}"
+        revision_label = f"revision {variant_revision}" if variant_revision is not None else f"snapshot {snapshot_hash[:8]}"
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text="Use in another bot or chat",
+                    switch_inline_query_chosen_chat=SwitchInlineQueryChosenChat(
+                        query=code,
+                        allow_user_chats=True,
+                        allow_bot_chats=True,
+                        allow_group_chats=True,
+                        allow_channel_chats=True,
+                    ),
+                )
+            ],
+            [InlineKeyboardButton(text="Copy inline command", copy_text=CopyTextButton(text=inline_command))],
+        ]
+        if creative.get("buttons"):
+            manifest = button_layout_manifest(creative)
+            if len(manifest) <= 256:
+                rows.append([InlineKeyboardButton(text="Copy CTA fallback", copy_text=CopyTextButton(text=manifest))])
+            else:
+                rows.append(
+                    [InlineKeyboardButton(text="Show CTA fallback", callback_data=f"share:{campaign_id}:{index}:buttons:{code}")]
+                )
+        rows.append([InlineKeyboardButton(text="Revoke this code", callback_data=f"share:{campaign_id}:{index}:revoke:{code}")])
+        if older_count:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"Revoke {older_count} older snapshot code{'s' if older_count != 1 else ''}",
+                        callback_data=f"share:{campaign_id}:{index}:older:{code}",
+                    )
+                ]
+            )
+        if len(active_shares) > 1:
+            rows.append([InlineKeyboardButton(text="Revoke all variant codes", callback_data=f"share:{campaign_id}:{index}:all:{code}")])
+        rows.extend(_navigation(f"c:{campaign_id}:variants"))
+        await self._render(
+            message,
+            f"Manual share • {campaign['name']} • Variant {index + 1}\n\n"
+            f"Code: {code}\n"
+            f"Frozen version: {revision_label}\n"
+            f"Active codes for this variant: {len(active_shares)}\n\n"
+            f"In the other broadcast bot's chat, type:\n{inline_command}\n\n"
+            "Choose the result to insert this exact frozen post with its formatting and URL buttons. "
+            "The receiving bot must preserve the keyboard when it republishes the post; the CTA fallback is available if it does not.",
+            _markup(rows),
+        )
+
+    async def _send_button_manifest(self, message: Message, creative: Document, back_callback: str) -> None:
+        manifest = button_layout_manifest(creative)
+        chunks: list[str] = []
+        current = ""
+        for line in manifest.splitlines(keepends=True):
+            if current and len(current) + len(line) > 3500:
+                chunks.append(current.rstrip())
+                current = ""
+            current += line
+        if current:
+            chunks.append(current.rstrip())
+        for chunk_index, chunk in enumerate(chunks):
+            await message.answer(
+                chunk,
+                reply_markup=_markup(_navigation(back_callback)) if chunk_index == len(chunks) - 1 else None,
+            )
+
+    async def _share_action(
+        self,
+        query: CallbackQuery,
+        campaign_id: str,
+        index: int,
+        action: str,
+        share_code: str,
+    ) -> None:
+        code = normalize_share_code(share_code)
+        share = await self.repositories.get_variant_share(code, query.from_user.id)
+        if not share or share.get("campaign_id") != campaign_id:
+            raise ValueError("that manual-share code is revoked or no longer available")
+        if action == "buttons":
+            await self._send_button_manifest(query.message, share["creative"], f"c:{campaign_id}:variants")
+            return
+        if action == "revoke":
+            await self.repositories.revoke_variant_share(code, query.from_user.id)
+            await self._render(
+                query.message,
+                f"Manual-share code {code} was revoked. It no longer returns an inline result.",
+                _markup(_navigation(f"c:{campaign_id}:variants")),
+            )
+            return
+        if action not in {"older", "all"}:
+            raise ValueError("that manual-share action is no longer valid")
+        revoked = await self.repositories.revoke_variant_shares(
+            owner_id=query.from_user.id,
+            campaign_id=campaign_id,
+            variant_id=share["variant_id"],
+            except_snapshot_hash=share["snapshot_hash"] if action == "older" else None,
+        )
+        if action == "older":
+            campaign = await self.repositories.get_campaign(campaign_id)
+            if campaign and 0 <= index < len(campaign.get("variants", [])):
+                notice = await query.message.answer(f"Revoked {revoked} older snapshot code{'s' if revoked != 1 else ''}.")
+                await self._show_variant_share(notice, query.from_user.id, campaign, index)
+                return
+        await self._render(
+            query.message,
+            f"Revoked {revoked} manual-share code{'s' if revoked != 1 else ''} for this variant.",
+            _markup(_navigation(f"c:{campaign_id}:variants")),
+        )
+
     async def _variant_action(self, query: CallbackQuery, campaign_id: str, index: int, action: str) -> None:
         campaign = await self.repositories.get_campaign(campaign_id)
         if not campaign:
@@ -1631,6 +1872,10 @@ class OwnerHandlers:
             if not updated:
                 raise ValueError("campaign no longer exists")
             await self._show_variants(notice, updated)
+        elif action == "share":
+            await self._show_variant_share(query.message, query.from_user.id, campaign, index)
+        elif action == "manifest":
+            await self._send_button_manifest(query.message, variants[index], f"c:{campaign_id}:variants")
         elif action == "buttons":
             if status != CampaignStatus.DRAFT.value:
                 raise ValueError("CTA layout can only be changed in a draft; replace the live variant content or edit a copy.")

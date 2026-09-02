@@ -89,7 +89,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if await repositories.get_setting(key) is None:
                     await repositories.set_setting(key, value)
             stage = "Telegram bot authentication"
-            await bot.get_me()
+            bot_user = await bot.get_me()
+            if not bot_user.supports_inline_queries:
+                logger.warning(
+                    "Inline manual sharing is disabled in BotFather; run /setinline for @%s to enable variant share codes",
+                    bot_user.username or "this bot",
+                )
             allowed_updates = dispatcher.resolve_used_update_types()
             if settings.run_mode == "webhook":
                 stage = "Telegram webhook registration"

@@ -52,16 +52,20 @@ def capture_creative(message: Message) -> Creative:
             link_preview_options=preview or None,
         )
     kinds = [
-        ("PHOTO", message.photo[-1].file_id if message.photo else None, "photo"),
-        ("VIDEO", message.video.file_id if message.video else None, "video"),
-        ("ANIMATION", message.animation.file_id if message.animation else None, "animation"),
-        ("DOCUMENT", message.document.file_id if message.document else None, "document"),
-        ("AUDIO", message.audio.file_id if message.audio else None, "audio"),
-        ("VOICE", message.voice.file_id if message.voice else None, "voice"),
-        ("VIDEO_NOTE", message.video_note.file_id if message.video_note else None, "video_note"),
-        ("STICKER", message.sticker.file_id if message.sticker else None, "sticker"),
+        ("PHOTO", message.photo[-1] if message.photo else None, "photo"),
+        ("VIDEO", message.video, "video"),
+        ("ANIMATION", message.animation, "animation"),
+        ("DOCUMENT", message.document, "document"),
+        ("AUDIO", message.audio, "audio"),
+        ("VOICE", message.voice, "voice"),
+        ("VIDEO_NOTE", message.video_note, "video_note"),
+        ("STICKER", message.sticker, "sticker"),
     ]
-    for kind, file_id, field in kinds:
-        if file_id:
-            return Creative(**common, kind=kind, media=[{"field": field, "file_id": file_id}])
+    for kind, media, field in kinds:
+        if media:
+            replayable_media = {"field": field, "file_id": media.file_id}
+            for attribute in ("mime_type", "file_name"):
+                if value := getattr(media, attribute, None):
+                    replayable_media[attribute] = value
+            return Creative(**common, kind=kind, media=[replayable_media])
     raise ValueError("This Telegram content type cannot be used as a campaign creative.")

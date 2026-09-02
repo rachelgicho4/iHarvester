@@ -23,3 +23,10 @@ async def ensure_indexes(database: Database) -> None:
     await db.owner_sessions.create_index("expires_at", expireAfterSeconds=0)
     await db.pending_restores.create_index("restore_id", unique=True)
     await db.pending_restores.create_index("expires_at", expireAfterSeconds=0)
+    await db.variant_shares.create_index("share_code", unique=True)
+    await db.variant_shares.create_index(
+        [("owner_id", 1), ("campaign_id", 1), ("variant_id", 1), ("snapshot_hash", 1), ("revoked_at", 1)],
+        unique=True,
+    )
+    await db.variant_shares.create_index([("owner_id", 1), ("campaign_id", 1), ("variant_id", 1), ("created_at", -1)])
+    await db.variant_shares.create_index("purge_at", expireAfterSeconds=0)
