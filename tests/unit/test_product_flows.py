@@ -186,6 +186,32 @@ class WorkerRepositories:
         return 0
 
 
+def test_worker_resolves_the_delivery_frozen_variant_revision() -> None:
+    old = {"id": "v1", "kind": "TEXT", "text": "old"}
+    new = {"id": "v1", "kind": "TEXT", "text": "new"}
+    campaign = {
+        "variants": [new],
+        "variant_versions": {
+            "v1": [
+                {"revision": 1, "creative": old},
+                {"revision": 2, "creative": new},
+            ]
+        },
+    }
+
+    assert DeliveryWorker._delivery_variant(
+        campaign,
+        {"variant_index": 0, "variant_id": "v1", "variant_revision": 1},
+    ) == old
+    assert DeliveryWorker._delivery_variant(
+        campaign,
+        {"variant_index": 0, "variant_id": "v1", "variant_revision": 2},
+    ) == new
+    # A legacy delivery created before revision fields existed consistently
+    # resolves to the pre-edit revision instead of the new live payload.
+    assert DeliveryWorker._delivery_variant(campaign, {"variant_index": 0}) == old
+
+
 @pytest.mark.asyncio
 async def test_repost_deletes_every_album_item_even_when_one_is_already_absent() -> None:
     repositories = WorkerRepositories()

@@ -31,14 +31,15 @@ With `RUN_MODE=polling`, no domain or TLS certificate is required. The container
 
 Everything is in the bot's private chat with an allowed owner ID:
 
-1. Press **Create Campaign**, name the draft, and capture formatted text or a supported media post.
+1. Press **Create Campaign**, name the draft, and capture **Variant 1** as formatted text or a supported media post.
 2. Choose **Text**, **Photo**, **Photo + caption**, **Video**, **Video + caption**, **Album**, or **Forward ready post**. Forwarded content retains its Telegram formatting and media IDs.
 3. Add a CTA by entering its label and URL in separate prompts. Use **Add beside last** for a horizontal button or **Add new row** for a vertical one; labels are never rewritten or truncated by iHarvester.
-4. Add destinations, source targets (all active, tags, audience-size range/minimum, or manual IDs), mode, and schedule through their own guided controls. The Network screen shows active, unavailable, paused, and attention-required channel counts, and accepts a forwarded channel post for manual repair/registration.
-5. Choose **Send campaign**, then pick a duration preset or enter a custom duration such as `45m`, `2h`, `3d`, or `1mo` (30 days). Choose an even repost interval, 1-20 **Specific times after launch** such as `1d, 4d, 6d`, or 1-20 **custom repost gaps** such as `1d, 3d, 2d`. Each repost replaces the previous campaign post. iHarvester renders a real preview and presents the final launch confirmation with the exact planned targets and protected destination exclusions.
-6. **Launch** freezes the active target snapshot and automatically excludes all known destination channel IDs.
+4. Use **+ Add variant** for Variant 2, Variant 3, and so on. With two or more variants, **Mix + Rotate** becomes the default: the frozen audience is divided into count-balanced cohorts and every cycle advances each cohort to the next variant. **Manage variants** previews, replaces, adds CTA buttons to, or removes each variant independently. Standard mode deliberately uses Variant 1 only.
+5. Add destinations, source targets (all active, tags, audience-size range/minimum, or manual IDs), mode, and schedule through their own guided controls. The Network screen shows active, unavailable, paused, and attention-required channel counts, and accepts a forwarded channel post for manual repair/registration.
+6. Choose **Send campaign**, then pick a duration preset or enter a custom duration such as `45m`, `2h`, `3d`, or `1mo` (30 days). Choose an even repost interval, 1-20 **Specific times after launch** such as `1d, 4d, 6d`, or 1-20 **custom repost gaps** such as `1d, 3d, 2d`. Each repost replaces the previous campaign post. If a rotating plan is too short or too tightly packed to complete every variant safely, iHarvester re-spaces the cadence or extends the end and shows the exact adjustment before launch.
+7. **Launch** freezes the active target snapshot and automatically excludes all known destination channel IDs.
 
-Drafts show a compact setup checklist; running campaigns show delivery and time progress, latest-cycle reachability, failures, cleanup, live-post, and tracked-join counts. Content, CTA buttons, destinations, targets, timing, and end behavior remain editable while a campaign is a draft. Scheduled campaigns can return to draft before they start.
+Drafts show a compact setup checklist; running campaigns show delivery, timeline, and variant-coverage progress, latest-cycle reachability, failures, cleanup, live-post, and tracked-join counts. Content, CTA buttons, destinations, targets, timing, and end behavior remain editable while a campaign is a draft. During an active or paused run, an individual variant can be replaced for future rotation cycles. Each planned cycle keeps its frozen content revision, and the window is extended automatically when the replacement needs more cycles to reach every frozen target. Scheduled campaigns can return to draft before they start.
 
 Archived campaigns offer two separate reuse paths. **Run again now** preserves the prior content, CTA layout, destinations, target rules, mode, duration, exact cadence, and end behavior, then asks for one launch confirmation. **Edit a copy** opens the same prefilled configuration as a normal editable draft.
 
@@ -47,7 +48,8 @@ For fallback channel registration, forward a post from a source channel to the b
 ## Safety behavior worth knowing
 
 - Every cycle gets a new deterministic HMAC dispatch order. A crash resumes the same cycle order; registration order is never broadcast order.
-- Mix + Rotate freezes count-balanced cohorts, rotates variants by cohort, and independently reshuffles physical delivery order each cycle.
+- Mix + Rotate freezes count-balanced cohorts, rotates variants by cohort, and independently reshuffles physical delivery order each cycle. Launch requires enough dispatch-safe cycles for every variant to visit every channel.
+- Every delivery stores the selected variant revision. Replacing a live variant cannot mix old and new payloads inside one already-planned cycle.
 - Reposts delete the known previous campaign message for that channel immediately before sending a replacement.
 - End time/early end prevents future sends, cleans known live posts, then archives immutable results. An archive is repeated only by creating a new draft.
 - End behavior can delete the final post at campaign end, retain it until a later campaign successfully replaces it in that channel, or retain it until manual cleanup. Overlapping active campaigns never delete one another's posts.

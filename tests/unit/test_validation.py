@@ -35,3 +35,26 @@ def test_preview_is_required() -> None:
         schedule=Schedule(start_at_utc=now, end_at_utc=now + timedelta(hours=1)), preview_sent=False, send_rps=20,
     )
     assert errors == ["Send a real Telegram preview before launch."]
+
+
+def test_incomplete_rotation_is_rejected_if_it_bypasses_auto_fit() -> None:
+    now = datetime.now(UTC)
+    variants = [
+        Creative(id=f"v{index}", kind="TEXT", text=f"hello {index}")
+        for index in range(3)
+    ]
+    errors = validate_launch(
+        variants=variants,
+        destinations=[],
+        source_ids={-1002},
+        mode=CampaignMode.MIX_ROTATE,
+        schedule=Schedule(
+            start_at_utc=now,
+            end_at_utc=now + timedelta(minutes=15),
+            repost_interval_seconds=10 * 60,
+        ),
+        preview_sent=True,
+        send_rps=20,
+    )
+
+    assert any("one cycle per variant" in error for error in errors)

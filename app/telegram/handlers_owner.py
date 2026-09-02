@@ -263,6 +263,7 @@ def campaign_keyboard(campaign_id: str, status: str, *, variant_count: int = 0, 
                 InlineKeyboardButton(text="View campaign report", callback_data=f"c:{campaign_id}:progress"),
             ]
         ]
+        rows.append([InlineKeyboardButton(text=f"Variants ({variant_count})", callback_data=f"c:{campaign_id}:variants")])
         if status in {CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}:
             rows.append(
                 [
@@ -309,7 +310,7 @@ def campaign_keyboard(campaign_id: str, status: str, *, variant_count: int = 0, 
         return _markup(rows)
     rows = [
         [
-            InlineKeyboardButton(text="Add content", callback_data=f"c:{campaign_id}:add"),
+            InlineKeyboardButton(text="Add first variant" if not variant_count else "+ Add variant", callback_data=f"c:{campaign_id}:add"),
             InlineKeyboardButton(text="Rename", callback_data=f"c:{campaign_id}:rename"),
         ]
     ]
@@ -317,7 +318,7 @@ def campaign_keyboard(campaign_id: str, status: str, *, variant_count: int = 0, 
         rows.extend(
             [
                 [
-                    InlineKeyboardButton(text="Manage content", callback_data=f"c:{campaign_id}:variants"),
+                    InlineKeyboardButton(text=f"Manage variants ({variant_count})", callback_data=f"c:{campaign_id}:variants"),
                     InlineKeyboardButton(text="CTA buttons", callback_data=f"c:{campaign_id}:buttons"),
                 ],
                 [
@@ -372,7 +373,7 @@ def content_type_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
 
 
 def mode_keyboard(campaign_id: str, variant_count: int) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="Standard", callback_data=f"mode:{campaign_id}:STANDARD")]]
+    rows = [[InlineKeyboardButton(text="Standard • Variant 1 only", callback_data=f"mode:{campaign_id}:STANDARD")]]
     if variant_count >= 2:
         rows.extend(
             [
@@ -607,8 +608,16 @@ class OwnerHandlers:
             else len(snapshot)
         )
         if status == CampaignStatus.DRAFT.value and len(variants) < 2 and campaign.get("mode") != CampaignMode.STANDARD.value:
-            await self.repositories.update_campaign(campaign["campaign_id"], {"mode": CampaignMode.STANDARD.value, "updated_at": datetime.now(UTC)})
+            await self.repositories.update_campaign(
+                campaign["campaign_id"],
+                {
+                    "mode": CampaignMode.STANDARD.value,
+                    "mode_explicitly_selected": False,
+                    "updated_at": datetime.now(UTC),
+                },
+            )
             campaign["mode"] = CampaignMode.STANDARD.value
+            campaign["mode_explicitly_selected"] = False
         display_timezone = campaign.get("owner_timezone") or await self.repositories.get_setting("owner_timezone", "UTC")
         cleanup = (
             "Delete final post"
@@ -620,7 +629,7 @@ class OwnerHandlers:
 
         if status == CampaignStatus.DRAFT.value:
             has_schedule = bool(campaign.get("start_at_utc") and campaign.get("current_end_at_utc"))
-            content_line = f"✓ Content: {len(variants)} creative{'s' if len(variants) != 1 else ''}" if variants else "○ Content: add a post"
+            content_line = f"✓ Variants: {len(variants)}" if variants else "○ Variants: add the first post"
             preview_line = "✓ Preview: ready" if campaign.get("preview_sent") else "○ Preview: required before launch"
             schedule_line = (
                 f"✓ Timing: {self._date(campaign['start_at_utc'], display_timezone)} → {self._date(campaign['current_end_at_utc'], display_timezone)}"
@@ -628,9 +637,11 @@ class OwnerHandlers:
                 else "○ Timing: choose Send campaign or Plan for later"
             )
             if not variants:
-                next_step = "Next: add the post you want to publish."
+                next_step = "Next: add Variant 1, then add more variants if you want rotation."
             elif not campaign.get("preview_sent"):
-                next_step = "Next: preview all creatives, then choose Send campaign."
+                next_step = "Next: preview all variants, then choose Send campaign."
+            elif len(variants) > 1 and campaign.get("mode") == CampaignMode.STANDARD.value:
+                next_step = "Standard sends Variant 1 only. Choose Rotation mode to use every saved variant."
             elif not has_schedule:
                 next_step = "Next: choose Send campaign for an immediate run, or Plan for later."
             else:
@@ -645,7 +656,13 @@ class OwnerHandlers:
                 f"{'✓' if destinations else '○'} Promoted links: {len(destinations)} (optional)\n"
                 f"{schedule_line}\n"
                 f"✓ End behavior: {cleanup.lower()}\n"
-                f"{preview_line}\n\n{next_step}",
+                f"{preview_line}\n"
+                + (
+                    "Timing auto-fit: " + "; ".join(campaign.get("rotation_adjustment_notes", [])) + "\n"
+                    if campaign.get("rotation_adjustment_notes")
+                    else ""
+                )
+                + f"\n{next_step}",
                 campaign_keyboard(campaign["campaign_id"], status, variant_count=len(variants)),
             )
             return
@@ -722,6 +739,20 @@ class OwnerHandlers:
             if status in {CampaignStatus.PAUSED.value, CampaignStatus.ENDING.value}
             else "Complete"
         )
+        coverage_text = ""
+        if campaign.get("mode") != CampaignMode.STANDARD.value and variants:
+            completed_cycles = int(cycle_stats.get("completed", 0))
+            full_passes, current_pass_cycles = divmod(completed_cycles, len(variants))
+            coverage_text = (
+                f"Variant coverage: {self._bar(current_pass_cycles, len(variants), 8)}  "
+                f"{current_pass_cycles}/{len(variants)} cycles in current pass; {full_passes} full pass"
+                f"{'es' if full_passes != 1 else ''} complete\n"
+            )
+        adjustment_text = (
+            "Timing auto-fit: " + "; ".join(campaign.get("rotation_adjustment_notes", [])) + "\n"
+            if campaign.get("rotation_adjustment_notes")
+            else ""
+        )
         latest_text = "Latest cycle: not created yet"
         if latest_cycle:
             latest = latest_cycle.get("delivery_counts", {})
@@ -740,7 +771,7 @@ class OwnerHandlers:
             message,
             f"{campaign['name']}\n"
             f"{status.title()} • {campaign.get('mode', 'STANDARD').replace('_', ' ').title()}\n\n"
-            f"Creatives: {len(variants)}  |  CTA buttons: {button_count}\n"
+            f"Variants: {len(variants)}  |  CTA buttons: {button_count}\n"
             f"Destinations: {len(destinations)}\n"
             f"Targets: {target_text}\n"
             f"Window: {self._date(campaign.get('start_at_utc'), display_timezone)} → "
@@ -748,6 +779,8 @@ class OwnerHandlers:
             f"End behavior: {cleanup}\n\n"
             f"Repost plan: {repost_plan}\n"
             f"Next cycle: {next_cycle_text}\n\n"
+            f"{adjustment_text}"
+            f"{coverage_text}"
             f"{report_heading}\n"
             f"Deliveries: {delivery_progress}\n"
             f"Sent: {sent}  |  Pending: {pending}  |  Failed: {permanent_failed}  |  Unknown: {unknown}\n"
@@ -876,7 +909,7 @@ class OwnerHandlers:
     async def _show_button_editor(self, message: Message, campaign: Document, variant_index: int) -> None:
         variants = [Creative.model_validate(item) for item in campaign.get("variants", [])]
         if not variants:
-            await message.answer("Add content first; CTA buttons attach to a saved creative.", reply_markup=content_type_keyboard(campaign["campaign_id"]))
+            await message.answer("Add Variant 1 first; CTA buttons attach to a saved variant.", reply_markup=content_type_keyboard(campaign["campaign_id"]))
             return
         creative = variants[variant_index]
         if creative.buttons:
@@ -1233,7 +1266,12 @@ class OwnerHandlers:
             await self.repositories.clear_owner_session(query.from_user.id)
             await self._show_campaign(query.message, campaign)
         elif action == "add":
-            await query.message.answer("What kind of post are you creating?", reply_markup=content_type_keyboard(campaign_id))
+            await self.campaigns.editable_campaign(campaign_id)
+            next_number = len(campaign.get("variants", [])) + 1
+            await query.message.answer(
+                f"Add Variant {next_number}\n\nWhat kind of post should this variant contain?",
+                reply_markup=content_type_keyboard(campaign_id),
+            )
         elif action == "rename":
             await self.campaigns.editable_campaign(campaign_id)
             await self.repositories.set_owner_session(query.from_user.id, {"action": "await_campaign_rename", "campaign_id": campaign_id})
@@ -1242,30 +1280,8 @@ class OwnerHandlers:
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
             )
         elif action == "variants":
-            variants = campaign.get("variants", [])
-            if not variants:
-                await query.message.answer("No creatives yet.", reply_markup=content_type_keyboard(campaign_id))
-            else:
-                rows: list[list[InlineKeyboardButton]] = []
-                for index, item in enumerate(variants):
-                    rows.append(
-                        [
-                            InlineKeyboardButton(
-                                text=f"Creative {index + 1}: {item['kind'].replace('_', ' ').title()}",
-                                callback_data=f"var:{campaign_id}:{index}:preview",
-                            )
-                        ]
-                    )
-                    rows.append(
-                        [
-                            InlineKeyboardButton(text="Replace", callback_data=f"var:{campaign_id}:{index}:replace"),
-                            InlineKeyboardButton(text="CTA", callback_data=f"var:{campaign_id}:{index}:buttons"),
-                            InlineKeyboardButton(text="Delete", callback_data=f"var:{campaign_id}:{index}:delete"),
-                        ]
-                    )
-                rows.append([InlineKeyboardButton(text="Add another creative", callback_data=f"c:{campaign_id}:add")])
-                rows.append([InlineKeyboardButton(text="Back", callback_data=f"c:{campaign_id}:open")])
-                await query.message.answer("Manage campaign content", reply_markup=_markup(rows))
+            await self.repositories.clear_owner_session(query.from_user.id)
+            await self._show_variants(query.message, campaign)
         elif action in {"buttons", "button"}:
             await self._show_button_editor(query.message, campaign, max(0, len(campaign.get("variants", [])) - 1))
         elif action == "destination":
@@ -1284,7 +1300,7 @@ class OwnerHandlers:
                     )
                     campaign["mode"] = CampaignMode.STANDARD.value
                 notice = await query.message.answer(
-                    "This campaign has one creative, so I set it to Standard. Add another creative to unlock Rotate and Mix + Rotate."
+                    "This campaign has one variant, so I set it to Standard. Add another variant to unlock Rotate and Mix + Rotate."
                 )
                 await self._show_campaign(notice, campaign)
                 return
@@ -1301,7 +1317,7 @@ class OwnerHandlers:
             )
         elif action == "send":
             if not campaign.get("variants"):
-                raise ValueError("Add campaign content before sending.")
+                raise ValueError("Add at least one campaign variant before sending.")
             await query.message.answer(
                 "Send campaign\n\nWhen should the campaign end? It will start as soon as you confirm launch.",
                 reply_markup=quick_duration_keyboard(campaign_id),
@@ -1312,7 +1328,7 @@ class OwnerHandlers:
         elif action == "test":
             await self.repositories.set_owner_session(query.from_user.id, {"action": "await_test_channel", "campaign_id": campaign_id})
             await query.message.answer(
-                "Send 1-3 owner-controlled test channel IDs, separated by commas. Every saved creative will be posted to each channel once.",
+                "Send 1-3 owner-controlled test channel IDs, separated by commas. Every saved variant will be posted to each channel once.",
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
             )
         elif action == "launch":
@@ -1379,13 +1395,13 @@ class OwnerHandlers:
         elif action == "refactor":
             copied = await self.campaigns.fork_to_draft(campaign_id, query.from_user.id)
             notice = await query.message.answer(
-                "The running campaign remains unchanged. I created an editable draft copy so you can safely replace content, buttons, targets, or schedule.",
+                "The running campaign remains unchanged. I created an editable draft copy so you can safely replace variants, buttons, targets, or schedule.",
             )
             await self._show_campaign(notice, copied)
         elif action == "delete":
             if campaign["status"] == CampaignStatus.DRAFT.value:
                 await query.message.answer(
-                    "Delete this draft? Its saved creative, CTA buttons, destinations, and schedule will be removed. This cannot be undone.",
+                    "Delete this draft? Its saved variants, CTA buttons, destinations, and schedule will be removed. This cannot be undone.",
                     reply_markup=_markup(
                         [
                             [
@@ -1463,10 +1479,23 @@ class OwnerHandlers:
     async def _set_mode(self, query: CallbackQuery, campaign_id: str, mode: str) -> None:
         campaign = await self.campaigns.editable_campaign(campaign_id)
         if mode != CampaignMode.STANDARD.value and len(campaign.get("variants", [])) < 2:
-            raise ValueError("Rotate and Mix + Rotate need at least two creatives.")
-        await self.repositories.update_campaign(campaign_id, {"mode": CampaignMode(mode).value, "updated_at": datetime.now(UTC)})
-        campaign["mode"] = mode
-        await self._show_campaign(query.message, campaign)
+            raise ValueError("Rotate and Mix + Rotate need at least two variants.")
+        await self.repositories.update_campaign(
+            campaign_id,
+            {
+                "mode": CampaignMode(mode).value,
+                "mode_explicitly_selected": True,
+                "rotation_adjustment_notes": [],
+                "updated_at": datetime.now(UTC),
+            },
+        )
+        campaign, notes = await self.campaigns.normalize_draft_rotation_schedule(campaign_id)
+        notice = query.message
+        if notes:
+            notice = await query.message.answer(
+                "Rotation timing was auto-fitted: " + "; ".join(notes) + "."
+            )
+        await self._show_campaign(notice, campaign)
 
     async def _set_retention(self, query: CallbackQuery, campaign_id: str, action: str) -> None:
         campaign = await self.repositories.get_campaign(campaign_id)
@@ -1495,7 +1524,13 @@ class OwnerHandlers:
         variants = [Creative.model_validate(item) for item in campaign.get("variants", [])]
         variants[index].button_layout = layout
         await self.repositories.update_campaign(
-            campaign_id, {"variants": [item.model_dump(mode="json") for item in variants], "preview_sent": False, "updated_at": datetime.now(UTC)}
+            campaign_id,
+            {
+                "variants": [item.model_dump(mode="json") for item in variants],
+                "preview_sent": False,
+                "previewed_variant_ids": [],
+                "updated_at": datetime.now(UTC),
+            },
         )
         campaign["variants"] = [item.model_dump(mode="json") for item in variants]
         await self._show_button_editor(query.message, campaign, index)
@@ -1508,7 +1543,13 @@ class OwnerHandlers:
         if len(variants[index].buttons) == before:
             raise ValueError("button no longer exists")
         await self.repositories.update_campaign(
-            campaign_id, {"variants": [item.model_dump(mode="json") for item in variants], "preview_sent": False, "updated_at": datetime.now(UTC)}
+            campaign_id,
+            {
+                "variants": [item.model_dump(mode="json") for item in variants],
+                "preview_sent": False,
+                "previewed_variant_ids": [],
+                "updated_at": datetime.now(UTC),
+            },
         )
         campaign["variants"] = [item.model_dump(mode="json") for item in variants]
         await self._show_button_editor(query.message, campaign, index)
@@ -1519,76 +1560,199 @@ class OwnerHandlers:
         if campaign:
             await self._show_button_editor(notice, campaign, index)
 
+    async def _show_variants(self, message: Message, campaign: Document) -> None:
+        variants = campaign.get("variants", [])
+        campaign_id = campaign["campaign_id"]
+        status = campaign["status"]
+        if not variants:
+            await message.answer(
+                "No variants yet. Add Variant 1 to begin.",
+                reply_markup=content_type_keyboard(campaign_id),
+            )
+            return
+        rows: list[list[InlineKeyboardButton]] = []
+        for index, item in enumerate(variants):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"Variant {index + 1} • {item['kind'].replace('_', ' ').title()}",
+                        callback_data=f"var:{campaign_id}:{index}:preview",
+                    )
+                ]
+            )
+            if status == CampaignStatus.DRAFT.value:
+                rows.append(
+                    [
+                        InlineKeyboardButton(text="Replace", callback_data=f"var:{campaign_id}:{index}:replace"),
+                        InlineKeyboardButton(text="CTA", callback_data=f"var:{campaign_id}:{index}:buttons"),
+                        InlineKeyboardButton(text="Delete", callback_data=f"var:{campaign_id}:{index}:delete"),
+                    ]
+                )
+            elif status in {CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}:
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            text="Replace in future cycles",
+                            callback_data=f"var:{campaign_id}:{index}:replace",
+                        )
+                    ]
+                )
+        if status == CampaignStatus.DRAFT.value:
+            rows.append([InlineKeyboardButton(text="+ Add variant", callback_data=f"c:{campaign_id}:add")])
+        elif status == CampaignStatus.SCHEDULED.value:
+            rows.append([InlineKeyboardButton(text="Edit before it starts", callback_data=f"c:{campaign_id}:todraft")])
+        rows.extend(_navigation(f"c:{campaign_id}:open"))
+        explanation = (
+            "Add, preview, replace, or remove variants. Rotate and Mix + Rotate automatically assign them across cycles."
+            if status == CampaignStatus.DRAFT.value
+            else "A live replacement is versioned: the current queued cycle stays consistent, and the new post is used when future rotation selects it."
+            if status in {CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}
+            else "Saved variants for this campaign."
+        )
+        await self._render(
+            message,
+            f"{campaign['name']} • Variants ({len(variants)})\n"
+            f"Mode: {campaign.get('mode', CampaignMode.STANDARD.value).replace('_', ' ').title()}\n\n"
+            f"{explanation}",
+            _markup(rows),
+        )
+
     async def _variant_action(self, query: CallbackQuery, campaign_id: str, index: int, action: str) -> None:
-        campaign = await self.campaigns.editable_campaign(campaign_id)
+        campaign = await self.repositories.get_campaign(campaign_id)
+        if not campaign:
+            raise ValueError("campaign no longer exists")
         variants = campaign.get("variants", [])
         if index < 0 or index >= len(variants):
-            raise ValueError("that creative no longer exists")
+            raise ValueError("that variant no longer exists")
+        status = campaign["status"]
         if action == "preview":
             notice = await self._send_preview(query.message, query.from_user.id, campaign_id, index)
-            await self._show_campaign(notice, await self.repositories.get_campaign(campaign_id))
+            updated = await self.repositories.get_campaign(campaign_id)
+            if not updated:
+                raise ValueError("campaign no longer exists")
+            await self._show_variants(notice, updated)
         elif action == "buttons":
+            if status != CampaignStatus.DRAFT.value:
+                raise ValueError("CTA layout can only be changed in a draft; replace the live variant content or edit a copy.")
             await self._show_button_editor(query.message, campaign, index)
         elif action == "replace":
+            if status not in {CampaignStatus.DRAFT.value, CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}:
+                raise ValueError("this campaign is not editable in its current state")
             await self.repositories.set_owner_session(
                 query.from_user.id,
-                {"action": "await_replace_creative", "campaign_id": campaign_id, "variant_index": index},
+                {
+                    "action": "await_replace_creative",
+                    "campaign_id": campaign_id,
+                    "variant_index": index,
+                    "campaign_status": status,
+                },
             )
             await query.message.answer(
-                "Send or forward the replacement post. Its formatting and media will be preserved; existing CTA buttons stay attached.",
+                f"Replace Variant {index + 1}\n\n"
+                "Send or forward the replacement post. Formatting and media are preserved, and its existing CTA buttons stay attached."
+                + (
+                    " I will preview it and ask for confirmation. The current queued cycle keeps the old revision; the replacement starts next cycle."
+                    if status in {CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}
+                    else ""
+                ),
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:variants")),
             )
+        elif action == "apply":
+            if status not in {CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}:
+                raise ValueError("this live replacement is no longer applicable")
+            session = await self.repositories.owner_session(query.from_user.id)
+            if (
+                not session
+                or session.get("action") != "confirm_running_variant_replace"
+                or session.get("campaign_id") != campaign_id
+                or int(session.get("variant_index", -1)) != index
+            ):
+                raise ValueError("that replacement preview expired; choose Replace again")
+            replacement = Creative.model_validate(session["replacement"])
+            updated, applies_from_cycle, has_future = await self.campaigns.replace_running_variant(
+                campaign_id,
+                index,
+                replacement,
+                query.from_user.id,
+            )
+            await self.repositories.clear_owner_session(query.from_user.id)
+            if has_future:
+                text = (
+                    f"Variant {index + 1} replaced safely. Future planning starts at cycle {applies_from_cycle + 1}; "
+                    "the already queued cycle keeps its original revision, and each channel receives the new version when rotation next selects this variant."
+                )
+                if as_utc(updated["current_end_at_utc"]) > as_utc(campaign["current_end_at_utc"]):
+                    text += " I extended the campaign window so the replacement still has a complete rotation pass across every frozen target."
+            else:
+                text = (
+                    f"Variant {index + 1} was saved, but this run has no future repost cycle. "
+                    "Its current live posts stay unchanged; use Run again after completion to use the replacement."
+                )
+            notice = await query.message.answer(text)
+            await self._show_variants(notice, updated)
         elif action == "delete":
+            if status != CampaignStatus.DRAFT.value:
+                raise ValueError("running variants cannot be removed because that would change frozen cohorts")
             await query.message.answer(
-                f"Delete creative {index + 1}?",
+                f"Delete Variant {index + 1}?",
                 reply_markup=_markup(
                     [
                         [
-                            InlineKeyboardButton(text="Delete creative", callback_data=f"var:{campaign_id}:{index}:remove"),
+                            InlineKeyboardButton(text="Delete variant", callback_data=f"var:{campaign_id}:{index}:remove"),
                             InlineKeyboardButton(text="Cancel", callback_data=f"c:{campaign_id}:variants"),
                         ]
                     ]
                 ),
             )
         elif action == "remove":
+            if status != CampaignStatus.DRAFT.value:
+                raise ValueError("running variants cannot be removed because that would change frozen cohorts")
             variants.pop(index)
             update: Document = {
                 "variants": variants,
                 "preview_sent": False,
                 "previewed_variant_ids": [],
+                "rotation_adjustment_notes": [],
                 "updated_at": datetime.now(UTC),
             }
             if len(variants) < 2:
                 update["mode"] = CampaignMode.STANDARD.value
+                update["mode_explicitly_selected"] = False
+                update["rotation_adjustment_notes"] = []
             await self.repositories.update_campaign(campaign_id, update)
-            notice = await query.message.answer("Creative deleted. Rotation was reset to Standard if fewer than two remain.")
-            await self._show_campaign(notice, await self.repositories.get_campaign(campaign_id))
+            campaign, notes = await self.campaigns.normalize_draft_rotation_schedule(campaign_id)
+            notice_text = "Variant deleted. Rotation was reset to Standard if fewer than two remain."
+            if notes:
+                notice_text += " Timing was auto-fitted for the remaining variants."
+            notice = await query.message.answer(notice_text)
+            await self._show_campaign(notice, campaign)
         else:
-            raise ValueError("unknown creative action")
+            raise ValueError("unknown variant action")
 
     async def _send_preview(self, message: Message, owner_id: int, campaign_id: str, index: int) -> Message:
         campaign = await self.repositories.get_campaign(campaign_id)
         if not campaign or index >= len(campaign.get("variants", [])):
-            raise ValueError("add a creative first")
+            raise ValueError("add a variant first")
         await self.sender.send_variant(owner_id, campaign["variants"][index])
-        previewed = set(campaign.get("previewed_variant_ids", []))
-        previewed.add(campaign["variants"][index]["id"])
-        current_ids = {variant["id"] for variant in campaign["variants"]}
-        await self.repositories.update_campaign(
-            campaign_id,
-            {
-                "previewed_variant_ids": sorted(previewed & current_ids),
-                "preview_sent": current_ids <= previewed,
-                "updated_at": datetime.now(UTC),
-            },
-        )
+        if campaign.get("status") == CampaignStatus.DRAFT.value:
+            previewed = set(campaign.get("previewed_variant_ids", []))
+            previewed.add(campaign["variants"][index]["id"])
+            current_ids = {variant["id"] for variant in campaign["variants"]}
+            await self.repositories.update_campaign(
+                campaign_id,
+                {
+                    "previewed_variant_ids": sorted(previewed & current_ids),
+                    "preview_sent": current_ids <= previewed,
+                    "updated_at": datetime.now(UTC),
+                },
+            )
         return await message.answer("That is a real Telegram preview using the saved content and CTA keyboard.")
 
     async def _preview_all(self, message: Message, owner_id: int, campaign_id: str) -> Message:
         campaign = await self.repositories.get_campaign(campaign_id)
         variants = campaign.get("variants", []) if campaign else []
         if not variants:
-            raise ValueError("add a creative first")
+            raise ValueError("add a variant first")
         for variant in variants:
             await self.sender.send_variant(owner_id, variant)
         await self.repositories.update_campaign(
@@ -1600,7 +1764,7 @@ class OwnerHandlers:
             },
         )
         return await message.answer(
-            f"Previewed all {len(variants)} creative{'s' if len(variants) != 1 else ''} with their saved formatting and CTA keyboards."
+            f"Previewed all {len(variants)} variant{'s' if len(variants) != 1 else ''} with their saved formatting and CTA keyboards."
         )
 
     async def _show_launch_confirmation(self, message: Message, campaign_id: str) -> None:
@@ -1641,6 +1805,25 @@ class OwnerHandlers:
             if reused_invite_count
             else ""
         )
+        rotation_notice = ""
+        if campaign.get("mode") != CampaignMode.STANDARD.value:
+            cycle_count = (
+                1 + len(offsets)
+                if offsets is not None
+                else 1 + (max(1, int((as_utc(campaign["current_end_at_utc"]) - as_utc(campaign["start_at_utc"])).total_seconds())) - 1)
+                // int(interval)
+                if interval
+                else 1
+            )
+            rotation_notice = (
+                f"\nRotation coverage: {cycle_count} cycles for {len(campaign['variants'])} variants; "
+                "every variant is scheduled to reach every target at least once."
+            )
+        adjustment_notice = (
+            "\nTiming auto-fit: " + "; ".join(campaign.get("rotation_adjustment_notes", [])) + "."
+            if campaign.get("rotation_adjustment_notes")
+            else ""
+        )
         await self._render(
             message,
             "Ready to launch\n\n"
@@ -1650,10 +1833,10 @@ class OwnerHandlers:
             f"End: {self._date(campaign['current_end_at_utc'], display_timezone)}\n"
             f"Repost: {repost_text}\n"
             f"End behavior: {cleanup_text}\n"
-            f"Mode: {campaign['mode']} ({len(campaign['variants'])} creative{'s' if len(campaign['variants']) != 1 else ''})\n"
+            f"Mode: {campaign['mode']} ({len(campaign['variants'])} variant{'s' if len(campaign['variants']) != 1 else ''})\n"
             f"Active sources before destination protection: {source_count}\n"
             f"Estimated first cycle: {self._duration_label(estimated_cycle_seconds)} at the configured send rate"
-            f"{tracking_notice}",
+            f"{rotation_notice}{adjustment_notice}{tracking_notice}",
             _markup(
                 [
                     [
@@ -2078,7 +2261,7 @@ class OwnerHandlers:
                 raise ValueError("send a campaign name as text")
             campaign = await self.campaigns.create_draft(owner_id, name)
             await self.repositories.clear_owner_session(owner_id)
-            await message.answer("Draft created. Start by choosing what kind of post to send.", reply_markup=content_type_keyboard(campaign["campaign_id"]))
+            await message.answer("Draft created. Start by choosing the post type for Variant 1.", reply_markup=content_type_keyboard(campaign["campaign_id"]))
             return
         if action == "await_channel_forward":
             if not await register_forwarded_channel(message, bot, self.repositories):
@@ -2142,6 +2325,17 @@ class OwnerHandlers:
             await self._show_campaign(message, campaign)
         elif action == "await_replace_creative":
             await self._replace_creative(message, session)
+        elif action == "confirm_running_variant_replace":
+            index = int(session["variant_index"])
+            await message.answer(
+                "Use the Confirm replacement button on the preview above, or cancel and choose Replace again.",
+                reply_markup=_markup(
+                    [
+                        [InlineKeyboardButton(text="Confirm replacement", callback_data=f"var:{campaign_id}:{index}:apply")],
+                        *_navigation(f"c:{campaign_id}:variants"),
+                    ]
+                ),
+            )
         elif action == "await_album":
             await self._capture_album_item(message, session)
         elif action == "await_button_label":
@@ -2270,7 +2464,7 @@ class OwnerHandlers:
         elif action == "await_test_channel":
             campaign = await self.repositories.get_campaign(campaign_id)
             if not campaign or not campaign.get("variants"):
-                raise ValueError("add a creative before testing")
+                raise ValueError("add a variant before testing")
             test_channel_ids = [int(value.strip()) for value in (message.text or "").split(",") if value.strip()]
             if not 1 <= len(test_channel_ids) <= 3 or len(set(test_channel_ids)) != len(test_channel_ids):
                 raise ValueError("send 1-3 unique numeric test channel IDs")
@@ -2308,9 +2502,22 @@ class OwnerHandlers:
         creative = capture_creative(message)
         campaign = await self.campaigns.editable_campaign(session["campaign_id"])
         if len(campaign.get("variants", [])) >= _MAX_VARIANTS:
-            raise ValueError(f"a campaign can contain at most {_MAX_VARIANTS} creatives")
+            raise ValueError(f"a campaign can contain at most {_MAX_VARIANTS} variants")
         variants = [*campaign.get("variants", []), creative.model_dump(mode="json")]
-        await self.repositories.update_campaign(session["campaign_id"], {"variants": variants, "preview_sent": False, "updated_at": datetime.now(UTC)})
+        add_update: Document = {
+            "variants": variants,
+            "preview_sent": False,
+            "rotation_adjustment_notes": [],
+            "updated_at": datetime.now(UTC),
+        }
+        auto_mix = len(variants) == 2 and not campaign.get("mode_explicitly_selected", False)
+        if auto_mix:
+            add_update["mode"] = CampaignMode.MIX_ROTATE.value
+        await self.repositories.update_campaign(
+            session["campaign_id"],
+            add_update,
+        )
+        campaign, timing_notes = await self.campaigns.normalize_draft_rotation_schedule(session["campaign_id"])
         await self.repositories.clear_owner_session(message.from_user.id)
         preview_ok = True
         try:
@@ -2318,33 +2525,93 @@ class OwnerHandlers:
         except Exception:
             preview_ok = False
             logger.exception("Saved creative preview failed", extra={"campaign_id": session["campaign_id"]})
+        previewed_ids = set(campaign.get("previewed_variant_ids", []))
+        if preview_ok:
+            previewed_ids.add(creative.id)
+        current_variant_ids = {item["id"] for item in variants}
+        await self.repositories.update_campaign(
+            session["campaign_id"],
+            {
+                "previewed_variant_ids": sorted(previewed_ids & current_variant_ids),
+                "preview_sent": current_variant_ids <= previewed_ids,
+                "updated_at": datetime.now(UTC),
+            },
+        )
+        saved_text = (
+            f"Variant {len(variants)} saved. The post above is replayable. Add CTA buttons, add another variant, or continue setup."
+            if preview_ok
+            else f"Variant {len(variants)} saved, but Telegram could not render its owner preview. Use Preview all after checking the content."
+        )
+        if auto_mix:
+            saved_text += " Mix + Rotate is now the default: channels are split into balanced cohorts and variants rotate across them."
         await message.answer(
-            (
-                "Creative saved. The post above is replayable; now add CTA buttons or continue configuring the campaign."
-                if preview_ok
-                else "Creative saved, but Telegram could not render its owner preview. Use Preview all after checking the content."
-            ),
+            saved_text,
             reply_markup=_markup(
                 [
                     [InlineKeyboardButton(text="+ Add CTA button", callback_data=f"btn:{session['campaign_id']}:{len(variants) - 1}:first")],
                     [
                         InlineKeyboardButton(text="Edit CTA layout", callback_data=f"edit:{session['campaign_id']}:{len(variants) - 1}"),
-                        InlineKeyboardButton(text="Add another creative", callback_data=f"c:{session['campaign_id']}:add"),
+                        InlineKeyboardButton(text="+ Add another variant", callback_data=f"c:{session['campaign_id']}:add"),
                     ],
+                    *(
+                        [[InlineKeyboardButton(text="Review auto-fitted timing", callback_data=f"c:{session['campaign_id']}:open")]]
+                        if timing_notes
+                        else []
+                    ),
                     [InlineKeyboardButton(text="Continue campaign setup", callback_data=f"c:{session['campaign_id']}:open")],
                 ]
             ),
         )
 
     async def _replace_creative(self, message: Message, session: Document) -> None:
-        campaign = await self.campaigns.editable_campaign(session["campaign_id"])
+        campaign = await self.repositories.get_campaign(session["campaign_id"])
+        if not campaign or campaign.get("status") not in {
+            CampaignStatus.DRAFT.value,
+            CampaignStatus.ACTIVE.value,
+            CampaignStatus.PAUSED.value,
+        }:
+            raise ValueError("this campaign is no longer editable")
         variants = [Creative.model_validate(item) for item in campaign.get("variants", [])]
         index = int(session["variant_index"])
         if index < 0 or index >= len(variants):
-            raise ValueError("that creative no longer exists")
+            raise ValueError("that variant no longer exists")
         replacement = capture_creative(message)
+        replacement.id = variants[index].id
         replacement.buttons = variants[index].buttons
         replacement.button_layout = variants[index].button_layout
+        if campaign["status"] in {CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}:
+            try:
+                await self.sender.send_variant(message.from_user.id, replacement.model_dump(mode="json"))
+            except Exception:
+                logger.exception("Live replacement variant preview failed", extra={"campaign_id": session["campaign_id"]})
+                await message.answer(
+                    "Telegram could not render that replacement preview, so nothing changed. Send the replacement again or go back.",
+                    reply_markup=_markup(_navigation(f"c:{session['campaign_id']}:variants")),
+                )
+                return
+            await self.repositories.set_owner_session(
+                message.from_user.id,
+                {
+                    "action": "confirm_running_variant_replace",
+                    "campaign_id": session["campaign_id"],
+                    "variant_index": index,
+                    "replacement": replacement.model_dump(mode="json"),
+                },
+            )
+            await message.answer(
+                f"Preview for replacement Variant {index + 1}\n\n"
+                "Confirm to use it from the next repost cycle. The current queued cycle and already-live posts are not mixed or changed mid-cycle.",
+                reply_markup=_markup(
+                    [
+                        [
+                            InlineKeyboardButton(text="Confirm replacement", callback_data=f"var:{session['campaign_id']}:{index}:apply"),
+                            InlineKeyboardButton(text="Cancel", callback_data=f"c:{session['campaign_id']}:variants"),
+                        ],
+                        *_navigation(f"c:{session['campaign_id']}:variants"),
+                    ]
+                ),
+            )
+            return
         variants[index] = replacement
         stored = [item.model_dump(mode="json") for item in variants]
         await self.repositories.update_campaign(
@@ -2359,10 +2626,13 @@ class OwnerHandlers:
         await self.repositories.clear_owner_session(message.from_user.id)
         try:
             await self._send_preview(message, message.from_user.id, session["campaign_id"], index)
-            replacement_text = "Creative replaced. Its existing CTA buttons and placement were preserved."
+            replacement_text = f"Variant {index + 1} replaced. Its existing CTA buttons and placement were preserved."
         except Exception:
             logger.exception("Replacement creative preview failed", extra={"campaign_id": session["campaign_id"]})
-            replacement_text = "Creative replaced and its CTA layout was preserved, but Telegram could not render the preview. Use Preview all to retry."
+            replacement_text = (
+                f"Variant {index + 1} replaced and its CTA layout was preserved, but Telegram could not render the preview. "
+                "Use Preview all to retry."
+            )
         await message.answer(replacement_text)
         await self._show_campaign(message, await self.repositories.get_campaign(session["campaign_id"]))
 
@@ -2403,7 +2673,7 @@ class OwnerHandlers:
             raise ValueError("an album needs at least two items")
         campaign = await self.campaigns.editable_campaign(campaign_id)
         if len(campaign.get("variants", [])) >= _MAX_VARIANTS:
-            raise ValueError(f"a campaign can contain at most {_MAX_VARIANTS} creatives")
+            raise ValueError(f"a campaign can contain at most {_MAX_VARIANTS} variants")
         creative = Creative(
             id=opaque_id("var"),
             kind="MEDIA_GROUP",
@@ -2412,7 +2682,20 @@ class OwnerHandlers:
             caption_entities=session.get("caption_entities", []),
         )
         variants = [*campaign.get("variants", []), creative.model_dump(mode="json")]
-        await self.repositories.update_campaign(campaign_id, {"variants": variants, "preview_sent": False, "updated_at": datetime.now(UTC)})
+        add_update: Document = {
+            "variants": variants,
+            "preview_sent": False,
+            "rotation_adjustment_notes": [],
+            "updated_at": datetime.now(UTC),
+        }
+        auto_mix = len(variants) == 2 and not campaign.get("mode_explicitly_selected", False)
+        if auto_mix:
+            add_update["mode"] = CampaignMode.MIX_ROTATE.value
+        await self.repositories.update_campaign(
+            campaign_id,
+            add_update,
+        )
+        _, timing_notes = await self.campaigns.normalize_draft_rotation_schedule(campaign_id)
         await self.repositories.clear_owner_session(query.from_user.id)
         preview_ok = True
         try:
@@ -2420,15 +2703,36 @@ class OwnerHandlers:
         except Exception:
             preview_ok = False
             logger.exception("Saved album preview failed", extra={"campaign_id": campaign_id})
+        previewed_ids = set(campaign.get("previewed_variant_ids", []))
+        if preview_ok:
+            previewed_ids.add(creative.id)
+        current_variant_ids = {item["id"] for item in variants}
+        await self.repositories.update_campaign(
+            campaign_id,
+            {
+                "previewed_variant_ids": sorted(previewed_ids & current_variant_ids),
+                "preview_sent": current_variant_ids <= previewed_ids,
+                "updated_at": datetime.now(UTC),
+            },
+        )
+        saved_text = (
+            f"Variant {len(variants)} (album) saved. Telegram renders its CTA as a compact message after the album when buttons are added."
+            if preview_ok
+            else f"Variant {len(variants)} (album) saved, but Telegram could not render its owner preview. Use Preview all to retry."
+        )
+        if auto_mix:
+            saved_text += " Mix + Rotate is now the default: channels are split into balanced cohorts and variants rotate across them."
         await query.message.answer(
-            (
-                "Album saved. Telegram renders its CTA as a compact message after the album when buttons are added."
-                if preview_ok
-                else "Album saved, but Telegram could not render its owner preview. Use Preview all to retry."
-            ),
+            saved_text,
             reply_markup=_markup(
                 [
                     [InlineKeyboardButton(text="+ Add CTA button", callback_data=f"btn:{campaign_id}:{len(variants) - 1}:first")],
+                    [InlineKeyboardButton(text="+ Add another variant", callback_data=f"c:{campaign_id}:add")],
+                    *(
+                        [[InlineKeyboardButton(text="Review auto-fitted timing", callback_data=f"c:{campaign_id}:open")]]
+                        if timing_notes
+                        else []
+                    ),
                     [InlineKeyboardButton(text="Continue campaign setup", callback_data=f"c:{campaign_id}:open")],
                 ]
             ),
@@ -2440,7 +2744,7 @@ class OwnerHandlers:
         index = int(session["variant_index"])
         creative = variants[index]
         if len(creative.buttons) >= _MAX_CTA_BUTTONS:
-            raise ValueError(f"a creative can contain at most {_MAX_CTA_BUTTONS} CTA buttons")
+            raise ValueError(f"a variant can contain at most {_MAX_CTA_BUTTONS} CTA buttons")
         placement = session["placement"]
         if placement == "right" and creative.buttons:
             row = max(button.row for button in creative.buttons)
@@ -2454,7 +2758,15 @@ class OwnerHandlers:
             row = position = 0
         creative.buttons.append(Button(id=opaque_id("btn"), text=session["label"], url=(message.text or "").strip(), row=row, position=position))
         stored = [item.model_dump(mode="json") for item in variants]
-        await self.repositories.update_campaign(session["campaign_id"], {"variants": stored, "preview_sent": False, "updated_at": datetime.now(UTC)})
+        await self.repositories.update_campaign(
+            session["campaign_id"],
+            {
+                "variants": stored,
+                "preview_sent": False,
+                "previewed_variant_ids": [],
+                "updated_at": datetime.now(UTC),
+            },
+        )
         await self.repositories.clear_owner_session(message.from_user.id)
         campaign["variants"] = stored
         await message.answer("CTA button saved. Use the placement controls to add the next one beside it or on a new row.")
@@ -2541,10 +2853,23 @@ class OwnerHandlers:
                 "delete_on_next_campaign": delete_on_next_campaign,
                 "owner_timezone": timezone,
                 "rerun_ready": False,
+                "rotation_adjustment_notes": [],
                 "updated_at": datetime.now(UTC),
             },
         )
-        return delete_on_end
+        normalized, _ = await self.campaigns.normalize_draft_rotation_schedule(campaign_id)
+        final_cleanup_available = self._campaign_supports_final_cleanup(normalized)
+        final_delete_on_end = bool(delete_on_end) and final_cleanup_available
+        if final_delete_on_end != normalized.get("delete_on_end"):
+            await self.repositories.update_campaign(
+                campaign_id,
+                {
+                    "delete_on_end": final_delete_on_end,
+                    "delete_on_next_campaign": not final_delete_on_end,
+                    "updated_at": datetime.now(UTC),
+                },
+            )
+        return final_delete_on_end
 
     @staticmethod
     def _specific_schedule_saved_text(offsets_minutes: list[int], final_cleanup: bool, adjusted: bool = False) -> str:

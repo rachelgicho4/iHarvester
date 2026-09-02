@@ -34,6 +34,20 @@ def test_mix_cohorts_are_balanced_and_rotate_every_variant() -> None:
         assert {variant_for("MIX_ROTATE", cycle, cohort, 3) for cycle in range(3)} == {0, 1, 2}
 
 
+def test_large_network_rotation_is_balanced_and_complete_for_many_variant_counts() -> None:
+    ids = list(range(-10_607, -10_000))
+    for variant_count in (2, 3, 7, 20):
+        cohorts = cohort_map(ids, variant_count, b"large-network")
+        sizes = [list(cohorts.values()).count(index) for index in range(variant_count)]
+        assert max(sizes) - min(sizes) <= 1
+        for cohort in cohorts.values():
+            visited = {
+                variant_for("MIX_ROTATE", cycle, cohort, variant_count)
+                for cycle in range(variant_count)
+            }
+            assert visited == set(range(variant_count))
+
+
 def test_standard_and_rotate_variant_selection() -> None:
     assert variant_for("STANDARD", 9, 1, 3) == 0
     assert [variant_for("ROTATE", cycle, 0, 3) for cycle in range(4)] == [0, 1, 2, 0]

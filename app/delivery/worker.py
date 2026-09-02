@@ -105,7 +105,7 @@ class DeliveryWorker:
         try:
             await self.send_limiter.acquire()
             await self.mutation_limiter.acquire()
-            result = await self.sender.send_variant(delivery["channel_id"], campaign["variants"][delivery["variant_index"]])
+            result = await self.sender.send_variant(delivery["channel_id"], self._delivery_variant(campaign, delivery))
         except Exception as error:
             decision = classify_telegram_error(error, operation="send")
             if decision.kind == ErrorKind.PERMANENT:
@@ -216,6 +216,23 @@ class DeliveryWorker:
         await self.repositories.complete_delivery(delivery_id, status, **details)
         if delivery.get("operation") != "CLEANUP":
             await self.repositories.finish_cycle_if_complete(delivery["campaign_id"], int(delivery.get("cycle_number", -1)))
+
+    @staticmethod
+    def _delivery_variant(campaign: dict[str, Any], delivery: dict[str, Any]) -> dict[str, Any]:
+        """Resolve the exact revision frozen when a cycle was materialized.
+
+        Legacy deliveries do not carry a revision. Once a live edit creates a
+        history for them, revision 1 is the pre-edit payload and keeps their
+        already-running cycle internally consistent.
+        """
+        current = campaign["variants"][int(delivery["variant_index"])]
+        variant_id = delivery.get("variant_id") or current.get("id")
+        revision = int(delivery.get("variant_revision", 1))
+        history = campaign.get("variant_versions", {}).get(variant_id, [])
+        for item in history:
+            if int(item.get("revision", 0)) == revision:
+                return item["creative"]
+        return current
 
     @staticmethod
     def _safe_error_summary(error: Exception) -> str:

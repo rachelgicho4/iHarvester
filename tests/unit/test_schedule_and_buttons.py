@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.campaigns.models import Button
-from app.campaigns.scheduling import can_create_cycle, scheduled_cycle_time
+from app.campaigns.scheduling import can_create_cycle, fit_rotation_schedule, scheduled_cycle_count, scheduled_cycle_time
 from app.telegram.handlers_owner import (
     OwnerHandlers,
     campaign_keyboard,
@@ -48,7 +48,18 @@ def test_guided_creator_uses_callback_controls_not_pipe_delimited_commands() -> 
     campaign_controls = [item.text for row in campaign_keyboard("cmp", "DRAFT", variant_count=2).inline_keyboard for item in row]
     archived_controls = [item.text for row in campaign_keyboard("cmp", "ARCHIVED", has_live_posts=True).inline_keyboard for item in row]
     assert {"Text", "Photo", "Photo + caption", "Video", "Video + caption", "Forward ready post"} <= set(content_controls)
-    assert {"Rename", "CTA buttons", "Promoted links", "Audience", "Plan for later", "Send campaign", "Delete draft", "Home"} <= set(campaign_controls)
+    assert {
+        "+ Add variant",
+        "Manage variants (2)",
+        "Rename",
+        "CTA buttons",
+        "Promoted links",
+        "Audience",
+        "Plan for later",
+        "Send campaign",
+        "Delete draft",
+        "Home",
+    } <= set(campaign_controls)
     assert {"Run again now", "Edit a copy", "Full report", "Delete retained posts", "Delete campaign history"} <= set(archived_controls)
 
 
@@ -67,6 +78,7 @@ def test_every_campaign_state_has_safe_navigation_and_short_callback_data() -> N
         assert "Home" in {item.text for item in buttons}
         assert all(not item.callback_data or len(item.callback_data.encode()) <= 64 for item in buttons)
     assert "+3 days" in {item.text for row in active.inline_keyboard for item in row}
+    assert "Variants (2)" in {item.text for row in active.inline_keyboard for item in row}
 
 
 def test_expired_network_controls_recover_to_network_and_home() -> None:
@@ -105,3 +117,52 @@ def test_custom_periods_and_reposts_fit_the_campaign_window() -> None:
     OwnerHandlers._validate_repost_interval(30, 7)
     with pytest.raises(ValueError, match="shorter"):
         OwnerHandlers._validate_repost_interval(15, 60)
+
+
+def test_incomplete_rotation_interval_is_auto_fitted_to_every_variant() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    fit = fit_rotation_schedule(
+        start_at=start,
+        end_at=start + timedelta(minutes=15),
+        interval_seconds=10 * 60,
+        repost_offsets_seconds=None,
+        mode="MIX_ROTATE",
+        variant_count=3,
+    )
+
+    assert fit.interval_seconds == 5 * 60
+    assert scheduled_cycle_count(start, fit.end_at, fit.interval_seconds) == 3
+    assert fit.adjusted
+
+
+def test_incomplete_uneven_rotation_plan_is_respaced_instead_of_silently_ending() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    fit = fit_rotation_schedule(
+        start_at=start,
+        end_at=start + timedelta(days=7),
+        interval_seconds=None,
+        repost_offsets_seconds=[24 * 3600],
+        mode="ROTATE",
+        variant_count=5,
+    )
+
+    assert fit.offsets_seconds is not None
+    assert len(fit.offsets_seconds) == 4
+    assert scheduled_cycle_count(start, fit.end_at, None, fit.offsets_seconds) == 5
+    assert any("all 5 variants" in note for note in fit.notes)
+
+
+def test_complete_safe_custom_rotation_plan_is_preserved_exactly() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    offsets = [24 * 3600, 4 * 24 * 3600, 6 * 24 * 3600]
+    fit = fit_rotation_schedule(
+        start_at=start,
+        end_at=start + timedelta(days=7),
+        interval_seconds=None,
+        repost_offsets_seconds=offsets,
+        mode="MIX_ROTATE",
+        variant_count=3,
+    )
+
+    assert fit.offsets_seconds == offsets
+    assert not fit.adjusted

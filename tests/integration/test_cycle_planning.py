@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.campaigns.models import Button, Creative, Destination
+from app.campaigns.scheduling import scheduled_cycle_count
 from app.campaigns.service import CampaignService
 from app.campaigns.shuffle import cohort_map
 
@@ -71,6 +72,33 @@ class MemoryRepositories:
         self.campaign.update(update)
         self.campaign.setdefault("extensions", []).append(event)
         return self.campaign
+
+    async def replace_running_variant(
+        self,
+        *,
+        campaign_id,
+        index,
+        variant_id,
+        expected_revision,
+        revision,
+        creative,
+        event,
+        schedule_update=None,
+    ):
+        if self.campaign.get("status") not in {"ACTIVE", "PAUSED"}:
+            return False
+        if self.campaign["variants"][index]["id"] != variant_id:
+            return False
+        if self.campaign.get("variant_current_revisions", {}).get(variant_id) != expected_revision:
+            return False
+        self.campaign["variants"][index] = creative
+        self.campaign["variant_current_revisions"][variant_id] = revision
+        self.campaign["variant_versions"][variant_id].append(
+            {"revision": revision, "creative": creative, "created_at": event["at"]}
+        )
+        self.campaign.setdefault("variant_edit_events", []).append(event)
+        self.campaign.update(schedule_update or {})
+        return True
 
     async def end_campaign_early(self, campaign_id):
         if self.campaign.get("status") not in {"SCHEDULED", "ACTIVE", "PAUSED"}:
@@ -160,6 +188,91 @@ async def test_launch_summary_shows_exact_source_and_protected_destination_count
     _, errors, source_count, protected_count, eligible_count = await CampaignService(repositories, send_rps=20).launch_summary("cmp_summary")
     assert not errors
     assert (source_count, protected_count, eligible_count) == (3, 1, 2)
+
+
+@pytest.mark.asyncio
+async def test_launch_summary_auto_fits_rotation_to_cover_every_variant() -> None:
+    now = datetime.now(UTC)
+    variants = [Creative(id=f"var_{index}", kind="TEXT", text=f"Variant {index}").model_dump(mode="json") for index in range(3)]
+    campaign = {
+        "campaign_id": "cmp_fit_rotation",
+        "status": "DRAFT",
+        "mode": "MIX_ROTATE",
+        "variants": variants,
+        "destinations": [],
+        "target_selector": {},
+        "start_at_utc": now + timedelta(minutes=1),
+        "current_end_at_utc": now + timedelta(minutes=16),
+        "repost_interval_seconds": 10 * 60,
+        "repost_offsets_seconds": None,
+        "delete_on_repost": True,
+        "delete_on_end": True,
+        "preview_sent": True,
+    }
+    repositories = MemoryRepositories(campaign, [{"telegram_chat_id": -1001}])
+
+    fitted, errors, *_ = await CampaignService(repositories, send_rps=20).launch_summary(campaign["campaign_id"])
+
+    assert not errors
+    assert fitted["repost_interval_seconds"] == 5 * 60
+    assert fitted["rotation_adjustment_notes"]
+
+
+@pytest.mark.asyncio
+async def test_planned_deliveries_freeze_variant_revision_across_live_replacement() -> None:
+    now = datetime.now(UTC)
+    old = Creative(id="var_1", kind="TEXT", text="Old post").model_dump(mode="json")
+    other = Creative(id="var_2", kind="TEXT", text="Other").model_dump(mode="json")
+    campaign = {
+        "campaign_id": "cmp_live_variant",
+        "status": "ACTIVE",
+        "mode": "ROTATE",
+        "variants": [old, other],
+        "start_at_utc": now - timedelta(seconds=1),
+        "current_end_at_utc": now + timedelta(minutes=9),
+        "repost_interval_seconds": 5 * 60,
+        "repost_offsets_seconds": None,
+        "target_snapshot": [-1001],
+        "cohort_map": {"-1001": 0},
+        "shuffle_seed": base64.urlsafe_b64encode(b"x" * 32).decode(),
+        "variant_versions": {
+            "var_1": [{"revision": 1, "creative": old, "created_at": now}],
+            "var_2": [{"revision": 1, "creative": other, "created_at": now}],
+        },
+        "variant_current_revisions": {"var_1": 1, "var_2": 1},
+        "next_cycle_number": 0,
+    }
+    repositories = MemoryRepositories(campaign, [{"telegram_chat_id": -1001}])
+    service = CampaignService(repositories, send_rps=20)
+
+    assert await service.plan_due_cycle(campaign, now)
+    first_delivery = repositories.deliveries[0]
+    updated, applies_from, has_future = await service.replace_running_variant(
+        campaign["campaign_id"],
+        0,
+        Creative(id="temporary", kind="TEXT", text="New post"),
+        owner_id=7,
+    )
+
+    assert first_delivery["variant_id"] == "var_1"
+    assert first_delivery["variant_revision"] == 1
+    assert updated["variant_current_revisions"]["var_1"] == 2
+    assert updated["variants"][0]["id"] == "var_1"
+    assert updated["variants"][0]["text"] == "New post"
+    assert updated["current_end_at_utc"] > now + timedelta(minutes=9)
+    assert any("future rotation cycles" in note for note in updated["rotation_adjustment_notes"])
+    assert applies_from == 1
+    assert has_future
+    assert (
+        scheduled_cycle_count(
+            updated["start_at_utc"],
+            updated["current_end_at_utc"],
+            updated["repost_interval_seconds"],
+            updated["repost_offsets_seconds"],
+        )
+        - applies_from
+        >= len(updated["variants"])
+    )
 
 
 @pytest.mark.asyncio

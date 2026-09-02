@@ -7,10 +7,11 @@ import logging
 import secrets
 from copy import deepcopy
 from datetime import timedelta
+from math import ceil
 from typing import Any
 
 from app.campaigns.models import CampaignMode, CampaignStatus, Creative, Destination, Schedule
-from app.campaigns.scheduling import can_create_cycle, scheduled_cycle_time
+from app.campaigns.scheduling import can_create_cycle, fit_rotation_schedule, scheduled_cycle_count, scheduled_cycle_time
 from app.campaigns.shuffle import cohort_map, dispatch_rank, variant_for
 from app.campaigns.validation import SAFE_DELETE_WINDOW, protected_destination_ids, validate_launch
 from app.db.repositories import Document, Repositories
@@ -33,6 +34,7 @@ class CampaignService:
             "name": name,
             "status": CampaignStatus.DRAFT.value,
             "mode": CampaignMode.STANDARD.value,
+            "mode_explicitly_selected": False,
             "variants": [],
             "destinations": [],
             "target_selector": {},
@@ -135,6 +137,22 @@ class CampaignService:
         )
         sources = await self.repositories.active_channels(campaign.get("target_selector"))
         source_ids = {source["telegram_chat_id"] for source in sources}
+        protected = protected_destination_ids(destinations)
+        target_snapshot = sorted(source_ids - protected)
+        campaign, adjustment_notes = await self._normalize_rotation_schedule(
+            campaign,
+            eligible_count=len(target_snapshot),
+            persist=False,
+        )
+        schedule = Schedule(
+            start_at_utc=as_utc(campaign["start_at_utc"]),
+            end_at_utc=as_utc(campaign["current_end_at_utc"]),
+            repost_interval_seconds=campaign.get("repost_interval_seconds"),
+            repost_offsets_seconds=campaign.get("repost_offsets_seconds"),
+            delete_on_repost=campaign.get("delete_on_repost", True),
+            delete_on_end=campaign.get("delete_on_end", True),
+            owner_timezone=campaign.get("owner_timezone", "UTC"),
+        )
         errors = validate_launch(
             variants=variants,
             destinations=destinations,
@@ -148,11 +166,14 @@ class CampaignService:
             errors.append("Campaign end time has already passed. Set a new schedule before launching.")
         if errors:
             raise ValueError(" ".join(errors))
-        protected = protected_destination_ids(destinations)
-        target_snapshot = sorted(source_ids - protected)
         cohort_seed = secrets.token_bytes(32)
         shuffle_seed = secrets.token_bytes(32)
         cohorts = cohort_map(target_snapshot, len(variants), cohort_seed)
+        variant_versions = {
+            variant["id"]: [{"revision": 1, "creative": deepcopy(variant), "created_at": now}]
+            for variant in campaign["variants"]
+        }
+        variant_current_revisions = {variant["id"]: 1 for variant in campaign["variants"]}
         status = CampaignStatus.SCHEDULED if schedule.start_at_utc > now else CampaignStatus.ACTIVE
         update = {
             "status": status.value,
@@ -167,6 +188,11 @@ class CampaignService:
             "start_at_utc": schedule.start_at_utc,
             "original_end_at_utc": schedule.end_at_utc,
             "current_end_at_utc": schedule.end_at_utc,
+            "repost_interval_seconds": schedule.repost_interval_seconds,
+            "repost_offsets_seconds": schedule.repost_offsets_seconds,
+            "rotation_adjustment_notes": adjustment_notes or campaign.get("rotation_adjustment_notes", []),
+            "variant_versions": variant_versions,
+            "variant_current_revisions": variant_current_revisions,
             "rerun_ready": False,
             "updated_at": now,
         }
@@ -200,6 +226,14 @@ class CampaignService:
             return campaign, ["Set a start and end time before launch."], 0, 0, 0
         variants = [Creative.model_validate(variant) for variant in campaign.get("variants", [])]
         destinations = [Destination.model_validate(destination) for destination in campaign.get("destinations", [])]
+        sources = await self.repositories.active_channels(campaign.get("target_selector"))
+        source_ids = {source["telegram_chat_id"] for source in sources}
+        protected = protected_destination_ids(destinations)
+        campaign, _ = await self._normalize_rotation_schedule(
+            campaign,
+            eligible_count=len(source_ids - protected),
+            persist=True,
+        )
         schedule = Schedule(
             start_at_utc=as_utc(campaign["start_at_utc"]),
             end_at_utc=as_utc(campaign["current_end_at_utc"]),
@@ -209,9 +243,6 @@ class CampaignService:
             delete_on_end=campaign.get("delete_on_end", True),
             owner_timezone=campaign.get("owner_timezone", "UTC"),
         )
-        sources = await self.repositories.active_channels(campaign.get("target_selector"))
-        source_ids = {source["telegram_chat_id"] for source in sources}
-        protected = protected_destination_ids(destinations)
         errors = validate_launch(
             variants=variants,
             destinations=destinations,
@@ -224,6 +255,58 @@ class CampaignService:
         if schedule.end_at_utc <= utcnow():
             errors.append("Campaign end time has already passed. Set a new schedule before launching.")
         return campaign, errors, len(source_ids), len(protected), len(source_ids - protected)
+
+    async def normalize_draft_rotation_schedule(self, campaign_id: str) -> tuple[Document, list[str]]:
+        """Keep a draft's current timing compatible as variants or mode change."""
+        campaign = await self._draft(campaign_id)
+        if not campaign.get("start_at_utc") or not campaign.get("current_end_at_utc"):
+            return campaign, []
+        sources = await self.repositories.active_channels(campaign.get("target_selector"))
+        destinations = [Destination.model_validate(item) for item in campaign.get("destinations", [])]
+        eligible_count = len({item["telegram_chat_id"] for item in sources} - protected_destination_ids(destinations))
+        return await self._normalize_rotation_schedule(campaign, eligible_count=eligible_count, persist=True)
+
+    async def _normalize_rotation_schedule(
+        self,
+        campaign: Document,
+        *,
+        eligible_count: int,
+        persist: bool,
+    ) -> tuple[Document, list[str]]:
+        if not campaign.get("start_at_utc") or not campaign.get("current_end_at_utc"):
+            return campaign, []
+        minimum_cycle_seconds = max(60, ceil(max(0, eligible_count) / self.send_rps))
+        fit = fit_rotation_schedule(
+            start_at=as_utc(campaign["start_at_utc"]),
+            end_at=as_utc(campaign["current_end_at_utc"]),
+            interval_seconds=campaign.get("repost_interval_seconds"),
+            repost_offsets_seconds=campaign.get("repost_offsets_seconds"),
+            mode=campaign.get("mode", CampaignMode.STANDARD.value),
+            variant_count=len(campaign.get("variants", [])),
+            minimum_cycle_seconds=minimum_cycle_seconds,
+        )
+        changed = (
+            as_utc(campaign["current_end_at_utc"]) != fit.end_at
+            or campaign.get("repost_interval_seconds") != fit.interval_seconds
+            or campaign.get("repost_offsets_seconds") != fit.offsets_seconds
+        )
+        if not changed:
+            return campaign, []
+        existing_notes = list(campaign.get("rotation_adjustment_notes", []))
+        notes = list(dict.fromkeys([*existing_notes, *fit.notes]))
+        update = {
+            "original_end_at_utc": fit.end_at,
+            "current_end_at_utc": fit.end_at,
+            "repost_interval_seconds": fit.interval_seconds,
+            "repost_offsets_seconds": fit.offsets_seconds,
+            "rotation_adjustment_notes": notes,
+            "rotation_adjusted_at": utcnow(),
+            "updated_at": utcnow(),
+        }
+        campaign.update(update)
+        if persist:
+            await self.repositories.update_campaign(campaign["campaign_id"], update)
+        return campaign, list(fit.notes)
 
     async def plan_due_cycle(self, campaign: Document, now: Any) -> bool:
         """Materialize the one due cycle. Its fixed HMAC ranks make restart ordering reproducible."""
@@ -256,13 +339,19 @@ class CampaignService:
         deliveries: list[Document] = []
         for channel_id in campaign["target_snapshot"]:
             cohort_index = int(campaign["cohort_map"][str(channel_id)])
+            selected_variant_index = variant_for(campaign["mode"], cycle_number, cohort_index, variant_count)
+            selected_variant = campaign["variants"][selected_variant_index]
+            variant_id = selected_variant.get("id")
+            revision = int(campaign.get("variant_current_revisions", {}).get(variant_id, 1))
             deliveries.append(
                 {
                     "campaign_id": campaign["campaign_id"],
                     "cycle_number": cycle_number,
                     "channel_id": channel_id,
                     "cohort_index": cohort_index,
-                    "variant_index": variant_for(campaign["mode"], cycle_number, cohort_index, variant_count),
+                    "variant_index": selected_variant_index,
+                    "variant_id": variant_id,
+                    "variant_revision": revision,
                     "dispatch_rank": dispatch_rank(seed, cycle_number, channel_id),
                     "status": "PENDING",
                     "previous_message_id": None,
@@ -323,6 +412,127 @@ class CampaignService:
                 },
             )
         return True
+
+    async def replace_running_variant(
+        self,
+        campaign_id: str,
+        index: int,
+        replacement: Creative,
+        owner_id: int,
+    ) -> tuple[Document, int, bool]:
+        """Replace one stable variant identity for future, not-yet-planned cycles."""
+        campaign = await self.repositories.get_campaign(campaign_id)
+        if not campaign or campaign.get("status") not in {CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}:
+            raise ValueError("Only active or paused campaigns support live variant replacement.")
+        variants = [Creative.model_validate(item) for item in campaign.get("variants", [])]
+        if index < 0 or index >= len(variants):
+            raise ValueError("That variant no longer exists.")
+        original = variants[index]
+        replacement.id = original.id
+        replacement.buttons = original.buttons
+        replacement.button_layout = original.button_layout
+
+        current_revisions = dict(campaign.get("variant_current_revisions", {}))
+        version_history = deepcopy(campaign.get("variant_versions", {}))
+        if original.id not in current_revisions or original.id not in version_history:
+            current_revisions[original.id] = 1
+            version_history[original.id] = [
+                {"revision": 1, "creative": original.model_dump(mode="json"), "created_at": campaign.get("activated_at") or utcnow()}
+            ]
+            initialized = {
+                "variant_current_revisions": current_revisions,
+                "variant_versions": version_history,
+                "updated_at": utcnow(),
+            }
+            await self.repositories.update_campaign(campaign_id, initialized)
+            campaign.update(initialized)
+
+        current_revision = int(current_revisions[original.id])
+        next_revision = current_revision + 1
+        schedule_update, _refactor_note = self._ensure_future_rotation_pass(campaign)
+        changed = await self.repositories.replace_running_variant(
+            campaign_id=campaign_id,
+            index=index,
+            variant_id=original.id,
+            expected_revision=current_revision,
+            revision=next_revision,
+            creative=replacement.model_dump(mode="json"),
+            event={
+                "at": utcnow(),
+                "owner_id": owner_id,
+                "variant_id": original.id,
+                "variant_index": index,
+                "from_revision": current_revision,
+                "to_revision": next_revision,
+                "applies_from_cycle": int(campaign.get("next_cycle_number", 0)),
+                "schedule_refactored": bool(schedule_update),
+            },
+            schedule_update=schedule_update,
+        )
+        if not changed:
+            raise ValueError("That variant changed while you were editing it. Open Variants and try again.")
+        updated = await self.repositories.get_campaign(campaign_id)
+        if not updated:
+            raise ValueError("Campaign no longer exists.")
+        applies_from_cycle = int(updated.get("next_cycle_number", 0))
+        total_cycles = scheduled_cycle_count(
+            as_utc(updated["start_at_utc"]),
+            as_utc(updated["current_end_at_utc"]),
+            updated.get("repost_interval_seconds"),
+            updated.get("repost_offsets_seconds"),
+        )
+        return updated, applies_from_cycle, applies_from_cycle < total_cycles
+
+    def _ensure_future_rotation_pass(self, campaign: Document) -> tuple[Document, str | None]:
+        """Extend a live rotating run so an edited revision can finish one pass."""
+        variants = campaign.get("variants", [])
+        if campaign.get("mode") == CampaignMode.STANDARD.value or len(variants) < 2:
+            return {}, None
+        start = as_utc(campaign["start_at_utc"])
+        end = as_utc(campaign["current_end_at_utc"])
+        interval = campaign.get("repost_interval_seconds")
+        offsets = deepcopy(campaign.get("repost_offsets_seconds"))
+        next_cycle = int(campaign.get("next_cycle_number", 0))
+        total_cycles = scheduled_cycle_count(start, end, interval, offsets)
+        missing_cycles = len(variants) - max(0, total_cycles - next_cycle)
+        if missing_cycles <= 0:
+            return {}, None
+
+        minimum_cycle_seconds = max(60, ceil(len(campaign.get("target_snapshot", [])) / self.send_rps))
+        maximum_safe_gap = int(SAFE_DELETE_WINDOW.total_seconds())
+        update: Document = {}
+        if offsets is not None:
+            points = [0, *offsets]
+            if len(points) >= 2:
+                step = points[-1] - points[-2]
+            else:
+                step = max(minimum_cycle_seconds, int((end - start).total_seconds()) // max(1, total_cycles))
+            step = max(minimum_cycle_seconds, min(step, maximum_safe_gap))
+            cursor = points[-1]
+            for _ in range(missing_cycles):
+                cursor += step
+                offsets.append(cursor)
+            new_end = max(end, start + timedelta(seconds=cursor + minimum_cycle_seconds))
+            update.update({"repost_offsets_seconds": offsets, "current_end_at_utc": new_end})
+        else:
+            cadence = max(minimum_cycle_seconds, min(int(interval or minimum_cycle_seconds), maximum_safe_gap))
+            required_end = start + timedelta(seconds=(next_cycle + len(variants) - 1) * cadence + minimum_cycle_seconds)
+            update.update(
+                {
+                    "repost_interval_seconds": cadence,
+                    "current_end_at_utc": max(end, required_end),
+                }
+            )
+
+        note = (
+            f"live Variant replacement added enough time for {len(variants)} future rotation cycles, "
+            "so the new revision can reach every frozen target"
+        )
+        update["rotation_adjustment_notes"] = list(
+            dict.fromkeys([*campaign.get("rotation_adjustment_notes", []), note])
+        )
+        update["rotation_adjusted_at"] = utcnow()
+        return update, note
 
     async def extend(self, campaign_id: str, owner_id: int, seconds: int) -> Document:
         campaign = await self.repositories.get_campaign(campaign_id)
@@ -501,6 +711,7 @@ class CampaignService:
             "name": name,
             "status": CampaignStatus.DRAFT.value,
             "mode": mode,
+            "mode_explicitly_selected": bool(original.get("mode_explicitly_selected", mode != CampaignMode.STANDARD.value)),
             "variants": variants,
             "destinations": deepcopy(original.get("destinations", [])),
             "target_selector": deepcopy(original.get("target_selector", {})),

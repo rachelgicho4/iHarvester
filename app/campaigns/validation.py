@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from math import ceil
 
 from app.campaigns.models import CampaignMode, Creative, Destination, Schedule
+from app.campaigns.scheduling import scheduled_cycle_count
 
 SAFE_DELETE_WINDOW = timedelta(hours=47)
 
@@ -47,6 +49,30 @@ def validate_launch(
             errors.append("Cleanup needs a repost interval of 47 hours or less for campaigns over 47 hours.")
     if schedule.repost_interval_seconds and len(eligible) / send_rps > schedule.repost_interval_seconds:
         errors.append("Repost interval is shorter than estimated initial-cycle send capacity.")
+    if mode != CampaignMode.STANDARD and len(variants) >= 2 and schedule.start_at_utc < schedule.end_at_utc:
+        cycle_count = scheduled_cycle_count(
+            schedule.start_at_utc,
+            schedule.end_at_utc,
+            schedule.repost_interval_seconds,
+            schedule.repost_offsets_seconds,
+        )
+        if cycle_count < len(variants):
+            errors.append("Rotation timing must include at least one cycle per variant.")
+        minimum_cycle_seconds = max(60, ceil(len(eligible) / send_rps))
+        duration_seconds = int(duration.total_seconds())
+        if schedule.repost_offsets_seconds is not None:
+            points = [0, *schedule.repost_offsets_seconds, duration_seconds]
+            gaps_are_safe = all(
+                later - earlier >= minimum_cycle_seconds
+                for earlier, later in zip(points, points[1:], strict=False)
+            )
+        elif schedule.repost_interval_seconds:
+            final_cycle = max(0, cycle_count - 1) * schedule.repost_interval_seconds
+            gaps_are_safe = schedule.repost_interval_seconds >= minimum_cycle_seconds and duration_seconds - final_cycle >= minimum_cycle_seconds
+        else:
+            gaps_are_safe = False
+        if not gaps_are_safe:
+            errors.append("Rotation timing does not leave enough dispatch time between every cycle and campaign end.")
     if not preview_sent:
         errors.append("Send a real Telegram preview before launch.")
     return errors

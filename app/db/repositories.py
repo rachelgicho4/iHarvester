@@ -176,6 +176,48 @@ class Repositories:
             return_document=ReturnDocument.AFTER,
         )
 
+    async def replace_running_variant(
+        self,
+        *,
+        campaign_id: str,
+        index: int,
+        variant_id: str,
+        expected_revision: int,
+        revision: int,
+        creative: Document,
+        event: Document,
+        schedule_update: Document | None = None,
+    ) -> bool:
+        """Atomically version one variant without changing cohort identities."""
+        revision_path = f"variant_current_revisions.{variant_id}"
+        set_update = {
+            f"variants.{index}": creative,
+            revision_path: revision,
+            "updated_at": utcnow(),
+            **(schedule_update or {}),
+        }
+        result = await self.db.campaigns.update_one(
+            {
+                "campaign_id": campaign_id,
+                "status": {"$in": ["ACTIVE", "PAUSED"]},
+                f"variants.{index}.id": variant_id,
+                revision_path: expected_revision,
+            },
+            {
+                "$set": set_update,
+                "$push": {
+                    f"variant_versions.{variant_id}": {
+                        "revision": revision,
+                        "creative": creative,
+                        "created_at": utcnow(),
+                    },
+                    "variant_edit_events": event,
+                },
+                "$inc": {"version": 1},
+            },
+        )
+        return result.modified_count == 1
+
     async def end_campaign_early(self, campaign_id: str) -> bool:
         now = utcnow()
         result = await self.db.campaigns.update_one(
