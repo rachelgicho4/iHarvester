@@ -850,6 +850,7 @@ class OwnerHandlers:
             )
         controls.extend(
             [
+                [InlineKeyboardButton(text="Top channels by subscribers", callback_data="net:top:15")],
                 [InlineKeyboardButton(text="Forward post to register", callback_data="net:forward")],
                 [InlineKeyboardButton(text="Back", callback_data="home:back")],
             ]
@@ -890,6 +891,45 @@ class OwnerHandlers:
         if nav:
             controls.append(nav)
         controls.append([InlineKeyboardButton(text="Back to Network", callback_data="net:home")])
+        await self._render(message, "\n".join(lines), _markup(controls))
+
+    async def _show_top_channels(self, message: Message, limit: int) -> None:
+        limit = 30 if limit >= 30 else 15
+        channels = await self.repositories.top_channels_by_members(limit)
+        known_count, unknown_count = await self.repositories.channel_member_count_coverage()
+        if not channels:
+            await self._render(
+                message,
+                "Top channels by subscribers\n\nNo registered channel has a verified subscriber count yet. "
+                "Open a channel from Network and use Refresh access to collect it.",
+                _markup(_navigation("net:home")),
+            )
+            return
+        lines = [f"Top {limit} channels by subscribers", ""]
+        for rank, channel in enumerate(channels, start=1):
+            title = " ".join(str(channel.get("title") or channel["telegram_chat_id"]).split())[:36]
+            username = f"@{channel['username']}" if channel.get("username") else "private"
+            status = str(channel.get("status") or "UNKNOWN").replace("_", " ").title()
+            lines.append(
+                f"{rank}. {title} — {int(channel['member_count']):,} subscribers • {username} • {status}"
+            )
+        lines.extend(
+            [
+                "",
+                f"Ranked from {known_count:,} channels with verified counts. "
+                f"{unknown_count:,} channel{'s are' if unknown_count != 1 else ' is'} omitted because the count is unknown.",
+                "Counts reflect the last successful channel refresh and are not live analytics.",
+            ]
+        )
+        controls = [
+            [
+                InlineKeyboardButton(
+                    text="Show top 15" if limit == 30 else "Show top 30",
+                    callback_data=f"net:top:{15 if limit == 30 else 30}",
+                )
+            ],
+            *_navigation("net:home"),
+        ]
         await self._render(message, "\n".join(lines), _markup(controls))
 
     async def _show_channel(self, message: Message, chat_id: int) -> None:
@@ -2378,6 +2418,8 @@ class OwnerHandlers:
             await self._show_network(query.message, notice=notice)
         elif parts[1] == "list" and len(parts) == 4:
             await self._show_network_list(query.message, parts[2], int(parts[3]))
+        elif parts[1] == "top" and len(parts) == 3:
+            await self._show_top_channels(query.message, int(parts[2]))
         else:
             raise ValueError("that network control is no longer valid")
 

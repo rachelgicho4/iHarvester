@@ -90,6 +90,18 @@ class Repositories:
         query: Document = {"status": status} if status else {}
         return await self.db.channels.find(query).sort("title", ASCENDING).skip(skip).limit(limit).to_list(limit)
 
+    async def top_channels_by_members(self, limit: int = 15) -> list[Document]:
+        """Rank every registered channel that has a verified numeric count."""
+        safe_limit = max(1, min(int(limit), 30))
+        return await self.db.channels.find({"member_count": {"$type": "number"}}).sort(
+            [("member_count", -1), ("title", ASCENDING)]
+        ).limit(safe_limit).to_list(safe_limit)
+
+    async def channel_member_count_coverage(self) -> tuple[int, int]:
+        known = await self.db.channels.count_documents({"member_count": {"$type": "number"}})
+        total = await self.db.channels.count_documents({})
+        return known, max(0, total - known)
+
     async def channel_ids_by_status(self, status: str) -> list[int]:
         rows = await self.db.channels.find(
             {"status": status},
