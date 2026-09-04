@@ -49,6 +49,9 @@ class Scheduler:
     async def tick(self) -> None:
         if not await self.lease_manager.acquire_or_renew("scheduler", self.instance_id, self.lease_seconds):
             return
+        recovered = await self.repositories.recover_interrupted_cleanup_campaigns()
+        if recovered:
+            logger.warning("Reopened %s campaign(s) with interrupted cleanup", recovered)
         now = utcnow()
         for campaign in await self.repositories.due_campaigns(now):
             try:

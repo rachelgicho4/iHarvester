@@ -299,6 +299,9 @@ async def test_scheduler_repairs_a_partially_completed_resume_before_planning() 
             self.resumed = 0
             self.update = None
 
+        async def recover_interrupted_cleanup_campaigns(self):
+            return 0
+
         async def due_campaigns(self, now):
             return [campaign]
 

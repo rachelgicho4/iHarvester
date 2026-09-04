@@ -515,8 +515,13 @@ class Repositories:
         return outstanding == 0
 
     async def cancel_pending_campaign_deliveries(self, campaign_id: str) -> None:
+        """Cancel unfinished sends while leaving end-of-campaign cleanup runnable."""
         await self.db.deliveries.update_many(
-            {"campaign_id": campaign_id, "status": {"$in": ["PENDING", "RETRY_WAIT", "PAUSED"]}},
+            {
+                "campaign_id": campaign_id,
+                "operation": {"$ne": "CLEANUP"},
+                "status": {"$in": ["PENDING", "RETRY_WAIT", "PAUSED"]},
+            },
             {"$set": {"status": DeliveryStatus.CANCELLED.value, "updated_at": utcnow()}},
         )
 
@@ -535,9 +540,23 @@ class Repositories:
         return result.modified_count
 
     async def materialize_cleanup_deliveries(self, campaign_id: str) -> int:
+        """Create cleanup work and repair orphaned cleanup jobs idempotently.
+
+        ``campaign_channel_state`` is the source of truth for posts that are
+        still live.  A prior release accidentally cancelled pending cleanup
+        deliveries on the scheduler's next tick.  Existing unique delivery
+        records therefore need to be revived as well as missing ones inserted.
+        Reconciliation also makes a partially completed deployment/restart
+        converge without an owner having to end the campaign again.
+        """
         states = await self.live_states(campaign_id)
         now = utcnow()
-        operations = [
+        existing_rows = await self.db.deliveries.find(
+            {"campaign_id": campaign_id, "cycle_number": -1},
+            {"_id": 0, "channel_id": 1, "operation": 1, "status": 1},
+        ).to_list(None)
+        existing = {int(item["channel_id"]): item for item in existing_rows}
+        insert_operations = [
             UpdateOne(
                 {"campaign_id": campaign_id, "cycle_number": -1, "channel_id": state["channel_id"]},
                 {
@@ -560,10 +579,90 @@ class Repositories:
                 upsert=True,
             )
             for state in states
+            if int(state["channel_id"]) not in existing
         ]
-        for offset in range(0, len(operations), 500):
-            await self.db.deliveries.bulk_write(operations[offset : offset + 500], ordered=False)
-        return len(states)
+        for offset in range(0, len(insert_operations), 500):
+            await self.db.deliveries.bulk_write(insert_operations[offset : offset + 500], ordered=False)
+
+        # Do not reset active retries or permanent cleanup failures on every
+        # scheduler tick.  Only terminal states that contradict a still-live
+        # channel pointer are repaired automatically.
+        repairable_statuses = [
+            DeliveryStatus.CANCELLED.value,
+            DeliveryStatus.CLEANED.value,
+            DeliveryStatus.PAUSED.value,
+        ]
+        repair_operations = [
+            UpdateOne(
+                {
+                    "campaign_id": campaign_id,
+                    "cycle_number": -1,
+                    "channel_id": state["channel_id"],
+                    "operation": "CLEANUP",
+                    "status": {"$in": repairable_statuses},
+                },
+                {
+                    "$set": {
+                        "message_ids": state["current_message_ids"],
+                        "status": DeliveryStatus.PENDING.value,
+                        "attempts": 0,
+                        "worker_id": None,
+                        "lease_until": None,
+                        "next_retry_at": None,
+                        "error_category": None,
+                        "error_summary": None,
+                        "updated_at": now,
+                        "cleanup_recovered_at": now,
+                    }
+                },
+            )
+            for state in states
+            if existing.get(int(state["channel_id"]), {}).get("operation") == "CLEANUP"
+            and existing[int(state["channel_id"])].get("status") in repairable_statuses
+        ]
+        for offset in range(0, len(repair_operations), 500):
+            await self.db.deliveries.bulk_write(repair_operations[offset : offset + 500], ordered=False)
+        return len(insert_operations) + len(repair_operations)
+
+    async def recover_interrupted_cleanup_campaigns(self) -> int:
+        """Reopen campaigns archived by the cancelled-cleanup regression.
+
+        New ending campaigns are repaired by ``materialize_cleanup_deliveries``.
+        This migration path targets only archived campaigns that have both a
+        cancelled cleanup delivery and a live-state pointer, so intentionally
+        retained campaigns are not reopened.
+        """
+        campaign_ids = await self.db.deliveries.distinct(
+            "campaign_id",
+            {"operation": "CLEANUP", "status": DeliveryStatus.CANCELLED.value},
+        )
+        recovered = 0
+        now = utcnow()
+        for campaign_id in campaign_ids:
+            has_live_state = await self.db.campaign_channel_state.count_documents(
+                {"campaign_id": campaign_id},
+                limit=1,
+            )
+            if not has_live_state:
+                continue
+            result = await self.db.campaigns.update_one(
+                {
+                    "campaign_id": campaign_id,
+                    "status": "ARCHIVED",
+                    "delete_on_end": True,
+                },
+                {
+                    "$set": {
+                        "status": "ENDING",
+                        "archived_at": None,
+                        "end_reason": "cleanup_recovery",
+                        "ending_at": now,
+                        "updated_at": now,
+                    }
+                },
+            )
+            recovered += result.modified_count
+        return recovered
 
     async def materialize_superseded_cleanup(self, channel_id: int, current_campaign_id: str) -> int:
         """Queue cleanup for retained posts only on the channel a new campaign reached."""
@@ -622,6 +721,15 @@ class Repositories:
         return queued
 
     async def cleanup_is_complete(self, campaign_id: str) -> bool:
+        # Never archive while a live-state pointer says a campaign post still
+        # exists.  This invariant prevents a cancelled/missing cleanup job from
+        # turning into a false-success archive.
+        live_posts = await self.db.campaign_channel_state.count_documents(
+            {"campaign_id": campaign_id},
+            limit=1,
+        )
+        if live_posts:
+            return False
         outstanding = await self.db.deliveries.count_documents(
             {
                 "campaign_id": campaign_id,
@@ -630,6 +738,31 @@ class Repositories:
             }
         )
         return outstanding == 0
+
+    async def retry_failed_cleanup_deliveries(self, campaign_id: str) -> int:
+        """Owner-requested retry for permanent cleanup failures only."""
+        now = utcnow()
+        result = await self.db.deliveries.update_many(
+            {
+                "campaign_id": campaign_id,
+                "operation": "CLEANUP",
+                "status": DeliveryStatus.CLEANUP_FAILED.value,
+            },
+            {
+                "$set": {
+                    "status": DeliveryStatus.PENDING.value,
+                    "attempts": 0,
+                    "worker_id": None,
+                    "lease_until": None,
+                    "next_retry_at": None,
+                    "error_category": None,
+                    "error_summary": None,
+                    "updated_at": now,
+                    "owner_retry_requested_at": now,
+                }
+            },
+        )
+        return result.modified_count
 
     async def delivery_summary(self, campaign_id: str, cycle_number: int) -> Document:
         cursor = await self.db.deliveries.aggregate(

@@ -79,6 +79,8 @@ def test_every_campaign_state_has_safe_navigation_and_short_callback_data() -> N
         assert all(not item.callback_data or len(item.callback_data.encode()) <= 64 for item in buttons)
     assert "+3 days" in {item.text for row in active.inline_keyboard for item in row}
     assert "Variants (2)" in {item.text for row in active.inline_keyboard for item in row}
+    ending_labels = {item.text for row in keyboards[4].inline_keyboard for item in row}
+    assert {"View cleanup issues", "Retry cleanup"} <= ending_labels
 
 
 def test_expired_network_controls_recover_to_network_and_home() -> None:

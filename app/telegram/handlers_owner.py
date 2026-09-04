@@ -289,6 +289,13 @@ def campaign_keyboard(campaign_id: str, status: str, *, variant_count: int = 0, 
                     InlineKeyboardButton(text="Retry failed", callback_data=f"c:{campaign_id}:retry"),
                 ]
             )
+        elif status == CampaignStatus.ENDING.value:
+            rows.append(
+                [
+                    InlineKeyboardButton(text="View cleanup issues", callback_data=f"c:{campaign_id}:failures"),
+                    InlineKeyboardButton(text="Retry cleanup", callback_data=f"c:{campaign_id}:retrycleanup"),
+                ]
+            )
         if status == CampaignStatus.PAUSED.value:
             rows.append(
                 [
@@ -1575,6 +1582,16 @@ class OwnerHandlers:
             notice = await query.message.answer(
                 f"Queued {count} failed {noun} across this campaign for one owner-requested retry. "
                 "Unknown send results were not retried."
+            )
+            await self._show_campaign(notice, await self.repositories.get_campaign(campaign_id))
+        elif action == "retrycleanup":
+            if campaign["status"] != CampaignStatus.ENDING.value:
+                raise ValueError("cleanup retries are only available while a campaign is ending")
+            count = await self.repositories.retry_failed_cleanup_deliveries(campaign_id)
+            noun = "cleanup" if count == 1 else "cleanups"
+            notice = await query.message.answer(
+                f"Queued {count} failed {noun} for another deletion attempt. "
+                "Cancelled or interrupted cleanup work is repaired automatically."
             )
             await self._show_campaign(notice, await self.repositories.get_campaign(campaign_id))
         else:
