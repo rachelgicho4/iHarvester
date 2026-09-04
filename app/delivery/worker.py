@@ -5,6 +5,8 @@ import logging
 import re
 from typing import Any
 
+from pymongo.errors import PyMongoError
+
 from app.campaigns.models import ChannelStatus, DeliveryStatus
 from app.db.repositories import Repositories
 from app.delivery.error_classification import ErrorKind, classify_telegram_error
@@ -46,6 +48,15 @@ class DeliveryWorker:
                 await self.process(delivery)
             except asyncio.CancelledError:
                 raise
+            except PyMongoError:
+                # All workers share one database.  During an Atlas/Koyeb
+                # connection interruption, retrying every second creates an
+                # avoidable connection and log storm without making progress.
+                logger.warning("Delivery worker paused: MongoDB unavailable")
+                try:
+                    await asyncio.wait_for(stopping.wait(), timeout=5)
+                except TimeoutError:
+                    pass
             except Exception as error:
                 logger.exception(
                     "Delivery worker iteration failed",

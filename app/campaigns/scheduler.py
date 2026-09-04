@@ -4,6 +4,8 @@ import asyncio
 import logging
 from typing import Any
 
+from pymongo.errors import PyMongoError
+
 from app.campaigns.service import CampaignService
 from app.db.leases import LeaseManager
 from app.db.repositories import Repositories
@@ -33,14 +35,20 @@ class Scheduler:
     async def run(self, stopping: asyncio.Event) -> None:
         try:
             while not stopping.is_set():
+                delay = self.tick_seconds
                 try:
                     await self.tick()
+                except PyMongoError:
+                    # Preserve the scheduler task and avoid a noisy two-second
+                    # reconnection loop while Atlas/Koyeb networking recovers.
+                    logger.warning("Campaign scheduler paused: MongoDB unavailable")
+                    delay = max(5, self.tick_seconds)
                 except Exception:
                     # Keep the task alive: a temporary Mongo/network failure
                     # must not permanently stop all future reposts.
                     logger.exception("Campaign scheduler tick failed")
                 try:
-                    await asyncio.wait_for(stopping.wait(), timeout=self.tick_seconds)
+                    await asyncio.wait_for(stopping.wait(), timeout=delay)
                 except TimeoutError:
                     pass
         finally:
