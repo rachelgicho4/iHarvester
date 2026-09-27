@@ -356,6 +356,12 @@ class CampaignService:
         cycle_number = int(campaign.get("next_cycle_number", 0))
         repost_offsets = campaign.get("repost_offsets_seconds")
         safety_refresh = await self._cleanup_safety_refresh_due(campaign, now, end)
+        # A safety refresh remains due until every channel has received its
+        # replacement.  Without this guard each scheduler tick could queue a
+        # new full-network cycle while the first one was still delivering.
+        # Separate campaigns may overlap; cycles within one campaign may not.
+        if await self.repositories.has_unfinished_send_work(campaign["campaign_id"]):
+            return False
         # After a one-off or final specific repost, keep the campaign active
         # until its configured end so cleanup can run. There is simply no
         # further cycle to plan before then, unless a confirmed live post is
@@ -453,12 +459,20 @@ class CampaignService:
                 },
             )
         elif interval:
+            next_cycle, next_cycle_at = self._next_cycle_after_now(
+                start,
+                end,
+                cycle_number,
+                interval,
+                repost_offsets,
+                now,
+            )
             await self.repositories.advance_running_campaign(
                 campaign["campaign_id"],
                 {
                     "status": CampaignStatus.ACTIVE.value,
-                    "next_cycle_number": cycle_number + 1,
-                    "next_cycle_at": expected + timedelta(seconds=interval),
+                    "next_cycle_number": next_cycle,
+                    "next_cycle_at": next_cycle_at,
                     "updated_at": now,
                 },
             )

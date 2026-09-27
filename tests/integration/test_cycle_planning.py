@@ -40,6 +40,9 @@ class MemoryRepositories:
     async def cycle_exists(self, campaign_id, cycle_number):
         return any(cycle["cycle_number"] == cycle_number for cycle in self.cycles)
 
+    async def has_unfinished_send_work(self, campaign_id):
+        return False
+
     async def update_campaign(self, campaign_id, update):
         self.campaign.update(update)
         return True
@@ -169,6 +172,32 @@ async def test_2000_channel_cycle_is_bounded_excludes_destination_and_changes_or
     second_order = [item["channel_id"] for item in sorted(second, key=lambda item: item["dispatch_rank"])]
     assert first_order != second_order
     assert max(delivery["cohort_index"] for delivery in second) == 2
+
+
+@pytest.mark.asyncio
+async def test_campaign_never_queues_a_second_cycle_while_send_work_is_open() -> None:
+    now = datetime.now(UTC)
+    campaign = {
+        "campaign_id": "cmp_no_overlap",
+        "status": "ACTIVE",
+        "mode": "STANDARD",
+        "start_at_utc": now - timedelta(minutes=5),
+        "current_end_at_utc": now + timedelta(hours=2),
+        "repost_interval_seconds": 60,
+        "target_snapshot": [-1001],
+        "cohort_map": {"-1001": 0},
+        "shuffle_seed": base64.urlsafe_b64encode(b"x" * 32).decode(),
+        "variants": [{}],
+        "next_cycle_number": 1,
+    }
+
+    class BusyRepositories(MemoryRepositories):
+        async def has_unfinished_send_work(self, campaign_id):
+            return True
+
+    repositories = BusyRepositories(campaign, [])
+    assert not await CampaignService(repositories, 20).plan_due_cycle(campaign, now)
+    assert not repositories.cycles
 
 
 @pytest.mark.asyncio

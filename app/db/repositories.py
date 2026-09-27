@@ -244,9 +244,18 @@ class Repositories:
         return job
 
     async def complete_network_refresh_job(self, job_id: Any, status: str, **details: Any) -> None:
+        terminal = status in {"COMPLETED", "FAILED"}
         job = await self.db.network_refresh_jobs.find_one_and_update(
             {"_id": job_id},
-            {"$set": {"status": status, "lease_until": None, "updated_at": utcnow(), **details}},
+            {
+                "$set": {
+                    "status": status,
+                    "lease_until": None,
+                    "updated_at": utcnow(),
+                    **({"finished_at": utcnow()} if terminal else {}),
+                    **details,
+                }
+            },
             return_document=ReturnDocument.AFTER,
         )
         if not job:
@@ -564,6 +573,23 @@ class Repositories:
     async def cycle_exists(self, campaign_id: str, cycle_number: int) -> bool:
         return await self.db.campaign_cycles.count_documents({"campaign_id": campaign_id, "cycle_number": cycle_number}, limit=1) > 0
 
+    async def has_unfinished_send_work(self, campaign_id: str) -> bool:
+        """Whether an earlier non-cleanup cycle still owns send work.
+
+        A campaign may overlap other campaigns, but not itself: a later cycle
+        replaces the prior cycle's posts and must wait for it to settle.
+        """
+        return bool(
+            await self.db.deliveries.count_documents(
+                {
+                    "campaign_id": campaign_id,
+                    "operation": {"$ne": "CLEANUP"},
+                    "status": {"$in": ["PENDING", "PROCESSING", "RETRY_WAIT", "PAUSED"]},
+                },
+                limit=1,
+            )
+        )
+
     async def campaigns_with_due_cleanup(self) -> list[Document]:
         return await self.db.campaigns.find({"status": "ENDING"}).to_list(None)
 
@@ -719,6 +745,7 @@ class Repositories:
         )
 
     async def complete_live_text_repair(self, repair_id: Any, status: str, **details: Any) -> None:
+        terminal = status in {"SUCCEEDED", "SKIPPED", "FAILED"}
         await self.db.live_text_repairs.update_one(
             {"_id": repair_id},
             {
@@ -726,6 +753,7 @@ class Repositories:
                     "status": status,
                     "lease_until": None,
                     "updated_at": utcnow(),
+                    **({"finished_at": utcnow()} if terminal else {}),
                     **details,
                 }
             },
@@ -1141,6 +1169,21 @@ class Repositories:
         rows = await cursor.to_list(None)
         return {item["_id"]: item["count"] for item in rows}
 
+    async def _history_rollup(self, campaign_id: str) -> Document:
+        """Return compacted/offline-history counters, if this campaign has any."""
+        campaigns = getattr(self.db, "campaigns", None)
+        if campaigns is None or not hasattr(campaigns, "find_one"):
+            return {}
+        campaign = await campaigns.find_one({"campaign_id": campaign_id}, {"history_rollup": 1})
+        return dict(campaign.get("history_rollup", {})) if campaign else {}
+
+    @staticmethod
+    def _merge_counts(current: Document, archived: Document) -> Document:
+        merged = dict(current)
+        for status, count in archived.items():
+            merged[status] = int(merged.get(status, 0)) + int(count or 0)
+        return merged
+
     async def campaign_delivery_totals(self, campaign_id: str) -> Document:
         cursor = await self.db.deliveries.aggregate(
             [
@@ -1149,7 +1192,12 @@ class Repositories:
             ]
         )
         rows = await cursor.to_list(None)
-        return {item["_id"]: item["count"] for item in rows}
+        current = {item["_id"]: item["count"] for item in rows}
+        rollup = await self._history_rollup(campaign_id)
+        return self._merge_counts(
+            current,
+            self._merge_counts(rollup.get("delivery_totals", {}), rollup.get("cleanup_totals", {})),
+        )
 
     async def cleanup_status_summary(self, campaign_id: str) -> Document:
         cursor = await self.db.deliveries.aggregate(
@@ -1159,7 +1207,8 @@ class Repositories:
             ]
         )
         rows = await cursor.to_list(None)
-        return {item["_id"]: item["count"] for item in rows}
+        current = {item["_id"]: item["count"] for item in rows}
+        return self._merge_counts(current, (await self._history_rollup(campaign_id)).get("cleanup_totals", {}))
 
     async def cleanup_failure_summary(self, campaign_id: str) -> Document:
         cursor = await self.db.deliveries.aggregate(
@@ -1175,7 +1224,8 @@ class Repositories:
             ]
         )
         rows = await cursor.to_list(None)
-        return {item["_id"]: item["count"] for item in rows}
+        current = {item["_id"]: item["count"] for item in rows}
+        return self._merge_counts(current, (await self._history_rollup(campaign_id)).get("cleanup_failure_totals", {}))
 
     async def campaign_cycle_count(self, campaign_id: str) -> int:
         return await self.db.campaign_cycles.count_documents({"campaign_id": campaign_id})
@@ -1255,13 +1305,24 @@ class Repositories:
             ]
         )
         rows = await cursor.to_list(1)
-        return rows[0] if rows else {"attempts": 0, "replaced_messages": 0, "cleaned_messages": 0}
+        current = rows[0] if rows else {"attempts": 0, "replaced_messages": 0, "cleaned_messages": 0}
+        archived = (await self._history_rollup(campaign_id)).get("metrics", {})
+        result = dict(current)
+        for key in ("attempts", "replaced_messages", "cleaned_messages"):
+            result[key] = int(current.get(key, 0) or 0) + int(archived.get(key, 0) or 0)
+        first, last = archived.get("first_created_at"), archived.get("last_updated_at")
+        if first and (not result.get("first_created_at") or first < result["first_created_at"]):
+            result["first_created_at"] = first
+        if last and (not result.get("last_updated_at") or last > result["last_updated_at"]):
+            result["last_updated_at"] = last
+        return result
 
     async def campaign_live_state_count(self, campaign_id: str) -> int:
         return await self.db.campaign_channel_state.count_documents({"campaign_id": campaign_id})
 
     async def campaign_join_count(self, campaign_id: str) -> int:
-        return await self.db.join_events.count_documents({"campaign_id": campaign_id})
+        current = await self.db.join_events.count_documents({"campaign_id": campaign_id})
+        return current + int((await self._history_rollup(campaign_id)).get("join_count", 0) or 0)
 
     async def failed_deliveries(self, campaign_id: str, cycle_number: int | None = None, *, limit: int = 20) -> list[Document]:
         query: Document = {
@@ -1276,7 +1337,11 @@ class Repositories:
         }
         if cycle_number is not None:
             query["cycle_number"] = cycle_number
-        return await self.db.deliveries.find(query).sort("updated_at", -1).limit(limit).to_list(limit)
+        current = await self.db.deliveries.find(query).sort("updated_at", -1).limit(limit).to_list(limit)
+        if cycle_number is not None or len(current) >= limit:
+            return current
+        samples = list((await self._history_rollup(campaign_id)).get("failure_samples", []))
+        return [*current, *samples][:limit]
 
     async def retry_failed_deliveries(self, campaign_id: str, cycle_number: int | None = None) -> int:
         """An owner-initiated retry never touches ambiguous send states."""
@@ -1612,7 +1677,10 @@ class Repositories:
     async def register_update(self, update_id: int) -> bool:
         try:
             now = utcnow()
-            await self.db.processed_updates.insert_one({"update_id": update_id, "received_at": now, "expires_at": now + timedelta(days=7)})
+            # Telegram webhook retries arrive within minutes, not weeks.  A
+            # one-day deduplication window is ample and keeps high-volume
+            # owner/channel updates from consuming the campaign database.
+            await self.db.processed_updates.insert_one({"update_id": update_id, "received_at": now, "expires_at": now + timedelta(days=1)})
             return True
         except DuplicateKeyError:
             return False
