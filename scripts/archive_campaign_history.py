@@ -65,10 +65,15 @@ def candidates(db: Any, include_ending_terminal: bool, include_ending_all_send: 
         campaign_id = campaign["campaign_id"]
         live_posts = db.campaign_channel_state.count_documents({"campaign_id": campaign_id})
         if campaign["status"] == "ARCHIVED" and not live_posts:
-            result.append({"campaign_id": campaign_id, "name": campaign.get("name", "Untitled"), "scope": "ARCHIVED_CLOSED", "live_posts": 0})
+            # A previously compacted campaign has its counters on the campaign
+            # document and no raw delivery data left to archive again.
+            if db.deliveries.count_documents({"campaign_id": campaign_id}, limit=1) or db.join_events.count_documents({"campaign_id": campaign_id}, limit=1):
+                result.append({"campaign_id": campaign_id, "name": campaign.get("name", "Untitled"), "scope": "ARCHIVED_CLOSED", "live_posts": 0})
         elif campaign["status"] == "ENDING" and (include_ending_terminal or include_ending_all_send):
             scope = "ENDING_ALL_SEND" if include_ending_all_send else "ENDING_TERMINAL_SEND"
-            result.append({"campaign_id": campaign_id, "name": campaign.get("name", "Untitled"), "scope": scope, "live_posts": live_posts})
+            query = ending_all_send_query(campaign_id) if include_ending_all_send else ending_terminal_query(campaign_id)
+            if db.deliveries.count_documents(query, limit=1):
+                result.append({"campaign_id": campaign_id, "name": campaign.get("name", "Untitled"), "scope": scope, "live_posts": live_posts})
     return result
 
 
@@ -248,6 +253,18 @@ def prune(db: Any, manifest_path: Path, *, emergency_delete_first: bool = False)
         if not valid:
             print(f"Skip {campaign_id}: no longer eligible.")
             continue
+        # A campaign can continue changing while a long archive is streaming.
+        # Never let a broad delete catch a record that was not in this exact
+        # checksum-verified archive; export a fresh manifest instead.
+        expected_delivery_count = int(entry.get("counts", {}).get("deliveries", 0))
+        if "deliveries" in collections:
+            actual_delivery_count = db.deliveries.count_documents(delete_query)
+            if actual_delivery_count != expected_delivery_count:
+                print(
+                    f"Skip {campaign_id}: delivery count changed since export "
+                    f"({expected_delivery_count} archived, {actual_delivery_count} current)."
+                )
+                continue
         def record_archive() -> None:
             refreshed = db.campaigns.find_one({"campaign_id": campaign_id}) or campaign
             rollup = merge_rollup(refreshed.get("history_rollup", {}), entry["rollup"], archive_id)
