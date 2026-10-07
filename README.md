@@ -1,10 +1,14 @@
 # iHarvester
 
+For an obsolete public handle in legacy channel posts, use the separate [audited handle-repair guide](docs/channel-handle-repair.md). It is a one-off, human-admin MTProto workflow with a mandatory dry run; it is not part of the hosted service.
+
 iHarvester is a Telegram-native campaign orchestrator for an owner-operated network of channels. It registers channels when the bot becomes an administrator, stores durable state in MongoDB, and runs rate-limited, restart-safe campaign cycles with real Telegram buttons.
 
 It deliberately remains one Python service plus MongoDB: no Redis, Celery, dashboard, redirect tracker, user-account login, or separate worker deployment.
 
-If a past campaign's cleanup is blocked by Telegram's Bot API 48-hour limit, use the workstation-only [MTProto recovery guide](docs/mtproto-recovery.md). It authenticates the existing bot identity—not a channel owner's personal account—and deletes only iHarvester's exact tracked message IDs after a small pilot succeeds.
+If a past campaign's cleanup is blocked by Telegram's Bot API 48-hour limit, use the workstation-only [MTProto recovery guide](docs/mtproto-recovery.md). It deletes only iHarvester's exact tracked message IDs after a small pilot succeeds.
+
+The handle-repair guide is the exception to the ordinary no-user-session design: it deliberately uses a temporary, already-authorised human admin session when an existing post must be corrected in place.
 
 ## The quickest production path: Koyeb
 
