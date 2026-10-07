@@ -22,23 +22,29 @@ The current target is the exact replacement:
 - It writes an append-only JSONL audit for every candidate, skip, successful
   edit, and Telegram error. The audit records metadata and counts, not post
   body text.
+- It builds its channel list from each authorised Telegram account's own
+  broadcast-channel directory. MongoDB and iHarvester's network registry are
+  not read or used.
 
 It never changes a similar name, a different handle, or any message outside
-the iHarvester channel registry. Messages forwarded from elsewhere are listed
-but intentionally skipped. A handle burned into an image/video thumbnail or
+the selected account's broadcast channels where that account has the Telegram
+**Edit messages** privilege. Messages forwarded from elsewhere are listed but
+intentionally skipped. A handle burned into an image/video thumbnail or
 watermark is media pixels, not editable Telegram text; it must be replaced by
 posting a corrected media asset separately.
 
 ## Safe run order
 
-Run the tool once per existing human admin session. Its session loads the
-account's channel directory, skips channels it cannot resolve or lacks the
-**Edit messages** privilege for, and leaves them for the next account.
+Run the tool once per existing human admin session. It loads that account's
+Telegram broadcast-channel directory directly, then skips any channel for
+which that account lacks **Edit messages**. It does not infer ownership or
+membership from MongoDB.
 
 1. QR-authorise the three accounts on the temporary VPS using the existing
    `scripts/authorize_owner_qr.sh account-1` helper. Sessions stay under the
    VPS operator's local `iharvester-recovery/session` directory.
-2. Run a 10-channel, read-only pilot with `--scan search`.
+2. Run a read-only pilot that stops after 10 matching posts with `--scan
+   search --max-candidates 10`.
 3. Inspect the JSONL audit. The `would_edit` records must only identify old
    `i_BOXTV` references.
 4. Apply that 10-channel pilot and verify the posts in Telegram.
@@ -47,9 +53,9 @@ account's channel directory, skips channels it cannot resolve or lacks the
    history pass for those accounts. This is deliberately slower because it
    reads every historical message; Telegram's pacing is respected.
 
-The convenience launcher prompts invisibly for the private Telegram API hash
-and Mongo connection value, passes them only to its short-lived container, and
-unsets them when it exits. It does not create an `.env` file. Start with:
+The convenience launcher prompts invisibly for the private Telegram API hash,
+passes it only to its short-lived container, and unsets it when it exits. It
+does not create an `.env` file or connect to MongoDB. Start with:
 
 ```bash
 cd /root/iharvester-handle-repair/repo
@@ -59,20 +65,20 @@ cd /root/iharvester-handle-repair/repo
 bash scripts/authorize_owner_qr.sh account-1
 
 # Read-only pilot. It creates a JSONL audit on the VPS outside this repo.
-bash scripts/run_handle_repair_mtproto.sh account-1 -- --scan search --limit-channels 10
+bash scripts/run_handle_repair_mtproto.sh account-1 -- --scan search --max-candidates 10
 ```
 
 The matching apply pilot adds the deliberate confirmation pair:
 
 ```bash
 bash scripts/run_handle_repair_mtproto.sh account-1 -- \
-  --scan search --limit-channels 10 --apply --confirm-new-handle i_BOX_TV
+  --scan search --max-candidates 10 --apply --confirm-new-handle i_BOX_TV
 ```
 
 The launcher is preferable to constructing a Docker command by hand. The
 equivalent low-level command below is retained for advanced operators who
-already use exported values. Do not paste those values in command history or
-source them from a tracked file.
+already use an exported Telegram API ID and hash. Do not paste them in command
+history or source them from a tracked file.
 
 ```bash
 cd /root/iharvester-handle-repair/repo
@@ -83,14 +89,14 @@ docker run --rm -it \
   --mount type=bind,src="$HOME/iharvester-recovery/session",dst=/recovery/session \
   --mount type=bind,src="$HOME/iharvester-recovery/handle-repair-audit",dst=/recovery/audit \
   -w /workspace/repo \
-  -e MONGODB_URI -e MONGODB_DB_NAME -e TELEGRAM_API_ID -e TELEGRAM_API_HASH \
+  -e TELEGRAM_API_ID -e TELEGRAM_API_HASH \
   -e PIP_DISABLE_PIP_VERSION_CHECK=1 \
   python:3.12-slim sh -ec \
   'python -m pip install --no-cache-dir -q -e . -r requirements-mtproto-recovery.txt && \
    python scripts/repair_channel_handle_mtproto.py \
      --session /recovery/session/account-1 \
      --audit-dir /recovery/audit \
-     --scan search --limit-channels 10'
+     --scan search --max-candidates 10'
 ```
 
 After all three `search` passes finish, use this only if the audit identifies
@@ -114,8 +120,8 @@ events are:
 
 - `would_edit` — dry-run candidate.
 - `edited` / `already_repaired` — successful outcome.
-- `channel_unavailable` or `channel_skipped_no_edit_right` — leave it for the
-  account that administers that channel.
+- `channel_skipped_no_edit_right` — the current account can see the channel
+  but lacks Telegram's **Edit messages** privilege.
 - `candidate_skipped_forwarded` — Telegram cannot safely edit that post in
   place.
 - `edit_failed` — inspect the Telegram error before deciding whether an

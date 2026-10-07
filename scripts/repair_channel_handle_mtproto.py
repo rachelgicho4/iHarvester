@@ -2,8 +2,8 @@
 
 This is deliberately an owner-operated recovery utility, never a Koyeb service
 feature.  It uses one already-authorised human admin session at a time, scans
-only iHarvester's registered broadcast channels, and writes an append-only
-JSONL audit before it changes anything.
+that account's own broadcast-channel directory, and writes an append-only
+JSONL audit before it changes anything. It does not read MongoDB.
 
 The default is a read-only, server-side search for the old handle.  Use
 ``--scan full`` only when messages may have the old handle solely inside an
@@ -25,10 +25,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pymongo import MongoClient
-
 try:
-    from telethon import TelegramClient, errors, types
+    from telethon import TelegramClient, errors, types, utils
 except ImportError as error:  # pragma: no cover - exercised by the operator
     raise SystemExit(
         "Telethon is required. Run: python -m pip install -e . -r requirements-mtproto-recovery.txt"
@@ -67,10 +65,6 @@ class RewrittenMessage:
         return bool(self.text_changes or self.entity_url_changes or self.button_url_changes)
 
 
-class ChannelUnavailableError(RuntimeError):
-    """The selected session cannot safely resolve this registered channel."""
-
-
 class AuditWriter:
     """Small append-only audit that is safe to inspect while a run continues."""
 
@@ -107,29 +101,6 @@ def _handle(value: str, argument: str) -> str:
     if not HANDLE_PATTERN.fullmatch(result):
         raise argparse.ArgumentTypeError(f"{argument} must be a Telegram handle without @ or a URL.")
     return result
-
-
-def _targets(database: Any, limit: int | None) -> list[ChannelTarget]:
-    # Full Bot API IDs for broadcast channels start at -100.  Querying them is
-    # more robust than trusting historical status flags: an account can regain
-    # access to a channel that iHarvester currently marks NEEDS_ATTENTION.
-    cursor = database.channels.find(
-        {"telegram_chat_id": {"$lte": -1_000_000_000_000}},
-        {"_id": 0, "telegram_chat_id": 1, "title": 1, "username": 1},
-    ).sort("telegram_chat_id", 1)
-    targets: list[ChannelTarget] = []
-    for row in cursor:
-        username = row.get("username")
-        targets.append(
-            ChannelTarget(
-                telegram_chat_id=int(row["telegram_chat_id"]),
-                title=" ".join(str(row.get("title") or row["telegram_chat_id"]).split()),
-                username=username.strip() if isinstance(username, str) and username.strip() else None,
-            )
-        )
-        if limit is not None and len(targets) >= limit:
-            break
-    return targets
 
 
 def _marker_pattern(old_handle: str) -> re.Pattern[str]:
@@ -270,19 +241,40 @@ def _rewrite_message(message: Any, pattern: re.Pattern[str], new_handle: str) ->
     )
 
 
-async def _resolve_channel(client: TelegramClient, target: ChannelTarget) -> Any:
-    expected_channel_id = -target.telegram_chat_id - 1_000_000_000_000
-    try:
-        entity = await client.get_input_entity(target.telegram_chat_id)
-    except ValueError:
-        if not target.username:
-            raise ChannelUnavailableError("no MTProto access hash and no public username") from None
-        entity = await client.get_input_entity(target.username)
-    if getattr(entity, "channel_id", None) != expected_channel_id:
-        raise ChannelUnavailableError("resolved peer did not match the registered channel ID")
-    if not isinstance(getattr(entity, "access_hash", None), int):
-        raise ChannelUnavailableError("Telegram did not provide a channel access hash")
-    return types.InputChannel(expected_channel_id, entity.access_hash)
+async def _account_broadcast_channels(client: TelegramClient) -> tuple[list[tuple[ChannelTarget, Any]], int]:
+    """Return every broadcast channel visible to this authorised account.
+
+    Telegram's own dialog directory is deliberately the only channel source
+    for this utility. That lets it repair legacy posts in healthy channels
+    which iHarvester has never indexed, and avoids stale database membership
+    data assigning a channel to the wrong account.
+    """
+
+    dialogs = await client.get_dialogs(limit=None)
+    channels: list[tuple[ChannelTarget, Any]] = []
+    broadcast_dialogs = 0
+    for dialog in dialogs:
+        entity = getattr(dialog, "entity", None)
+        if not isinstance(entity, types.Channel) or not getattr(entity, "broadcast", False):
+            continue
+        broadcast_dialogs += 1
+        chat_id = utils.get_peer_id(entity)
+        access_hash = getattr(entity, "access_hash", None)
+        if not isinstance(access_hash, int):
+            continue
+        username = getattr(entity, "username", None)
+        channels.append(
+            (
+                ChannelTarget(
+                    telegram_chat_id=chat_id,
+                    title=" ".join(str(getattr(entity, "title", "") or chat_id).split()),
+                    username=username.strip() if isinstance(username, str) and username.strip() else None,
+                ),
+                types.InputChannel(entity.id, access_hash),
+            )
+        )
+    channels.sort(key=lambda item: (item[0].title.casefold(), item[0].telegram_chat_id))
+    return channels, broadcast_dialogs
 
 
 async def _can_edit_messages(client: TelegramClient, channel: Any) -> bool:
@@ -344,16 +336,11 @@ async def _edit_with_flood_wait(client: TelegramClient, channel: Any, message: A
 
 
 async def run(args: argparse.Namespace) -> int:
-    mongo = MongoClient(_required_env("MONGODB_URI"), tz_aware=True)
-    database = mongo[os.environ.get("MONGODB_DB_NAME", "telegram_campaign_orchestrator")]
     api_id = int(_required_env("TELEGRAM_API_ID"))
     api_hash = _required_env("TELEGRAM_API_HASH")
     session = Path(args.session).expanduser().resolve()
     if not session.with_suffix(".session").exists() and not session.exists():
         raise SystemExit(f"No authorised session was found at {session} (or {session}.session). Run the QR helper first.")
-    targets = _targets(database, args.limit_channels)
-    if not targets:
-        raise SystemExit("No registered broadcast channels were found in Mongo.")
     pattern = _marker_pattern(args.old_handle)
     client = TelegramClient(
         str(session),
@@ -365,7 +352,18 @@ async def run(args: argparse.Namespace) -> int:
         entity_cache_limit=10_000,
     )
     audit: AuditWriter | None = None
-    counts = {"channels": 0, "unavailable": 0, "no_edit_right": 0, "messages_scanned": 0, "candidates": 0, "edited": 0, "failed": 0, "skipped_forwarded": 0}
+    counts = {
+        "channels": 0,
+        "account_broadcast_dialogs": 0,
+        "channels_selected": 0,
+        "no_edit_right": 0,
+        "messages_scanned": 0,
+        "candidates": 0,
+        "edited": 0,
+        "failed": 0,
+        "skipped_forwarded": 0,
+    }
+    candidate_limit_reached = False
     try:
         await client.start()
         identity = await client.get_me()
@@ -381,32 +379,38 @@ async def run(args: argparse.Namespace) -> int:
             new_handle=args.new_handle,
             scan=args.scan,
             apply=args.apply,
-            selected_channels=len(targets),
         )
         logger.info(
-            "Authenticated as @%s. %s registered channels selected; mode=%s%s.",
+            "Authenticated as @%s. Building targets from this account's Telegram channel directory; mode=%s%s.",
             identity.username or identity.id,
-            len(targets),
             args.scan,
             " APPLY" if args.apply else " DRY RUN",
         )
-        logger.info("Loading the account directory to seed channel access hashes; no messages are changed at this stage.")
-        await client.get_dialogs(limit=None)
+        logger.info("Loading this account's broadcast-channel directory first; no messages are changed at this stage.")
+        channel_pairs, broadcast_dialog_count = await _account_broadcast_channels(client)
+        if args.limit_channels is not None:
+            channel_pairs = channel_pairs[: args.limit_channels]
+        counts["account_broadcast_dialogs"] = broadcast_dialog_count
+        counts["channels_selected"] = len(channel_pairs)
+        audit.write(
+            "account_channel_directory",
+            account_broadcast_dialogs=broadcast_dialog_count,
+            usable_broadcast_channels=len(channel_pairs),
+        )
+        logger.info(
+            "This account has %s broadcast dialogs; %s are selected for this run.",
+            broadcast_dialog_count,
+            len(channel_pairs),
+        )
 
-        for index, target in enumerate(targets, start=1):
-            try:
-                channel = await _resolve_channel(client, target)
-            except (ChannelUnavailableError, errors.RPCError, ValueError) as error:
-                counts["unavailable"] += 1
-                audit.write("channel_unavailable", channel_id=target.telegram_chat_id, channel_title=target.title, reason=str(error)[:300])
-                continue
+        for index, (target, channel) in enumerate(channel_pairs, start=1):
             try:
                 if not await _can_edit_messages(client, channel):
                     counts["no_edit_right"] += 1
                     audit.write("channel_skipped_no_edit_right", channel_id=target.telegram_chat_id, channel_title=target.title)
                     continue
             except errors.RPCError as error:
-                counts["unavailable"] += 1
+                counts["failed"] += 1
                 audit.write(
                     "channel_permission_check_failed",
                     channel_id=target.telegram_chat_id,
@@ -431,12 +435,21 @@ async def run(args: argparse.Namespace) -> int:
                         continue
                     details = _message_details(target, message, rewrite)
                     counts["candidates"] += 1
+                    stop_after_this_candidate = bool(
+                        args.max_candidates is not None and counts["candidates"] >= args.max_candidates
+                    )
                     if getattr(message, "fwd_from", None):
                         counts["skipped_forwarded"] += 1
                         audit.write("candidate_skipped_forwarded", **details)
+                        if stop_after_this_candidate:
+                            candidate_limit_reached = True
+                            break
                         continue
                     if not args.apply:
                         audit.write("would_edit", **details)
+                        if stop_after_this_candidate:
+                            candidate_limit_reached = True
+                            break
                         continue
                     try:
                         await _edit_with_flood_wait(client, channel, message, rewrite)
@@ -447,11 +460,14 @@ async def run(args: argparse.Namespace) -> int:
                     except Exception as error:  # Telegram exposes many granular RPC error classes.
                         counts["failed"] += 1
                         audit.write("edit_failed", **details, error=f"{type(error).__name__}: {error}"[:500])
-                        logger.warning("Could not edit %s/%s message %s: %s", index, len(targets), message.id, type(error).__name__)
+                        logger.warning("Could not edit %s/%s message %s: %s", index, len(channel_pairs), message.id, type(error).__name__)
                     else:
                         counts["edited"] += 1
                         audit.write("edited", **details)
                     await asyncio.sleep(1 / args.edit_rps)
+                    if stop_after_this_candidate:
+                        candidate_limit_reached = True
+                        break
             except errors.FloodWaitError as error:
                 # Reading channel history can also be throttled.  Stop this
                 # channel cleanly, wait as Telegram asks, then move on; the
@@ -468,11 +484,15 @@ async def run(args: argparse.Namespace) -> int:
                     channel_title=target.title,
                     error=f"{type(error).__name__}: {error}"[:500],
                 )
-            if index % 25 == 0 or index == len(targets):
+            if candidate_limit_reached:
+                audit.write("candidate_limit_reached", max_candidates=args.max_candidates)
+                logger.info("Reached the requested %s matching-message limit.", args.max_candidates)
+                break
+            if index % 25 == 0 or index == len(channel_pairs):
                 logger.info(
                     "Progress %s/%s channels; %s candidate messages, %s edits, %s failures.",
                     index,
-                    len(targets),
+                    len(channel_pairs),
                     counts["candidates"],
                     counts["edited"],
                     counts["failed"],
@@ -486,7 +506,6 @@ async def run(args: argparse.Namespace) -> int:
         if audit:
             audit.close()
         await client.disconnect()
-        mongo.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -497,7 +516,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scan", choices=("search", "full"), default="search", help="Search is fast; full also finds old URLs inside inline buttons.")
     parser.add_argument("--history-limit", type=int, help="For --scan full, inspect at most N newest messages per channel (omit for all history).")
     parser.add_argument("--history-wait", type=float, default=1.0, help="Minimum delay Telethon uses between history/search pages (default: 1 second).")
-    parser.add_argument("--limit-channels", type=int, help="Pilot only the first N registered channels.")
+    parser.add_argument("--limit-channels", type=int, help="Pilot only the first N channels from this account's Telegram directory.")
+    parser.add_argument("--max-candidates", type=int, help="Stop after N matching messages; use this for a meaningful write pilot.")
     parser.add_argument("--audit-dir", default="work/handle-repair-audit", help="Local-only directory for JSONL audit files.")
     parser.add_argument("--edit-rps", type=float, default=0.8, help="Maximum actual edits per second (default: 0.8).")
     parser.add_argument("--apply", action="store_true", help="Perform edits. Omit for an audit-only dry run.")
@@ -507,6 +527,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--limit-channels must be at least 1")
     if args.history_limit is not None and args.history_limit < 1:
         parser.error("--history-limit must be at least 1")
+    if args.max_candidates is not None and args.max_candidates < 1:
+        parser.error("--max-candidates must be at least 1")
     if args.history_wait < 0.5:
         parser.error("--history-wait must be at least 0.5 seconds")
     if not 0 < args.edit_rps <= 2:
