@@ -47,9 +47,32 @@ account's channel directory, skips channels it cannot resolve or lacks the
    history pass for those accounts. This is deliberately slower because it
    reads every historical message; Telegram's pacing is respected.
 
-The shell that invokes the Docker command must have the private Telegram API
-credentials and Mongo connection value already exported. Do not paste them in
-the command history or source them from a tracked file.
+The convenience launcher prompts invisibly for the private Telegram API hash
+and Mongo connection value, passes them only to its short-lived container, and
+unsets them when it exits. It does not create an `.env` file. Start with:
+
+```bash
+cd /root/iharvester-handle-repair/repo
+
+# Run this once per account and scan the terminal QR in Telegram:
+# Settings > Devices > Link Desktop Device.
+bash scripts/authorize_owner_qr.sh account-1
+
+# Read-only pilot. It creates a JSONL audit on the VPS outside this repo.
+bash scripts/run_handle_repair_mtproto.sh account-1 -- --scan search --limit-channels 10
+```
+
+The matching apply pilot adds the deliberate confirmation pair:
+
+```bash
+bash scripts/run_handle_repair_mtproto.sh account-1 -- \
+  --scan search --limit-channels 10 --apply --confirm-new-handle i_BOX_TV
+```
+
+The launcher is preferable to constructing a Docker command by hand. The
+equivalent low-level command below is retained for advanced operators who
+already use exported values. Do not paste those values in command history or
+source them from a tracked file.
 
 ```bash
 cd /root/iharvester-handle-repair/repo
@@ -70,18 +93,13 @@ docker run --rm -it \
      --scan search --limit-channels 10'
 ```
 
-The matching apply pilot differs only by the deliberate confirmation pair:
-
-```bash
-    --apply --confirm-new-handle i_BOX_TV
-```
-
 After all three `search` passes finish, use this only if the audit identifies
 messages that contain the old URL solely in inline buttons (no searchable
 caption/text):
 
 ```bash
-    --scan full --history-wait 1 --apply --confirm-new-handle i_BOX_TV
+bash scripts/run_handle_repair_mtproto.sh account-1 -- \
+  --scan full --history-wait 1 --apply --confirm-new-handle i_BOX_TV
 ```
 
 `--scan full` has no history cap by default. For a test on very old, busy
