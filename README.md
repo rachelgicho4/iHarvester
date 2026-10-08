@@ -16,7 +16,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 ```env
 CLONE_TOKEN_ENCRYPTION_KEY=paste-the-generated-value
-CLONE_DATABASE_PREFIX=iharvester_clone
+CLONE_DATABASE_PREFIX=iharvester
 ```
 
 The key encrypts every clone bot token and webhook secret before they are stored in the main database. The clone data databases use the configured Mongo URI but have separate generated database names. This is strong application/data isolation while sharing the Atlas cluster; use a separate deployment/Atlas cluster only when you need infrastructure or billing isolation as well.

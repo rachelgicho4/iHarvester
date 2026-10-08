@@ -47,6 +47,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_ATLAS_DATABASE_NAME_MAX_BYTES = 38
+
 
 def _clone_id() -> str:
     return f"clone_{secrets.token_hex(8)}"
@@ -112,13 +114,38 @@ class CloneManager:
             }
         )
 
+    def _clone_database_name(self, clone_id: str) -> str:
+        # All generated IDs are ASCII.  Settings bounds the configured prefix
+        # to 15 characters, which leaves room for ``_<22-char clone id>``.
+        return f"{self.main_runtime.settings.clone_database_prefix}_{clone_id}"
+
+    async def _repair_overlong_database_name(self, clone: dict[str, Any]) -> dict[str, Any]:
+        """Repair the brief v1 clone-prefix bug before any child starts.
+
+        The original default produced a 39-byte Atlas database name. Such a
+        database cannot have been created, so changing its stored name cannot
+        lose existing creator data.  This also makes deployments self-heal the
+        one affected clone rather than requiring an operator database edit.
+        """
+        database_name = str(clone["mongodb_db_name"])
+        if len(database_name.encode("utf-8")) <= _ATLAS_DATABASE_NAME_MAX_BYTES:
+            return clone
+        clone_id = str(clone["clone_id"])
+        repaired_name = self._clone_database_name(clone_id)
+        await self.main_runtime.repositories.update_bot_clone(clone_id, mongodb_db_name=repaired_name)
+        logger.warning(
+            "Repaired overlong clone database name",
+            extra={"clone_id": clone_id, "database_name": repaired_name},
+        )
+        return {**clone, "mongodb_db_name": repaired_name}
+
     async def start_all(self) -> None:
         if not self.enabled:
             return
         for clone in await self.main_runtime.repositories.active_bot_clones():
             try:
-                await self.start_clone(clone)
-            except Exception:
+                await self._start_with_status(await self._repair_overlong_database_name(clone))
+            except ValueError:
                 logger.exception("Could not start clone", extra={"clone_id": clone.get("clone_id")})
 
     async def create_clone(self, *, label: str, token: str, creator_ids: frozenset[int]) -> dict[str, Any]:
@@ -141,12 +168,15 @@ class CloneManager:
         document: dict[str, Any] = {
             "clone_id": clone_id,
             "label": label,
-            "active": True,
+            # A clone only becomes active after every child-runtime startup
+            # check succeeds.  This avoids a bot that looks live but has no
+            # registered webhook or workers.
+            "active": False,
             "token_ciphertext": self._seal(token),
             "creator_user_ids": sorted(creator_ids),
             "bot_user_id": bot_user.id,
             "bot_username": bot_user.username,
-            "mongodb_db_name": f"{self.main_runtime.settings.clone_database_prefix}_{clone_id}",
+            "mongodb_db_name": self._clone_database_name(clone_id),
             "webhook_path_secret": _webhook_secret(clone_id),
             "webhook_secret_ciphertext": self._seal(secrets.token_urlsafe(32)),
             "created_at": datetime.now(UTC),
@@ -157,11 +187,11 @@ class CloneManager:
         except DuplicateKeyError as error:
             raise ValueError("that Telegram bot is already registered as a clone") from error
         try:
-            await self.start_clone(document)
-        except Exception:
-            await self.main_runtime.repositories.update_bot_clone(clone_id, active=False)
+            await self._start_with_status(document)
+        except ValueError:
             raise
-        return document
+        created = await self.main_runtime.repositories.get_bot_clone(clone_id)
+        return created or document
 
     async def create_clone_from_encrypted_token(
         self, *, label: str, token_ciphertext: str, creator_ids: frozenset[int]
@@ -170,12 +200,43 @@ class CloneManager:
         return await self.create_clone(label=label, token=self._open(token_ciphertext), creator_ids=creator_ids)
 
     async def start_clone(self, clone: dict[str, Any]) -> Runtime:
+        clone = await self._repair_overlong_database_name(clone)
         clone_id = str(clone["clone_id"])
         if clone_id in self._children:
             return self._children[clone_id]
         settings = self._clone_settings(clone)
         runtime = await _start_child_runtime(settings)
         self._children[clone_id] = runtime
+        return runtime
+
+    @staticmethod
+    def _safe_start_error(error: Exception) -> str:
+        """Keep an actionable but bounded operator diagnostic in MongoDB."""
+        detail = " ".join(str(error).split())
+        if not detail:
+            detail = "no additional detail was returned"
+        return f"{type(error).__name__}: {detail[:240]}"
+
+    async def _start_with_status(self, clone: dict[str, Any]) -> Runtime:
+        clone_id = str(clone["clone_id"])
+        try:
+            runtime = await self.start_clone(clone)
+        except Exception as error:
+            diagnostic = self._safe_start_error(error)
+            logger.exception("Clone runtime startup failed", extra={"clone_id": clone_id})
+            await self.main_runtime.repositories.update_bot_clone(
+                clone_id,
+                active=False,
+                last_start_error=diagnostic,
+                last_start_failed_at=datetime.now(UTC),
+            )
+            raise ValueError(f"clone startup failed: {diagnostic}") from error
+        await self.main_runtime.repositories.update_bot_clone(
+            clone_id,
+            active=True,
+            last_start_error=None,
+            last_started_at=datetime.now(UTC),
+        )
         return runtime
 
     async def stop_clone(self, clone_id: str, *, deactivate: bool = True) -> None:
@@ -187,14 +248,18 @@ class CloneManager:
                 logger.warning("Could not detach clone webhook", extra={"clone_id": clone_id})
             await _stop_child_runtime(runtime)
         if deactivate:
-            await self.main_runtime.repositories.update_bot_clone(clone_id, active=False)
+            await self.main_runtime.repositories.update_bot_clone(
+                clone_id,
+                active=False,
+                last_start_error=None,
+                last_paused_at=datetime.now(UTC),
+            )
 
     async def activate_clone(self, clone_id: str) -> None:
         clone = await self.main_runtime.repositories.get_bot_clone(clone_id)
         if not clone:
             raise ValueError("clone not found")
-        await self.main_runtime.repositories.update_bot_clone(clone_id, active=True)
-        await self.start_clone(clone)
+        await self._start_with_status(clone)
 
     async def set_creators(self, clone_id: str, creator_ids: frozenset[int]) -> None:
         clone = await self.main_runtime.repositories.get_bot_clone(clone_id)
@@ -202,11 +267,15 @@ class CloneManager:
             raise ValueError("clone not found")
         was_active = bool(clone.get("active"))
         await self.stop_clone(clone_id, deactivate=False)
-        await self.main_runtime.repositories.update_bot_clone(clone_id, creator_user_ids=sorted(creator_ids), active=was_active)
+        await self.main_runtime.repositories.update_bot_clone(
+            clone_id,
+            creator_user_ids=sorted(creator_ids),
+            active=False,
+        )
         if was_active:
             updated = await self.main_runtime.repositories.get_bot_clone(clone_id)
             if updated:
-                await self.start_clone(updated)
+                await self._start_with_status(updated)
 
     async def dispatch_webhook(self, path_secret: str, request_secret: str, payload: dict[str, Any]) -> bool:
         for runtime in self._children.values():
@@ -554,6 +623,8 @@ class CloneWorkspaceHandlers:
             f"Authorised creator IDs: {creators}\n\n"
             "This clone is isolated from the main bot and all other creator bots."
         )
+        if clone.get("last_start_error"):
+            text += f"\n\nLast startup issue:\n{clone['last_start_error']}"
         run_button = (
             InlineKeyboardButton(text="Pause clone", callback_data=f"clone:pause:{clone_id}")
             if clone.get("active")
@@ -723,7 +794,11 @@ class CloneWorkspaceHandlers:
                 else:
                     await self.manager.activate_clone(parts[2])
             except ValueError as error:
-                await query.message.answer(f"Could not update this clone: {error}")
+                await query.message.answer(
+                    f"Could not {action} this clone. It remains paused.\n\n{error}\n\n"
+                    "The detailed startup reason is now saved on the clone screen."
+                )
+                await self._show_detail(query.message, parts[2])
             else:
                 await self._show_detail(query.message, parts[2])
         elif action != "noop":
@@ -823,7 +898,7 @@ class CloneWorkspaceHandlers:
                 clone_id = str(state["clone_id"])
                 await self.manager.set_creators(clone_id, _owner_ids(value))
             except ValueError as error:
-                await message.answer(f"That creator list is not valid: {error}")
+                await message.answer(f"Could not update creator access: {error}")
                 return
             await self.repositories.clear_clone_setup_session(message.from_user.id)
             await message.answer("Authorised creators updated. The clone was safely refreshed.")

@@ -24,7 +24,9 @@ class Settings(BaseSettings):
     webhook_path_secret: str | None = None
     webhook_secret_token: str | None = None
     clone_token_encryption_key: str | None = None
-    clone_database_prefix: str = "iharvester_clone"
+    # Atlas accepts database names up to 38 bytes.  Clone IDs are 22 ASCII
+    # characters, so this deliberately stays short enough for ``prefix_id``.
+    clone_database_prefix: str = Field(default="iharvester", min_length=1, max_length=15)
     broadcast_send_rps: float = Field(default=20, gt=0)
     broadcast_global_api_rps: float = Field(default=25, gt=0)
     broadcast_workers: int = Field(default=20, ge=1, le=100)
@@ -51,6 +53,16 @@ class Settings(BaseSettings):
         if not ids or any(not item.lstrip("-").isdigit() for item in ids):
             raise ValueError("OWNER_USER_IDS must be one or more comma-separated numeric Telegram IDs")
         return ",".join(ids)
+
+    @field_validator("clone_database_prefix")
+    @classmethod
+    def valid_clone_database_prefix(cls, value: str) -> str:
+        value = value.strip()
+        if not value or not value.isascii() or not all(
+            character.isalnum() or character in "_-" for character in value
+        ):
+            raise ValueError("CLONE_DATABASE_PREFIX must use only ASCII letters, numbers, underscores, or hyphens")
+        return value
 
     @model_validator(mode="after")
     def validate_broadcast_limits(self) -> Settings:
