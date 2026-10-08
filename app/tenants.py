@@ -142,7 +142,13 @@ class CloneManager:
     async def start_all(self) -> None:
         if not self.enabled:
             return
-        for clone in await self.main_runtime.repositories.active_bot_clones():
+        # Deliberately paused clones stay paused.  A clone paused only because
+        # an earlier deployment hit a startup error is safe to retry after a
+        # new deployment fixes that error.
+        clones = await self.main_runtime.repositories.list_bot_clones()
+        for clone in clones:
+            if not clone.get("active") and not clone.get("last_start_error"):
+                continue
             try:
                 await self._start_with_status(await self._repair_overlong_database_name(clone))
             except ValueError:
