@@ -40,6 +40,11 @@ async def ensure_indexes(database: Database) -> None:
     await db.bot_clones.create_index("webhook_path_secret", unique=True)
     await db.bot_clones.create_index("bot_user_id", unique=True)
     await db.bot_clones.create_index([("active", 1), ("created_at", -1)])
+    # The main owner's guided clone-creation screen has its own state rather
+    # than sharing campaign setup state.  It expires quickly and encrypted
+    # bot tokens are never retained after confirmation or cancellation.
+    await db.clone_setup_sessions.create_index("owner_id", unique=True)
+    await db.clone_setup_sessions.create_index("expires_at", expireAfterSeconds=0)
     await db.owner_sessions.create_index("owner_id", unique=True)
     await db.owner_sessions.create_index("expires_at", expireAfterSeconds=0)
     await db.pending_restores.create_index("restore_id", unique=True)

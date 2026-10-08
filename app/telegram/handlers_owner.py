@@ -544,12 +544,14 @@ class OwnerHandlers:
         campaigns: CampaignService,
         sender: TelegramSender,
         public_base_url: str | None = None,
+        include_clone_manager: bool = False,
     ) -> None:
         self.owner_ids = owner_ids
         self.repositories = repositories
         self.campaigns = campaigns
         self.sender = sender
         self.public_base_url = public_base_url.rstrip("/") if public_base_url else None
+        self.include_clone_manager = include_clone_manager
         self.router = Router(name="owner")
         self.router.message.register(self.start, CommandStart())
         self.router.message.register(self.backup, Command("backup"))
@@ -563,6 +565,9 @@ class OwnerHandlers:
 
     def _allowed_inline(self, user_id: int | None) -> bool:
         return user_id in self.owner_ids
+
+    def _home_keyboard(self) -> InlineKeyboardMarkup:
+        return home_keyboard(include_clone_manager=self.include_clone_manager)
 
     @staticmethod
     def _date(value: Any, timezone: str = "UTC") -> str:
@@ -630,7 +635,7 @@ class OwnerHandlers:
             f"Active source channels: {channels.get('ACTIVE', 0)}\n"
             f"Need attention: {channels.get('NEEDS_ATTENTION', 0)}\n"
             f"Client requests: {request_count}",
-            home_keyboard(),
+            self._home_keyboard(),
         )
 
     async def _show_settings(self, message: Message) -> None:
@@ -1230,7 +1235,7 @@ class OwnerHandlers:
         await message.answer_document(
             BufferedInputFile(payload, filename="iharvester-core-backup.json.gz"),
             caption="Core backup: channels, campaign definitions, and settings.",
-            reply_markup=home_keyboard(),
+            reply_markup=self._home_keyboard(),
         )
 
     async def restore(self, message: Message) -> None:
@@ -1500,7 +1505,7 @@ class OwnerHandlers:
             page_size = 8
             rows = await self.repositories.list_campaigns(page_size, skip=page * page_size)
             if not rows:
-                await self._render(query.message, "No campaigns on this page.", home_keyboard())
+                await self._render(query.message, "No campaigns on this page.", self._home_keyboard())
                 return
             buttons: list[list[InlineKeyboardButton]] = []
             for row in rows:
@@ -1633,7 +1638,7 @@ class OwnerHandlers:
         if action == "reject":
             if not await self.repositories.resolve_client_promotion_request(request_id, query.from_user.id, status="REJECTED"):
                 raise ValueError("that request was already resolved")
-            await query.message.answer("Client request rejected.", reply_markup=home_keyboard())
+            await query.message.answer("Client request rejected.", reply_markup=self._home_keyboard())
             return
         if action != "approve":
             raise ValueError("that client request control is no longer valid")
@@ -2994,7 +2999,7 @@ class OwnerHandlers:
     async def _restore_confirm(self, query: CallbackQuery, restore_id: str, action: str) -> None:
         if action == "cancel":
             await self.repositories.delete_pending_restore(restore_id, query.from_user.id)
-            await query.message.answer("Restore cancelled.", reply_markup=home_keyboard())
+            await query.message.answer("Restore cancelled.", reply_markup=self._home_keyboard())
             return
         if action != "confirm":
             raise ValueError("that restore control is no longer valid")
@@ -3003,7 +3008,7 @@ class OwnerHandlers:
             raise ValueError("restore request expired")
         result = await restore_backup(self.repositories, pending["backup"])
         await self.repositories.delete_pending_restore(restore_id, query.from_user.id)
-        await query.message.answer(f"Restore complete: {result}", reply_markup=home_keyboard())
+        await query.message.answer(f"Restore complete: {result}", reply_markup=self._home_keyboard())
 
     async def message(self, message: Message, bot: Bot) -> None:
         if not self._allowed(message.from_user.id if message.from_user else None, message.chat.type):
@@ -3013,7 +3018,7 @@ class OwnerHandlers:
             if not await register_forwarded_channel(message, bot, self.repositories):
                 await message.answer(
                     "No setup step is waiting for this message. Use the controls below, or forward a channel post to register it.",
-                    reply_markup=home_keyboard(),
+                    reply_markup=self._home_keyboard(),
                 )
             return
         try:

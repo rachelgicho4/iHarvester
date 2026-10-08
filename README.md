@@ -21,17 +21,9 @@ CLONE_DATABASE_PREFIX=iharvester_clone
 
 The key encrypts every clone bot token and webhook secret before they are stored in the main database. The clone data databases use the configured Mongo URI but have separate generated database names. This is strong application/data isolation while sharing the Atlas cluster; use a separate deployment/Atlas cluster only when you need infrastructure or billing isolation as well.
 
-Only a main-bot owner can manage clones, through private-chat commands:
+Only a main-bot owner sees **Creator clones** in the primary bot's home screen. It opens a guided private-chat workspace to create a clone, name it, safely submit its BotFather token, authorise creator IDs, and confirm. The workspace also lists clones, allows access to be replaced, and provides pause/resume controls. It never appears in a child clone.
 
-```text
-/clones
-/cloneadd Creator name | 123456:bot-token | 123456789[,987654321]
-/cloneowners clone_id creator-id[,another-creator-id]
-/clonestop clone_id
-/clonestart clone_id
-```
-
-`/cloneadd` validates the token with Telegram, encrypts it, provisions the isolated database/runtime, and registers the clone's own webhook automatically. Do not paste a clone token anywhere except a private chat with the main bot. A stopped clone preserves all data but does not run workers or accept updates until started again.
+The token message is deleted immediately, then retained only as encrypted data while the setup is confirmed. Creation validates the token with Telegram, provisions the isolated database/runtime, and registers the clone's webhook automatically. A paused clone preserves all data but does not run workers or accept updates until resumed.
 
 It deliberately remains one Python service plus MongoDB: no Redis, Celery, dashboard, redirect tracker, user-account login, or separate worker deployment.
 

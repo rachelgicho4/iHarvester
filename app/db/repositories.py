@@ -1400,6 +1400,35 @@ class Repositories:
     async def clear_owner_session(self, owner_id: int) -> None:
         await self.db.owner_sessions.delete_one({"owner_id": owner_id})
 
+    async def set_clone_setup_session(self, owner_id: int, state: Document, *, ttl_minutes: int = 30) -> None:
+        """Persist the short guided clone-management flow independently.
+
+        It must not share ``owner_sessions`` with campaign setup: navigating
+        around either workspace should never orphan or overwrite the other.
+        """
+        now = utcnow()
+        await self.db.clone_setup_sessions.update_one(
+            {"owner_id": owner_id},
+            {
+                "$set": {
+                    "owner_id": owner_id,
+                    "state": state,
+                    "updated_at": now,
+                    "expires_at": now + timedelta(minutes=ttl_minutes),
+                }
+            },
+            upsert=True,
+        )
+
+    async def clone_setup_session(self, owner_id: int) -> Document | None:
+        document = await self.db.clone_setup_sessions.find_one(
+            {"owner_id": owner_id, "expires_at": {"$gt": utcnow()}}
+        )
+        return document.get("state") if document else None
+
+    async def clear_clone_setup_session(self, owner_id: int) -> None:
+        await self.db.clone_setup_sessions.delete_one({"owner_id": owner_id})
+
     async def create_bot_clone(self, document: Document) -> None:
         await self.db.bot_clones.insert_one(document)
 

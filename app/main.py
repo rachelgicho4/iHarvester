@@ -28,7 +28,7 @@ from app.telegram.handlers_join_events import JoinEventHandlers
 from app.telegram.handlers_owner import OwnerHandlers
 from app.telegram.raw_api import RawTelegramAPI
 from app.telegram.sender import TelegramSender
-from app.tenants import CloneAdminHandlers, CloneManager
+from app.tenants import CloneManager, CloneWorkspaceHandlers
 from app.utils.ids import opaque_id
 from app.web.routes import install_routes
 
@@ -78,7 +78,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # cannot create a clone from their clone.
         clone_manager = CloneManager(runtime)
         runtime.clone_manager = clone_manager
-        dispatcher.include_router(CloneAdminHandlers(clone_manager, settings.owner_ids).router)
+        dispatcher.include_router(CloneWorkspaceHandlers(clone_manager, settings.owner_ids).router)
         dispatcher.include_router(
             OwnerHandlers(
                 owner_ids=settings.owner_ids,
@@ -86,6 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 campaigns=service,
                 sender=sender,
                 public_base_url=settings.resolved_public_base_url,
+                include_clone_manager=True,
             ).router
         )
         app.state.runtime = runtime

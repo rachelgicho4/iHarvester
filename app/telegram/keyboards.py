@@ -40,12 +40,17 @@ def audience_markup(buttons: list[Button], layout: str = "AUTO") -> InlineKeyboa
     ] for row in auto_button_rows(buttons, layout)])
 
 
-def home_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def home_keyboard(*, include_clone_manager: bool = False) -> InlineKeyboardMarkup:
+    rows = [
         [InlineKeyboardButton(text="Create Campaign", callback_data="home:create"),
          InlineKeyboardButton(text="Campaigns", callback_data="home:campaigns")],
         [InlineKeyboardButton(text="Network", callback_data="home:network"),
          InlineKeyboardButton(text="Backups", callback_data="home:backups")],
         [InlineKeyboardButton(text="Client requests", callback_data="home:requests")],
         [InlineKeyboardButton(text="Settings", callback_data="home:settings")],
-    ])
+    ]
+    # This is deliberately opt-in.  Child creator bots use the same owner UI,
+    # but must never be able to reach the main bot's clone controls.
+    if include_clone_manager:
+        rows.insert(3, [InlineKeyboardButton(text="Creator clones", callback_data="clone:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
