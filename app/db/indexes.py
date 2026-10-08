@@ -33,6 +33,13 @@ async def ensure_indexes(database: Database) -> None:
     await db.join_events.create_index([("campaign_id", 1), ("destination_id", 1), ("joined_at_utc", 1)])
     await db.processed_updates.create_index("update_id", unique=True)
     await db.processed_updates.create_index("expires_at", expireAfterSeconds=0)
+    # Clone definitions live only in the main database. Each clone's campaign
+    # data is stored in its own database, so a creator can never see another
+    # creator's channels, campaigns, sessions, or update de-duplication data.
+    await db.bot_clones.create_index("clone_id", unique=True)
+    await db.bot_clones.create_index("webhook_path_secret", unique=True)
+    await db.bot_clones.create_index("bot_user_id", unique=True)
+    await db.bot_clones.create_index([("active", 1), ("created_at", -1)])
     await db.owner_sessions.create_index("owner_id", unique=True)
     await db.owner_sessions.create_index("expires_at", expireAfterSeconds=0)
     await db.pending_restores.create_index("restore_id", unique=True)

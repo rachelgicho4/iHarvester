@@ -28,6 +28,7 @@ from app.telegram.handlers_join_events import JoinEventHandlers
 from app.telegram.handlers_owner import OwnerHandlers
 from app.telegram.raw_api import RawTelegramAPI
 from app.telegram.sender import TelegramSender
+from app.tenants import CloneAdminHandlers, CloneManager
 from app.utils.ids import opaque_id
 from app.web.routes import install_routes
 
@@ -46,6 +47,7 @@ class Runtime:
     tasks: list[asyncio.Task[object]] = field(default_factory=list)
     bot_username: str | None = None
     ready: bool = False
+    clone_manager: CloneManager | None = None
 
 
 def configure_logging(level: str) -> None:
@@ -70,6 +72,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # This narrow public intake must be ahead of the owner router, whose
         # generic message handler intentionally owns all private owner chats.
         dispatcher.include_router(ClientRequestHandlers(repositories=repositories, owner_ids=settings.owner_ids).router)
+        runtime = Runtime(settings, database, repositories, bot, dispatcher, sender)
+        # Only the primary runtime mounts the clone manager. Child runtimes
+        # intentionally include the normal owner router only, so a creator
+        # cannot create a clone from their clone.
+        clone_manager = CloneManager(runtime)
+        runtime.clone_manager = clone_manager
+        dispatcher.include_router(CloneAdminHandlers(clone_manager, settings.owner_ids).router)
         dispatcher.include_router(
             OwnerHandlers(
                 owner_ids=settings.owner_ids,
@@ -79,7 +88,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 public_base_url=settings.resolved_public_base_url,
             ).router
         )
-        runtime = Runtime(settings, database, repositories, bot, dispatcher, sender)
         app.state.runtime = runtime
         stage = "MongoDB connection"
         try:
@@ -159,6 +167,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 runtime.tasks.append(asyncio.create_task(worker.run(runtime.stopping), name=f"delivery-{number}"))
             if settings.run_mode == "polling":
                 runtime.tasks.append(asyncio.create_task(dispatcher.start_polling(bot, allowed_updates=allowed_updates, handle_signals=False), name="polling"))
+            stage = "clone startup"
+            await clone_manager.start_all()
             runtime.ready = True
             yield
         except Exception:
@@ -171,6 +181,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 task.cancel()
             if runtime.tasks:
                 await asyncio.gather(*runtime.tasks, return_exceptions=True)
+            for clone_id in list(clone_manager._children):
+                await clone_manager.stop_clone(clone_id, deactivate=False)
             await raw_api.close()
             await bot.session.close()
             await database.close()

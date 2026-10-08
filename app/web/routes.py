@@ -154,9 +154,17 @@ def install_routes(app: object) -> None:
     async def telegram_webhook(path_secret: str, request: Request) -> Response:
         runtime = request.app.state.runtime
         settings = runtime.settings
-        if settings.run_mode != "webhook" or not hmac.compare_digest(path_secret, settings.webhook_path_secret or ""):
-            raise HTTPException(status_code=404, detail="not found")
         provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if settings.run_mode != "webhook":
+            raise HTTPException(status_code=404, detail="not found")
+        if not hmac.compare_digest(path_secret, settings.webhook_path_secret or ""):
+            manager = getattr(runtime, "clone_manager", None)
+            if not manager:
+                raise HTTPException(status_code=404, detail="not found")
+            accepted = await manager.dispatch_webhook(path_secret, provided, await request.json())
+            if not accepted:
+                raise HTTPException(status_code=404, detail="not found")
+            return Response(status_code=200)
         if not hmac.compare_digest(provided, settings.webhook_secret_token or ""):
             raise HTTPException(status_code=401, detail="invalid Telegram webhook secret")
         update = Update.model_validate(await request.json(), context={"bot": runtime.bot})

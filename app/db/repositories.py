@@ -1400,6 +1400,24 @@ class Repositories:
     async def clear_owner_session(self, owner_id: int) -> None:
         await self.db.owner_sessions.delete_one({"owner_id": owner_id})
 
+    async def create_bot_clone(self, document: Document) -> None:
+        await self.db.bot_clones.insert_one(document)
+
+    async def get_bot_clone(self, clone_id: str) -> Document | None:
+        return await self.db.bot_clones.find_one({"clone_id": clone_id})
+
+    async def list_bot_clones(self) -> list[Document]:
+        return await self.db.bot_clones.find({}).sort("created_at", -1).to_list(None)
+
+    async def active_bot_clones(self) -> list[Document]:
+        return await self.db.bot_clones.find({"active": True}).sort("created_at", 1).to_list(None)
+
+    async def update_bot_clone(self, clone_id: str, **fields: Any) -> None:
+        await self.db.bot_clones.update_one(
+            {"clone_id": clone_id},
+            {"$set": {**fields, "updated_at": utcnow()}},
+        )
+
     @staticmethod
     def _token_hash(token: str) -> str:
         return sha256(token.encode("utf-8")).hexdigest()

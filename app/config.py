@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     koyeb_public_domain: str | None = None
     webhook_path_secret: str | None = None
     webhook_secret_token: str | None = None
+    clone_token_encryption_key: str | None = None
+    clone_database_prefix: str = "iharvester_clone"
     broadcast_send_rps: float = Field(default=20, gt=0)
     broadcast_global_api_rps: float = Field(default=25, gt=0)
     broadcast_workers: int = Field(default=20, ge=1, le=100)

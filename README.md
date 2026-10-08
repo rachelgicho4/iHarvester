@@ -4,6 +4,35 @@ For an obsolete public handle in legacy channel posts, use the separate [audited
 
 iHarvester is a Telegram-native campaign orchestrator for an owner-operated network of channels. It registers channels when the bot becomes an administrator, stores durable state in MongoDB, and runs rate-limited, restart-safe campaign cycles with real Telegram buttons.
 
+## Creator clones
+
+The primary iHarvester bot can host creator-specific clones from the same deployment. A clone is not a copy of the main network: it has its own Telegram bot token, webhook path and secret, owner allow-list, MongoDB database, channel registry, campaigns, scheduler, delivery jobs, sessions, and backup settings. A creator can administer only their clone in channels where they add that clone as an administrator. Clones never expose clone-management commands, so they cannot create further clones.
+
+Before enabling clones, add one permanent Koyeb secret to the **main** deployment. Generate it locally once and keep it unchanged for the lifetime of existing clones:
+
+```powershell
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+```env
+CLONE_TOKEN_ENCRYPTION_KEY=paste-the-generated-value
+CLONE_DATABASE_PREFIX=iharvester_clone
+```
+
+The key encrypts every clone bot token and webhook secret before they are stored in the main database. The clone data databases use the configured Mongo URI but have separate generated database names. This is strong application/data isolation while sharing the Atlas cluster; use a separate deployment/Atlas cluster only when you need infrastructure or billing isolation as well.
+
+Only a main-bot owner can manage clones, through private-chat commands:
+
+```text
+/clones
+/cloneadd Creator name | 123456:bot-token | 123456789[,987654321]
+/cloneowners clone_id creator-id[,another-creator-id]
+/clonestop clone_id
+/clonestart clone_id
+```
+
+`/cloneadd` validates the token with Telegram, encrypts it, provisions the isolated database/runtime, and registers the clone's own webhook automatically. Do not paste a clone token anywhere except a private chat with the main bot. A stopped clone preserves all data but does not run workers or accept updates until started again.
+
 It deliberately remains one Python service plus MongoDB: no Redis, Celery, dashboard, redirect tracker, user-account login, or separate worker deployment.
 
 If a past campaign's cleanup is blocked by Telegram's Bot API 48-hour limit, use the workstation-only [MTProto recovery guide](docs/mtproto-recovery.md). It deletes only iHarvester's exact tracked message IDs after a small pilot succeeds.
