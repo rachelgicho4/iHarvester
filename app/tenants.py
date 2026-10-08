@@ -372,14 +372,13 @@ async def _start_child_runtime(settings: Settings) -> Runtime:
         )
         runtime.tasks.append(asyncio.create_task(refresh.run(runtime.stopping)))
         for number in range(settings.broadcast_workers):
-            worker = DeliveryWorker(
+            worker = _clone_delivery_worker(
                 worker_id=f"{instance_id}-{number}",
                 repositories=repositories,
                 sender=sender,
                 send_limiter=send_limiter,
                 mutation_limiter=mutation_limiter,
-                delivery_lease_seconds=settings.delivery_lease_seconds,
-                max_attempts=settings.max_transient_attempts,
+                settings=settings,
             )
             runtime.tasks.append(asyncio.create_task(worker.run(runtime.stopping)))
         runtime.ready = True
@@ -387,6 +386,27 @@ async def _start_child_runtime(settings: Settings) -> Runtime:
     except Exception:
         await _stop_child_runtime(runtime)
         raise
+
+
+def _clone_delivery_worker(
+    *,
+    worker_id: str,
+    repositories: Repositories,
+    sender: TelegramSender,
+    send_limiter: AsyncTokenBucket,
+    mutation_limiter: AsyncTokenBucket,
+    settings: Settings,
+) -> DeliveryWorker:
+    """Build a child worker using the same current constructor contract as main."""
+    return DeliveryWorker(
+        worker_id=worker_id,
+        repositories=repositories,
+        sender=sender,
+        send_limiter=send_limiter,
+        mutation_limiter=mutation_limiter,
+        delivery_lease_seconds=settings.delivery_lease_seconds,
+        max_transient_attempts=settings.max_transient_attempts,
+    )
 
 
 async def _stop_child_runtime(runtime: Runtime) -> None:

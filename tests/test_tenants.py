@@ -4,9 +4,10 @@ from types import SimpleNamespace
 import pytest
 from cryptography.fernet import Fernet
 
+from app import tenants
 from app.config import Settings
 from app.telegram.keyboards import home_keyboard
-from app.tenants import CloneManager, _owner_ids
+from app.tenants import CloneManager, _clone_delivery_worker, _owner_ids
 
 
 def test_clone_creator_ids_require_positive_numeric_telegram_ids() -> None:
@@ -77,3 +78,26 @@ def test_creator_clone_button_is_only_added_to_the_primary_home_keyboard() -> No
 
     assert "clone:home" in primary_controls
     assert "clone:home" not in clone_controls
+
+
+def test_clone_worker_uses_the_current_delivery_worker_constructor(monkeypatch: pytest.MonkeyPatch) -> None:
+    received: dict[str, object] = {}
+
+    class WorkerStub:
+        def __init__(self, **kwargs: object) -> None:
+            received.update(kwargs)
+
+    monkeypatch.setattr(tenants, "DeliveryWorker", WorkerStub)
+    settings = SimpleNamespace(delivery_lease_seconds=90, max_transient_attempts=3)
+
+    _clone_delivery_worker(
+        worker_id="clone-worker",
+        repositories=SimpleNamespace(),
+        sender=SimpleNamespace(),
+        send_limiter=SimpleNamespace(),
+        mutation_limiter=SimpleNamespace(),
+        settings=settings,
+    )
+
+    assert received["max_transient_attempts"] == 3
+    assert "max_attempts" not in received
