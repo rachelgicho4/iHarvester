@@ -35,6 +35,7 @@ except ImportError as error:  # pragma: no cover - exercised by the operator
 
 logger = logging.getLogger("iharvester.mtproto_handle_repair")
 HANDLE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+NEW_MARKER = "🆕"
 
 
 @dataclass(frozen=True)
@@ -59,10 +60,16 @@ class RewrittenMessage:
     text_changes: int
     entity_url_changes: int
     button_url_changes: int
+    marker_period_changes: int
 
     @property
     def changed(self) -> bool:
-        return bool(self.text_changes or self.entity_url_changes or self.button_url_changes)
+        return bool(
+            self.text_changes
+            or self.entity_url_changes
+            or self.button_url_changes
+            or self.marker_period_changes
+        )
 
 
 class AuditWriter:
@@ -134,6 +141,36 @@ def _replace_markers(value: str, pattern: re.Pattern[str], new_handle: str) -> t
     return "".join(pieces), replacements
 
 
+def _append_new_marker_period(value: str) -> tuple[str, list[TextReplacement]]:
+    """Make a minimal visible change after each unpunctuated ``🆕`` marker.
+
+    A small group of legacy channel posts appears to be re-synchronised by
+    their original posting workflow unless the user edit also changes visible
+    text.  Telegram retains the desired handle edit when the marker becomes
+    ``🆕.``.  The insertion is idempotent and deliberately leaves any marker
+    that already has a period alone.
+    """
+    replacements: list[TextReplacement] = []
+    cursor = 0
+    while True:
+        position = value.find(NEW_MARKER, cursor)
+        if position < 0:
+            break
+        insert_at = position + len(NEW_MARKER)
+        if not value.startswith(".", insert_at):
+            replacements.append(TextReplacement(insert_at, insert_at, "."))
+        cursor = insert_at
+    if not replacements:
+        return value, []
+    pieces: list[str] = []
+    cursor = 0
+    for replacement in replacements:
+        pieces.extend((value[cursor : replacement.start], replacement.replacement))
+        cursor = replacement.end
+    pieces.append(value[cursor:])
+    return "".join(pieces), replacements
+
+
 def _utf16_length(value: str) -> int:
     return len(value.encode("utf-16-le")) // 2
 
@@ -146,7 +183,7 @@ def _remap_entities(
     original_text: str,
     entities: Iterable[Any] | None,
     replacements: list[TextReplacement],
-    pattern: re.Pattern[str],
+    pattern: re.Pattern[str] | None,
     new_handle: str,
 ) -> tuple[list[Any], int]:
     """Adjust UTF-16 entity offsets after a replacement and repair text URLs.
@@ -168,6 +205,15 @@ def _remap_entities(
     def map_boundary(position: int, *, end: bool) -> int:
         delta = 0
         for start, finish, replacement_length in spans:
+            if start == finish:
+                # For an insertion, an entity ending at the insertion stays
+                # before it while one starting there moves after it.
+                if position < start:
+                    return position + delta
+                if position == start:
+                    return position + delta + (0 if end else replacement_length)
+                delta += replacement_length
+                continue
             # An entity touching the left boundary remains before the changed
             # handle; one touching the right boundary remains after it.
             if position <= start:
@@ -192,7 +238,7 @@ def _remap_entities(
             clone.offset = mapped_start
             clone.length = max(0, mapped_end - mapped_start)
         url = getattr(entity, "url", None)
-        if isinstance(url, str):
+        if isinstance(url, str) and pattern is not None:
             rewritten_url, url_replacements = _replace_markers(url, pattern, new_handle)
             if url_replacements:
                 clone.url = rewritten_url
@@ -218,7 +264,13 @@ def _rewrite_markup(markup: Any | None, pattern: re.Pattern[str], new_handle: st
     return rewritten, changed
 
 
-def _rewrite_message(message: Any, pattern: re.Pattern[str], new_handle: str) -> RewrittenMessage:
+def _rewrite_message(
+    message: Any,
+    pattern: re.Pattern[str],
+    new_handle: str,
+    *,
+    append_new_marker_period: bool = False,
+) -> RewrittenMessage:
     original_text = getattr(message, "raw_text", None)
     if not isinstance(original_text, str):
         original_text = getattr(message, "message", "") or ""
@@ -231,6 +283,20 @@ def _rewrite_message(message: Any, pattern: re.Pattern[str], new_handle: str) ->
         new_handle,
     )
     markup, button_url_changes = _rewrite_markup(getattr(message, "reply_markup", None), pattern, new_handle)
+    marker_period_changes = 0
+    # Only alter the marker on a post whose visible text contains the target
+    # handle (either newly replaced or already repaired).  This prevents a
+    # general punctuation sweep of unrelated ``🆕`` posts.
+    current_handle_pattern = _marker_pattern(new_handle)
+    if append_new_marker_period and current_handle_pattern.search(text):
+        intermediate_text = text
+        text, marker_replacements = _append_new_marker_period(intermediate_text)
+        if marker_replacements:
+            # Entity offsets above are based on the first rewrite. Apply the
+            # marker insertions to that intermediate text without touching
+            # URL entities a second time.
+            entities, _ = _remap_entities(intermediate_text, entities, marker_replacements, None, new_handle)
+            marker_period_changes = len(marker_replacements)
     return RewrittenMessage(
         text=text,
         entities=entities,
@@ -238,6 +304,7 @@ def _rewrite_message(message: Any, pattern: re.Pattern[str], new_handle: str) ->
         text_changes=len(replacements),
         entity_url_changes=entity_url_changes,
         button_url_changes=button_url_changes,
+        marker_period_changes=marker_period_changes,
     )
 
 
@@ -287,8 +354,12 @@ async def _can_edit_messages(client: TelegramClient, channel: Any) -> bool:
 
 async def _candidate_messages(client: TelegramClient, channel: Any, args: argparse.Namespace):
     if args.scan == "search":
-        async for message in client.iter_messages(channel, search=args.old_handle, limit=None, wait_time=args.history_wait):
-            yield message
+        search_terms = [args.old_handle]
+        if args.append_new_marker_period and args.new_handle != args.old_handle:
+            search_terms.append(args.new_handle)
+        for search_term in search_terms:
+            async for message in client.iter_messages(channel, search=search_term, limit=None, wait_time=args.history_wait):
+                yield message
         return
     limit = args.history_limit or None
     async for message in client.iter_messages(channel, limit=limit, wait_time=args.history_wait):
@@ -306,6 +377,7 @@ def _message_details(target: ChannelTarget, message: Any, rewrite: RewrittenMess
         "text_replacements": rewrite.text_changes,
         "text_link_url_replacements": rewrite.entity_url_changes,
         "button_url_replacements": rewrite.button_url_changes,
+        "new_marker_period_insertions": rewrite.marker_period_changes,
     }
 
 
@@ -378,6 +450,7 @@ async def run(args: argparse.Namespace) -> int:
             old_handle=args.old_handle,
             new_handle=args.new_handle,
             scan=args.scan,
+            append_new_marker_period=args.append_new_marker_period,
             apply=args.apply,
         )
         logger.info(
@@ -430,7 +503,12 @@ async def run(args: argparse.Namespace) -> int:
                         continue
                     seen_ids.add(message.id)
                     counts["messages_scanned"] += 1
-                    rewrite = _rewrite_message(message, pattern, args.new_handle)
+                    rewrite = _rewrite_message(
+                        message,
+                        pattern,
+                        args.new_handle,
+                        append_new_marker_period=args.append_new_marker_period,
+                    )
                     if not rewrite.changed:
                         continue
                     details = _message_details(target, message, rewrite)
@@ -520,6 +598,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-candidates", type=int, help="Stop after N matching messages; use this for a meaningful write pilot.")
     parser.add_argument("--audit-dir", default="work/handle-repair-audit", help="Local-only directory for JSONL audit files.")
     parser.add_argument("--edit-rps", type=float, default=0.8, help="Maximum actual edits per second (default: 0.8).")
+    parser.add_argument(
+        "--append-new-marker-period",
+        action="store_true",
+        help="For matching handle posts, change an unpunctuated 🆕 marker to 🆕. so Telegram retains the edit.",
+    )
     parser.add_argument("--apply", action="store_true", help="Perform edits. Omit for an audit-only dry run.")
     parser.add_argument("--confirm-new-handle", help="Required with --apply; must exactly equal --new-handle.")
     args = parser.parse_args()

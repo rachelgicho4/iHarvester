@@ -19,6 +19,10 @@ The current target is the exact replacement:
 - Existing text-link URLs and URL buttons pointing to the old handle.
 - It preserves the saved text entities (formatting, links, spoilers, emoji)
   and the complete inline keyboard while replacing only matching URL values.
+- For legacy promo posts that revert after a handle-only edit, the optional
+  `--append-new-marker-period` mode changes a visible `🆕` marker to `🆕.`
+  while applying the handle repair. It also finds posts already changed to
+  `i_BOX_TV` but still missing that full stop. The change is idempotent.
 - It writes an append-only JSONL audit for every candidate, skip, successful
   edit, and Telegram error. The audit records metadata and counts, not post
   body text.
@@ -73,6 +77,16 @@ The matching apply pilot adds the deliberate confirmation pair:
 ```bash
 bash scripts/run_handle_repair_mtproto.sh account-1 -- \
   --scan search --max-candidates 10 --apply --confirm-new-handle i_BOX_TV
+```
+
+For the known reverting promo-post format, make a second pass with the
+visible marker adjustment. Start with the same small pilot, verify it in
+Telegram, then remove `--max-candidates 10` for the complete account pass:
+
+```bash
+bash scripts/run_handle_repair_mtproto.sh account-1 -- \
+  --scan search --max-candidates 10 --append-new-marker-period \
+  --apply --confirm-new-handle i_BOX_TV
 ```
 
 The launcher is preferable to constructing a Docker command by hand. The
