@@ -284,11 +284,11 @@ def _rewrite_message(
     )
     markup, button_url_changes = _rewrite_markup(getattr(message, "reply_markup", None), pattern, new_handle)
     marker_period_changes = 0
-    # Only alter the marker on a post whose visible text contains the target
-    # handle (either newly replaced or already repaired).  This prevents a
-    # general punctuation sweep of unrelated ``🆕`` posts.
-    current_handle_pattern = _marker_pattern(new_handle)
-    if append_new_marker_period and current_handle_pattern.search(text):
+    # The visible punctuation is the deliberate second part of a legacy
+    # handle repair, not a general clean-up. Add it only when this very edit
+    # replaced an obsolete handle in visible text. Already-correct posts must
+    # stay completely untouched.
+    if append_new_marker_period and replacements:
         intermediate_text = text
         text, marker_replacements = _append_new_marker_period(intermediate_text)
         if marker_replacements:
@@ -354,10 +354,7 @@ async def _can_edit_messages(client: TelegramClient, channel: Any) -> bool:
 
 async def _candidate_messages(client: TelegramClient, channel: Any, args: argparse.Namespace):
     if args.scan == "search":
-        search_terms = [args.old_handle]
-        if args.append_new_marker_period and args.new_handle != args.old_handle:
-            search_terms.append(args.new_handle)
-        for search_term in search_terms:
+        for search_term in (args.old_handle,):
             async for message in client.iter_messages(channel, search=search_term, limit=None, wait_time=args.history_wait):
                 yield message
         return

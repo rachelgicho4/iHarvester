@@ -45,7 +45,7 @@ def test_marker_pass_repairs_old_handle_and_adds_a_visible_period(repair_module)
     assert rewrite.marker_period_changes == 1
 
 
-def test_marker_pass_repairs_already_renamed_posts_once_and_preserves_entities(repair_module) -> None:
+def test_marker_pass_leaves_already_renamed_posts_and_entities_untouched(repair_module) -> None:
     text = "JOIN https://t.me/i_BOX_TV 🆕 next"
     next_offset = len("JOIN https://t.me/i_BOX_TV 🆕 ".encode("utf-16-le")) // 2
     entity = SimpleNamespace(offset=next_offset, length=4, url=None)
@@ -58,19 +58,10 @@ def test_marker_pass_repairs_already_renamed_posts_once_and_preserves_entities(r
         append_new_marker_period=True,
     )
 
-    assert rewrite.text == "JOIN https://t.me/i_BOX_TV 🆕. next"
+    assert rewrite.text == text
     assert rewrite.text_changes == 0
-    assert rewrite.marker_period_changes == 1
-    assert rewrite.entities[0].offset == next_offset + 1
-
-    second_message = SimpleNamespace(raw_text=rewrite.text, entities=rewrite.entities, reply_markup=None)
-    second = repair_module._rewrite_message(
-        second_message,
-        repair_module._marker_pattern("i_BOXTV"),
-        "i_BOX_TV",
-        append_new_marker_period=True,
-    )
-    assert not second.changed
+    assert rewrite.marker_period_changes == 0
+    assert rewrite.entities[0].offset == next_offset
 
 
 def test_marker_pass_does_not_punctuate_unrelated_new_markers(repair_module) -> None:
