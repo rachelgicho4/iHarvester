@@ -78,4 +78,4 @@ def test_marker_pass_does_not_punctuate_unrelated_new_markers(repair_module) -> 
 
 
 def test_handle_search_terms_include_underscore_token_forms(repair_module) -> None:
-    assert repair_module._search_terms_for_handle("i_BOXTV") == ("i_BOXTV", "iBOXTV", "BOXTV")
+    assert repair_module._search_terms_for_handle("i_BOXTV") == ("BOXTV", "i_BOXTV", "iBOXTV")

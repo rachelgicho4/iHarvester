@@ -364,7 +364,10 @@ def _search_terms_for_handle(old_handle: str) -> tuple[str, ...]:
     condensed = old_handle.replace("_", "")
     core = condensed.removeprefix("i")
     unique: list[str] = []
-    for term in (old_handle, condensed, core):
+    # Try the token Telegram is most likely to index first. It catches the
+    # common ``t.me/i_BOXTV`` form without first spending a full account pass
+    # on the literal spelling that Telegram commonly ignores.
+    for term in (core, old_handle, condensed):
         if term and term not in unique:
             unique.append(term)
     return tuple(unique)
