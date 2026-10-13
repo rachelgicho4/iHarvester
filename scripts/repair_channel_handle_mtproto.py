@@ -352,9 +352,27 @@ async def _can_edit_messages(client: TelegramClient, channel: Any) -> bool:
     )
 
 
+def _search_terms_for_handle(old_handle: str) -> tuple[str, ...]:
+    """Return safe server-search terms for an exact handle replacement.
+
+    Telegram tokenises underscores in message search.  A visible
+    ``i_BOXTV`` link can therefore be absent from a search for its literal
+    spelling even though the post is editable.  The broader terms only find
+    candidates to inspect; :func:`_rewrite_message` still requires the exact
+    old handle before any audit entry or write is made.
+    """
+    condensed = old_handle.replace("_", "")
+    core = condensed.removeprefix("i")
+    unique: list[str] = []
+    for term in (old_handle, condensed, core):
+        if term and term not in unique:
+            unique.append(term)
+    return tuple(unique)
+
+
 async def _candidate_messages(client: TelegramClient, channel: Any, args: argparse.Namespace):
     if args.scan == "search":
-        for search_term in (args.old_handle,):
+        for search_term in _search_terms_for_handle(args.old_handle):
             async for message in client.iter_messages(channel, search=search_term, limit=None, wait_time=args.history_wait):
                 yield message
         return

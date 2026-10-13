@@ -48,7 +48,9 @@ membership from MongoDB.
    `scripts/authorize_owner_qr.sh account-1` helper. Sessions stay under the
    VPS operator's local `iharvester-recovery/session` directory.
 2. Run a read-only pilot that stops after 10 matching posts with `--scan
-   search --max-candidates 10`.
+   search --max-candidates 10`. The search includes Telegram's
+   underscore-token forms (such as `BOXTV`) but it is still a fast discovery
+   aid, not a complete archive index.
 3. Inspect the JSONL audit. The `would_edit` records must only identify old
    `i_BOXTV` references.
 4. Apply that 10-channel pilot and verify the posts in Telegram.
