@@ -689,8 +689,9 @@ class OwnerHandlers:
         snapshot = campaign.get("target_snapshot", [])
         protected_ids = {item["telegram_chat_id"] for item in destinations if item.get("telegram_chat_id") is not None}
         status = campaign["status"]
-        # A launched campaign's audience is immutable history.  Only drafts
-        # should be evaluated against the network as it exists today.
+        # Drafts show the network as it exists today. Running campaigns keep a
+        # durable target list which grows at the next repost when newly
+        # registered channels match the saved selector.
         planned_count = (
             await self.repositories.active_channel_count(selector, exclude_ids=protected_ids)
             if status == CampaignStatus.DRAFT.value
@@ -818,7 +819,10 @@ class OwnerHandlers:
             if campaign["status"] == CampaignStatus.ACTIVE.value
             else campaign["status"].lower()
         )
-        target_text = f"{len(snapshot)} frozen source channels"
+        joined_after_launch = int(campaign.get("target_joined_after_launch_count", 0))
+        target_text = f"{len(snapshot)} campaign source channels"
+        if joined_after_launch:
+            target_text += f" ({joined_after_launch} added after launch)"
         report_heading = "Final results" if status == CampaignStatus.ARCHIVED.value else "Live progress"
         offsets = campaign.get("repost_offsets_seconds")
         interval = campaign.get("repost_interval_seconds")

@@ -12,7 +12,7 @@ from typing import Any
 
 from app.campaigns.models import CampaignMode, CampaignStatus, Creative, Destination, Schedule
 from app.campaigns.scheduling import can_create_cycle, fit_rotation_schedule, scheduled_cycle_count, scheduled_cycle_time
-from app.campaigns.shuffle import cohort_map, dispatch_rank, variant_for
+from app.campaigns.shuffle import cohort_map, dispatch_rank, extend_cohort_map, variant_for
 from app.campaigns.validation import SAFE_DELETE_WINDOW, protected_destination_ids, validate_launch
 from app.db.repositories import Document, Repositories
 from app.utils.ids import opaque_id
@@ -43,6 +43,9 @@ class CampaignService:
             "variants": [],
             "destinations": [],
             "target_selector": {},
+            # This is the campaign's durable target list.  It begins with the
+            # launch snapshot and eligible channels discovered later join at a
+            # future repost; already-materialized cycles never change.
             "target_snapshot": [],
             "protected_destination_ids": [],
             "cohort_map": {},
@@ -183,6 +186,8 @@ class CampaignService:
         update = {
             "status": status.value,
             "target_snapshot": target_snapshot,
+            "target_initial_count": len(target_snapshot),
+            "target_joined_after_launch_count": 0,
             "protected_destination_ids": sorted(protected),
             "cohort_map": {str(channel_id): cohort for channel_id, cohort in cohorts.items()},
             "cohort_seed": base64.urlsafe_b64encode(cohort_seed).decode(),
@@ -381,6 +386,7 @@ class CampaignService:
             return False
         if safety_refresh:
             expected = now
+        campaign = await self._add_new_eligible_targets(campaign, now)
         seed = base64.urlsafe_b64decode(campaign["shuffle_seed"])
         variant_count = len(campaign["variants"])
         deliveries: list[Document] = []
@@ -488,6 +494,70 @@ class CampaignService:
                 },
             )
         return True
+
+    async def _add_new_eligible_targets(self, campaign: Document, now: Any) -> Document:
+        """Add channels registered after launch to the cycle about to be planned.
+
+        Deliveries are created per cycle, so doing this immediately before
+        materialisation makes the change take effect at the next repost while
+        leaving an already queued or currently sending cycle untouched. Only
+        channels whose admin registration happened after launch are added;
+        this preserves deliberately excluded existing channels. A campaign's
+        promoted destinations remain excluded even if they are also active
+        source channels.
+        """
+        current_targets = {int(channel_id) for channel_id in campaign.get("target_snapshot", [])}
+        protected = {int(channel_id) for channel_id in campaign.get("protected_destination_ids", [])}
+        active = await self.repositories.active_channels(campaign.get("target_selector"))
+        activated_at = campaign.get("activated_at") or campaign.get("start_at_utc")
+        joined_after_launch = {
+            int(channel["telegram_chat_id"])
+            for channel in active
+            if (registered_at := channel.get("last_admin_update_at") or channel.get("registered_at"))
+            and activated_at
+            and as_utc(registered_at) > as_utc(activated_at)
+        }
+        eligible = joined_after_launch - protected
+        additions = eligible - current_targets
+        if not additions:
+            return campaign
+
+        variant_count = max(1, len(campaign.get("variants", [])))
+        encoded_seed = campaign.get("cohort_seed")
+        if encoded_seed:
+            cohort_seed = base64.urlsafe_b64decode(encoded_seed)
+        else:
+            # Compatibility for pre-cohort records.  Persist a seed now, so
+            # subsequent join batches remain deterministic too.
+            cohort_seed = secrets.token_bytes(32)
+            campaign["cohort_seed"] = base64.urlsafe_b64encode(cohort_seed).decode()
+        existing_cohorts = campaign.get("cohort_map", {})
+        if not existing_cohorts:
+            existing_cohorts = {str(channel_id): cohort for channel_id, cohort in cohort_map(current_targets, variant_count, cohort_seed).items()}
+        mapped_targets = {int(channel_id) for channel_id in existing_cohorts}
+        # Older campaigns should already have a complete map, but fill any
+        # missing legacy entries before adding a new channel batch so one bad
+        # record cannot break an otherwise healthy repost.
+        cohorts = extend_cohort_map(existing_cohorts, additions | (current_targets - mapped_targets), variant_count, cohort_seed)
+        updated_snapshot = sorted(current_targets | additions)
+        update = {
+            "target_snapshot": updated_snapshot,
+            "cohort_map": {str(channel_id): cohort for channel_id, cohort in cohorts.items()},
+            "cohort_seed": base64.urlsafe_b64encode(cohort_seed).decode(),
+            "target_joined_after_launch_count": int(campaign.get("target_joined_after_launch_count", 0)) + len(additions),
+            "target_last_joined_at": now,
+            "updated_at": now,
+        }
+        if not await self.repositories.advance_running_campaign(campaign["campaign_id"], update):
+            # A concurrent pause/end won the race.  Do not create a cycle
+            # from stale state; the scheduler will re-read its true state.
+            raise ValueError("campaign changed while adding newly registered channels")
+        campaign.update(update)
+        logger.info(
+            "Added newly registered channels to the upcoming campaign cycle",
+            extra={"campaign_id": campaign["campaign_id"], "new_targets": len(additions), "target_count": len(updated_snapshot)},
+        )
+        return campaign
 
     async def _cleanup_safety_refresh_due(self, campaign: Document, now: Any, end: Any) -> bool:
         """Return whether an ageing live post needs an early replacement.

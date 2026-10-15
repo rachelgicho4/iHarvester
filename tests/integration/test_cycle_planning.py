@@ -175,6 +175,60 @@ async def test_2000_channel_cycle_is_bounded_excludes_destination_and_changes_or
 
 
 @pytest.mark.asyncio
+async def test_newly_registered_channels_join_the_next_repost_without_changing_current_cycle() -> None:
+    now = datetime.now(UTC)
+    target_ids = [-1001, -1002]
+    destination_id = -1003
+    new_channel_id = -1004
+    seed = b"x" * 32
+    cohort_seed = b"c" * 32
+    initial_cohorts = cohort_map(target_ids, 2, cohort_seed)
+    campaign = {
+        "campaign_id": "cmp_new_channels",
+        "status": "ACTIVE",
+        "mode": "MIX_ROTATE",
+        "start_at_utc": now - timedelta(seconds=1),
+        "current_end_at_utc": now + timedelta(hours=3),
+        "repost_interval_seconds": 3600,
+        "target_selector": {},
+        "target_snapshot": target_ids,
+        "protected_destination_ids": [destination_id],
+        "cohort_map": {str(key): value for key, value in initial_cohorts.items()},
+        "cohort_seed": base64.urlsafe_b64encode(cohort_seed).decode(),
+        "shuffle_seed": base64.urlsafe_b64encode(seed).decode(),
+        "variants": [{"id": "one"}, {"id": "two"}],
+        "variant_current_revisions": {"one": 1, "two": 1},
+        "next_cycle_number": 0,
+    }
+    campaign["activated_at"] = now - timedelta(seconds=1)
+    repositories = MemoryRepositories(
+        campaign,
+        [
+            {"telegram_chat_id": channel_id, "last_admin_update_at": now - timedelta(minutes=1)}
+            for channel_id in [*target_ids, destination_id]
+        ],
+    )
+    service = CampaignService(repositories, send_rps=20)
+
+    assert await service.plan_due_cycle(campaign, now)
+    assert {item["channel_id"] for item in repositories.deliveries} == set(target_ids)
+
+    # The bot is admined after launch.  It is eligible for the saved selector,
+    # but cannot change the already created cycle zero.
+    repositories.sources.append({"telegram_chat_id": new_channel_id, "last_admin_update_at": now + timedelta(minutes=1)})
+    assert await service.plan_due_cycle(campaign, now + timedelta(hours=1, seconds=1))
+
+    second_cycle = [item for item in repositories.deliveries if item["cycle_number"] == 1]
+    assert {item["channel_id"] for item in second_cycle} == {*target_ids, new_channel_id}
+    assert destination_id not in {item["channel_id"] for item in second_cycle}
+    assert set(campaign["target_snapshot"]) == {*target_ids, new_channel_id}
+    assert campaign["target_joined_after_launch_count"] == 1
+    assert campaign["cohort_map"]["-1001"] == initial_cohorts[-1001]
+    assert campaign["cohort_map"]["-1002"] == initial_cohorts[-1002]
+    assert campaign["cohort_map"][str(new_channel_id)] in {0, 1}
+
+
+@pytest.mark.asyncio
 async def test_campaign_never_queues_a_second_cycle_while_send_work_is_open() -> None:
     now = datetime.now(UTC)
     campaign = {
