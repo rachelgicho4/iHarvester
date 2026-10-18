@@ -6,8 +6,8 @@ already-authorised human Telegram sessions only to read the exact live post IDs
 from MongoDB.  ``messages.getMessagesViews`` is always called with
 ``increment=False``: sampling does not create an extra view or alter a post.
 
-The script stores just one view total on each existing delivery and a compact
-roll-up on each campaign.  It deliberately creates no time-series collection,
+The script stores just one view total on each existing live-placement state and
+a compact roll-up on each campaign.  It deliberately creates no time-series collection,
 so repeated samples cannot cause another MongoDB growth problem.
 """
 
@@ -178,16 +178,14 @@ def _targets(database: Any, campaign_id: str | None, limit: int | None) -> list[
 
 
 def _update_campaign_rollup(database: Any, campaign_id: str, now: datetime) -> dict[str, Any]:
-    """Persist a bounded aggregate that survives delivery-history archival."""
+    """Persist a bounded aggregate without depending on pruned delivery history."""
     rows = list(
-        database.deliveries.find(
+        database.campaign_channel_state.find(
             {
                 "campaign_id": campaign_id,
-                "operation": {"$ne": "CLEANUP"},
-                "status": "SENT",
                 "view_count": {"$type": "number"},
             },
-            {"view_count": 1, "view_observed_at": 1, "sent_at": 1},
+            {"view_count": 1, "view_observed_at": 1, "view_first_observed_at": 1, "posted_at": 1},
         )
     )
     total_views = sum(max(0, int(row.get("view_count") or 0)) for row in rows)
@@ -196,7 +194,7 @@ def _update_campaign_rollup(database: Any, campaign_id: str, now: datetime) -> d
     placement_hours = 0.0
     hourly_samples = 0
     for row in rows:
-        sent_at = _as_utc(row.get("sent_at"))
+        sent_at = _as_utc(row.get("posted_at"))
         observed_at = _as_utc(row.get("view_observed_at"))
         if not sent_at or not observed_at:
             continue
@@ -292,23 +290,25 @@ async def run(args: argparse.Namespace) -> int:
                         raise RuntimeError("Telegram returned no view counter for the exact message")
                     views = max(0, int(getattr(counters[0], "views", 0) or 0))
                     now = datetime.now(UTC)
-                    database.deliveries.update_one(
+                    persisted = database.campaign_channel_state.update_one(
                         {
                             "campaign_id": target["campaign_id"],
-                            "cycle_number": target["current_cycle_number"],
+                            "current_cycle_number": target["current_cycle_number"],
                             "channel_id": target["channel_id"],
-                            "operation": {"$ne": "CLEANUP"},
-                            "status": "SENT",
+                            "current_message_ids": target["message_id"],
                         },
                         {
                             "$set": {
                                 "view_count": views,
                                 "view_observed_at": now,
                                 "view_tracker_session": client_index + 1,
-                                "updated_at": now,
-                            }
+                            },
+                            "$min": {"view_first_observed_at": now},
                         },
                     )
+                    if not persisted.matched_count:
+                        logger.info("Live post changed before its view count could be stored")
+                        break
                     changed_campaigns.add(target["campaign_id"])
                     sampled += 1
                     success = True

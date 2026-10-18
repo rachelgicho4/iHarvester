@@ -642,6 +642,7 @@ class Repositories:
         return await self.db.campaign_channel_state.find_one({"campaign_id": campaign_id, "channel_id": channel_id})
 
     async def save_live_state(self, campaign_id: str, channel_id: int, cycle_number: int, variant_index: int, message_ids: list[int]) -> None:
+        posted_at = utcnow()
         await self.db.campaign_channel_state.update_one(
             {"campaign_id": campaign_id, "channel_id": channel_id},
             {
@@ -649,7 +650,11 @@ class Repositories:
                     "current_message_ids": message_ids,
                     "current_cycle_number": cycle_number,
                     "current_variant_index": variant_index,
-                    "updated_at": utcnow(),
+                    # Kept on the existing bounded live-state record so the
+                    # optional view sampler can calculate an honest view rate
+                    # without retaining a second delivery analytics history.
+                    "posted_at": posted_at,
+                    "updated_at": posted_at,
                 }
             },
             upsert=True,

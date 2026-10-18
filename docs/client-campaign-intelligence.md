@@ -9,7 +9,7 @@ iHarvester has two web experiences:
 
 `Subscriber memberships` is the sum of the latest known subscriber count for every selected placement. One person may follow more than one channel, so it is not an audience total, unique-person reach figure, or outcome forecast.
 
-`Views` comes only from Telegram's actual post-view counters. The tracker stores the latest counter on the existing delivery record and one compact total on the campaign. It does not create a per-minute analytics collection, retain message content, or estimate views without a sample.
+`Views` comes only from Telegram's actual post-view counters. The tracker stores the latest counter on the existing live-placement record and one compact total on the campaign. It does not create a per-minute analytics collection, retain message content, or estimate views without a sample.
 
 The time-of-day planner groups prior campaigns by the start hour selected in the campaign's owner timezone. It uses the measured post views per placement-hour and shows the number of campaign samples behind each number. A time without sufficient samples stays unscored rather than being assigned a made-up forecast.
 
