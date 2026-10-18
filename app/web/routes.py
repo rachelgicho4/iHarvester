@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 from datetime import UTC, datetime
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 from pymongo.errors import PyMongoError
 
 from app.web.client_portal import campaign_progress_payload, render_client_portal
+from app.web.media_kit import media_kit_payload, render_media_kit
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +48,39 @@ async def _client_portal_payload(runtime: object, token: str) -> tuple[object, d
     campaign = await runtime.repositories.get_campaign(share["campaign_id"])
     if not campaign:
         raise HTTPException(status_code=404, detail="This campaign is no longer available.")
-    totals = await runtime.repositories.campaign_delivery_totals(campaign["campaign_id"])
-    cycle_stats = await runtime.repositories.campaign_cycle_stats(campaign["campaign_id"])
-    metrics = await runtime.repositories.campaign_delivery_metrics(campaign["campaign_id"])
-    live_posts = await runtime.repositories.campaign_live_state_count(campaign["campaign_id"])
-    joined = await runtime.repositories.campaign_join_count(campaign["campaign_id"])
-    return share, campaign_progress_payload(campaign, totals, cycle_stats, metrics, live_posts=live_posts, joined=joined)
+    totals, cycle_stats, metrics, live_posts, joined, audience, views, benchmarks, public_placements = await asyncio.gather(
+        runtime.repositories.campaign_delivery_totals(campaign["campaign_id"]),
+        runtime.repositories.campaign_cycle_stats(campaign["campaign_id"]),
+        runtime.repositories.campaign_delivery_metrics(campaign["campaign_id"]),
+        runtime.repositories.campaign_live_state_count(campaign["campaign_id"]),
+        runtime.repositories.campaign_join_count(campaign["campaign_id"]),
+        runtime.repositories.campaign_audience_summary(campaign),
+        runtime.repositories.campaign_view_summary(campaign),
+        runtime.repositories.promotion_view_benchmarks(),
+        runtime.repositories.campaign_public_placements(campaign["campaign_id"]),
+    )
+    return share, campaign_progress_payload(
+        campaign,
+        totals,
+        cycle_stats,
+        metrics,
+        live_posts=live_posts,
+        joined=joined,
+        audience=audience,
+        views=views,
+        benchmarks=benchmarks,
+        public_placements=public_placements,
+    )
+
+
+async def _media_kit_payload(runtime: object) -> dict[str, object]:
+    audience, benchmarks = await asyncio.gather(
+        runtime.repositories.network_audience_summary(),
+        runtime.repositories.promotion_view_benchmarks(),
+    )
+    bot_username = getattr(runtime, "bot_username", None)
+    contact_url = f"https://t.me/{bot_username}" if bot_username else None
+    return media_kit_payload(audience, benchmarks, contact_url=contact_url)
 
 
 async def _notify_rerun_request(runtime: object, client_request: object) -> None:
@@ -112,6 +141,17 @@ def install_routes(app: object) -> None:
         except Exception as error:
             raise HTTPException(status_code=503, detail="database unavailable") from error
         return {"status": "ready"}
+
+    @app.get("/promote", response_class=HTMLResponse)
+    async def promotion_media_kit(request: Request) -> HTMLResponse:
+        """Public, aggregate-only proposal page for prospective advertisers."""
+        runtime = request.app.state.runtime
+        return HTMLResponse(render_media_kit(await _media_kit_payload(runtime)))
+
+    @app.get("/promote/insights")
+    async def promotion_media_kit_insights(request: Request) -> dict[str, object]:
+        runtime = request.app.state.runtime
+        return await _media_kit_payload(runtime)
 
     @app.get("/client/c/{token}", response_class=HTMLResponse)
     async def client_campaign_page(token: str, request: Request) -> HTMLResponse:

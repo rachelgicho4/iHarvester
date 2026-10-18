@@ -6,6 +6,7 @@ import secrets
 from datetime import timedelta
 from hashlib import sha256
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pymongo import ASCENDING, ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError
@@ -13,7 +14,7 @@ from pymongo.errors import DuplicateKeyError
 from app.campaigns.models import ChannelStatus, DeliveryStatus
 from app.campaigns.sharing import new_share_code
 from app.db.client import Database
-from app.utils.time import utcnow
+from app.utils.time import as_utc, utcnow
 
 Document = dict[str, Any]
 
@@ -1323,6 +1324,172 @@ class Repositories:
     async def campaign_join_count(self, campaign_id: str) -> int:
         current = await self.db.join_events.count_documents({"campaign_id": campaign_id})
         return current + int((await self._history_rollup(campaign_id)).get("join_count", 0) or 0)
+
+    async def campaign_audience_summary(self, campaign: Document) -> Document:
+        """Summarise the frozen campaign audience without exposing channel rows.
+
+        Subscriber counts are channel subscriptions, not a deduplicated count
+        of people.  That distinction is kept in the payload so client-facing
+        pages never overstate a campaign's probable reach.
+        """
+        target_ids = {int(channel_id) for channel_id in campaign.get("target_snapshot", [])}
+        if not target_ids:
+            return {
+                "target_channels": 0,
+                "known_audience_channels": 0,
+                "subscriber_slots": 0,
+                "unknown_audience_channels": 0,
+                "public_channels": 0,
+            }
+        rows = await self.db.channels.find(
+            {"telegram_chat_id": {"$in": list(target_ids)}},
+            {"telegram_chat_id": 1, "member_count": 1, "username": 1},
+        ).to_list(None)
+        known = 0
+        subscriber_slots = 0
+        public_channels = 0
+        for row in rows:
+            audience = row.get("member_count")
+            if isinstance(audience, (int, float)) and not isinstance(audience, bool) and audience >= 0:
+                known += 1
+                subscriber_slots += int(audience)
+            if isinstance(row.get("username"), str) and row["username"].strip():
+                public_channels += 1
+        return {
+            "target_channels": len(target_ids),
+            "known_audience_channels": known,
+            "subscriber_slots": subscriber_slots,
+            "unknown_audience_channels": max(0, len(target_ids) - known),
+            "public_channels": public_channels,
+        }
+
+    async def network_audience_summary(self) -> Document:
+        """Return the active network's public aggregate inventory only."""
+        rows = await self.db.channels.find(
+            self._active_channel_query(),
+            {"member_count": 1, "username": 1},
+        ).to_list(None)
+        known = 0
+        subscriber_slots = 0
+        public_channels = 0
+        for row in rows:
+            audience = row.get("member_count")
+            if isinstance(audience, (int, float)) and not isinstance(audience, bool) and audience >= 0:
+                known += 1
+                subscriber_slots += int(audience)
+            if isinstance(row.get("username"), str) and row["username"].strip():
+                public_channels += 1
+        return {
+            "active_channels": len(rows),
+            "known_audience_channels": known,
+            "subscriber_slots": subscriber_slots,
+            "unknown_audience_channels": max(0, len(rows) - known),
+            "public_channels": public_channels,
+        }
+
+    async def campaign_public_placements(self, campaign_id: str, *, limit: int = 24) -> list[Document]:
+        """Provide inspectable links for public placements only.
+
+        Private channels intentionally remain aggregate-only on bearer client
+        links.  A public username and an exact, currently live message ID are
+        both required before an external link is returned.
+        """
+        safe_limit = max(1, min(int(limit), 60))
+        states = await self.db.campaign_channel_state.find(
+            {"campaign_id": campaign_id},
+            {"channel_id": 1, "current_message_ids": 1},
+        ).sort("updated_at", -1).to_list(None)
+        channel_ids = {int(row["channel_id"]) for row in states if row.get("channel_id") is not None}
+        if not channel_ids:
+            return []
+        channels = await self.db.channels.find(
+            {"telegram_chat_id": {"$in": list(channel_ids)}},
+            {"telegram_chat_id": 1, "title": 1, "username": 1},
+        ).to_list(None)
+        by_id = {int(channel["telegram_chat_id"]): channel for channel in channels}
+        result: list[Document] = []
+        for state in states:
+            channel = by_id.get(int(state["channel_id"]))
+            username = channel.get("username") if channel else None
+            message_ids = [int(message_id) for message_id in state.get("current_message_ids", []) if int(message_id) > 0]
+            if not isinstance(username, str) or not username.strip() or not message_ids:
+                continue
+            label = str(channel.get("title") or f"@{username}").strip()
+            result.append(
+                {
+                    "label": label[:120],
+                    "url": f"https://t.me/{username.strip()}/{message_ids[0]}",
+                }
+            )
+            if len(result) >= safe_limit:
+                break
+        return result
+
+    @staticmethod
+    def _view_tracking_payload(tracking: Document | None) -> Document:
+        values = dict(tracking or {})
+        return {
+            "total_views": max(0, int(values.get("total_views") or 0)),
+            "sampled_placements": max(0, int(values.get("sampled_placements") or 0)),
+            "sampled_campaigns": max(0, int(values.get("sampled_campaigns") or 0)),
+            "views_per_placement": max(0, int(values.get("views_per_placement") or 0)),
+            "views_per_placement_hour": max(0.0, float(values.get("views_per_placement_hour") or 0)),
+            "last_sample_at": values.get("last_sample_at"),
+            "first_sample_at": values.get("first_sample_at"),
+            "placement_hours": max(0.0, float(values.get("placement_hours") or 0)),
+        }
+
+    async def campaign_view_summary(self, campaign: Document) -> Document:
+        """Return the compact view snapshot retained on the campaign itself."""
+        return self._view_tracking_payload(campaign.get("view_tracking"))
+
+    async def promotion_view_benchmarks(self, *, limit: int = 500) -> Document:
+        """Build conservative historical benchmarks from verified view snapshots.
+
+        No metric is returned as a forecast until at least one campaign has a
+        MTProto view sample.  The hourly values are based on the campaign's
+        selected start hour in its owner timezone, and are labelled with their
+        sample counts by the web layer.
+        """
+        safe_limit = max(1, min(int(limit), 2_000))
+        rows = await self.db.campaigns.find(
+            {"view_tracking.sampled_placements": {"$gte": 1}},
+            {"view_tracking": 1, "start_at_utc": 1, "owner_timezone": 1},
+        ).sort("updated_at", -1).limit(safe_limit).to_list(safe_limit)
+        per_campaign: list[float] = []
+        per_hour: dict[int, list[float]] = {hour: [] for hour in range(24)}
+        sampled_placements = 0
+        for row in rows:
+            tracking = self._view_tracking_payload(row.get("view_tracking"))
+            placements = tracking["sampled_placements"]
+            views = tracking["total_views"]
+            if placements <= 0 or views < 0:
+                continue
+            per_campaign.append(views / placements)
+            sampled_placements += placements
+            start = row.get("start_at_utc")
+            rate = tracking["views_per_placement_hour"]
+            if not start or rate <= 0:
+                continue
+            try:
+                timezone = ZoneInfo(str(row.get("owner_timezone") or "UTC"))
+            except ZoneInfoNotFoundError:
+                timezone = ZoneInfo("UTC")
+            per_hour[as_utc(start).astimezone(timezone).hour].append(rate)
+        hourly = [
+            {
+                "hour": hour,
+                "sample_campaigns": len(values),
+                "views_per_placement_hour": round(sum(values) / len(values), 2) if values else 0,
+            }
+            for hour, values in per_hour.items()
+        ]
+        return {
+            "sampled_campaigns": len(per_campaign),
+            "sampled_placements": sampled_placements,
+            "average_views_per_placement": round(sum(per_campaign) / len(per_campaign)) if per_campaign else 0,
+            "hourly": hourly,
+        }
 
     async def failed_deliveries(self, campaign_id: str, cycle_number: int | None = None, *, limit: int = 20) -> list[Document]:
         query: Document = {

@@ -1553,6 +1553,20 @@ class OwnerHandlers:
             await self._render(query.message, f"Campaigns • page {page + 1}\nTap a campaign for its full controls.", _markup(buttons))
         elif action_name == "requests":
             await self._show_client_requests(query.message, query.from_user.id)
+        elif action_name == "media":
+            if not self.public_base_url:
+                raise ValueError("the media kit needs PUBLIC_BASE_URL or KOYEB_PUBLIC_DOMAIN to be configured")
+            url = f"{self.public_base_url}/promote"
+            await query.message.answer(
+                "Your public media kit is ready. It presents aggregate audience inventory and measured promotion benchmarks without exposing private channels.",
+                reply_markup=_markup(
+                    [
+                        [InlineKeyboardButton(text="Copy media-kit link", copy_text=CopyTextButton(text=url))],
+                        [InlineKeyboardButton(text="Open client requests", callback_data="home:requests")],
+                        [InlineKeyboardButton(text="Home", callback_data="home:back")],
+                    ]
+                ),
+            )
         elif action_name == "back":
             await self._show_home(query.message)
         elif action_name == "backups":

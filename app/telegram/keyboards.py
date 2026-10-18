@@ -46,7 +46,8 @@ def home_keyboard(*, include_clone_manager: bool = False) -> InlineKeyboardMarku
          InlineKeyboardButton(text="Campaigns", callback_data="home:campaigns")],
         [InlineKeyboardButton(text="Network", callback_data="home:network"),
          InlineKeyboardButton(text="Backups", callback_data="home:backups")],
-        [InlineKeyboardButton(text="Client requests", callback_data="home:requests")],
+        [InlineKeyboardButton(text="Client requests", callback_data="home:requests"),
+         InlineKeyboardButton(text="Media kit", callback_data="home:media")],
         [InlineKeyboardButton(text="Settings", callback_data="home:settings")],
     ]
     # This is deliberately opt-in.  Child creator bots use the same owner UI,
