@@ -258,9 +258,16 @@ async def run(args: argparse.Namespace) -> int:
                 for index, channel_ids in enumerate(accessible_channel_ids)
                 if target["channel_id"] in channel_ids
             ]
-            fallback = [index for index in range(len(clients)) if index not in known]
+            if not known:
+                # The account directories are the authority for which owner
+                # can read a channel. Do not guess via an old public username:
+                # that turns a harmless unavailable placement into repeated
+                # bad requests and can create needless flood waits. A later
+                # pass will pick it up when its authorised account is ready.
+                unavailable += 1
+                continue
             candidates = sorted(
-                known + fallback,
+                known,
                 key=lambda index: (
                     cooldown_until[index] > loop.time(),
                     (index - offset) % len(clients),
