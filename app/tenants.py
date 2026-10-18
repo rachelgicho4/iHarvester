@@ -108,6 +108,9 @@ class CloneManager:
                 **self.main_runtime.settings.model_dump(),
                 "bot_token": token,
                 "owner_user_ids": owner_ids,
+                # A creator clone must never inherit the primary operator's
+                # public contact. Its media kit falls back to its own owner.
+                "public_contact_username": None,
                 "mongodb_db_name": str(clone["mongodb_db_name"]),
                 "webhook_path_secret": str(clone["webhook_path_secret"]),
                 "webhook_secret_token": self._open(str(clone["webhook_secret_ciphertext"])),
@@ -211,9 +214,13 @@ class CloneManager:
         if clone_id in self._children:
             return self._children[clone_id]
         settings = self._clone_settings(clone)
-        runtime = await _start_child_runtime(settings)
+        runtime = await _start_child_runtime(settings, clone_id=clone_id)
         self._children[clone_id] = runtime
         return runtime
+
+    def child_runtime(self, clone_id: str) -> Runtime | None:
+        """Return only an already-running child; never start one from HTTP."""
+        return self._children.get(clone_id)
 
     @staticmethod
     def _safe_start_error(error: Exception) -> str:
@@ -306,7 +313,7 @@ class CloneManager:
         return False
 
 
-async def _start_child_runtime(settings: Settings) -> Runtime:
+async def _start_child_runtime(settings: Settings, *, clone_id: str) -> Runtime:
     """Start the normal bot stack with clone-only owner IDs and no clone router."""
     from app.main import Runtime  # avoids a runtime import cycle
 
@@ -327,6 +334,8 @@ async def _start_child_runtime(settings: Settings) -> Runtime:
             campaigns=service,
             sender=sender,
             public_base_url=settings.resolved_public_base_url,
+            client_portal_route=f"/client/t/{clone_id}/c",
+            media_kit_route=f"/promote/{clone_id}",
         ).router
     )
     runtime = Runtime(settings, database, repositories, bot, dispatcher, sender)

@@ -30,6 +30,18 @@ def test_clone_settings_key_is_optional_until_clone_management_is_used() -> None
     assert len(f"{settings.clone_database_prefix}_clone_0123456789abcdef") <= 38
 
 
+def test_public_media_kit_contact_uses_username_or_own_owner_id() -> None:
+    shared = {
+        "bot_token": "1:" + "x" * 30,
+        "owner_user_ids": "44, 12",
+        "mongodb_uri": "mongodb://example.invalid",
+        "run_mode": "polling",
+    }
+
+    assert Settings(**shared).public_contact_url == "tg://user?id=12"
+    assert Settings(**shared, public_contact_username="@iamskyking2").public_contact_url == "https://t.me/iamskyking2"
+
+
 def test_clone_database_prefix_rejects_non_ascii_values() -> None:
     with pytest.raises(ValueError, match="CLONE_DATABASE_PREFIX"):
         Settings(

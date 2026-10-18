@@ -1387,7 +1387,7 @@ class Repositories:
             "public_channels": public_channels,
         }
 
-    async def campaign_public_placements(self, campaign_id: str, *, limit: int = 24) -> list[Document]:
+    async def campaign_public_placements(self, campaign_id: str, *, page: int = 0, limit: int = 24) -> Document:
         """Provide inspectable links for public placements only.
 
         Private channels intentionally remain aggregate-only on bearer client
@@ -1395,19 +1395,20 @@ class Repositories:
         both required before an external link is returned.
         """
         safe_limit = max(1, min(int(limit), 60))
+        safe_page = max(0, int(page))
         states = await self.db.campaign_channel_state.find(
             {"campaign_id": campaign_id},
             {"channel_id": 1, "current_message_ids": 1},
         ).sort("updated_at", -1).to_list(None)
         channel_ids = {int(row["channel_id"]) for row in states if row.get("channel_id") is not None}
         if not channel_ids:
-            return []
+            return {"items": [], "total": 0, "page": safe_page, "page_size": safe_limit}
         channels = await self.db.channels.find(
             {"telegram_chat_id": {"$in": list(channel_ids)}},
-            {"telegram_chat_id": 1, "title": 1, "username": 1},
+            {"telegram_chat_id": 1, "title": 1, "username": 1, "member_count": 1},
         ).to_list(None)
         by_id = {int(channel["telegram_chat_id"]): channel for channel in channels}
-        result: list[Document] = []
+        all_items: list[Document] = []
         for state in states:
             channel = by_id.get(int(state["channel_id"]))
             username = channel.get("username") if channel else None
@@ -1415,15 +1416,32 @@ class Repositories:
             if not isinstance(username, str) or not username.strip() or not message_ids:
                 continue
             label = str(channel.get("title") or f"@{username}").strip()
-            result.append(
+            member_count = channel.get("member_count")
+            all_items.append(
                 {
                     "label": label[:120],
                     "url": f"https://t.me/{username.strip()}/{message_ids[0]}",
+                    "subscriber_slots": int(member_count)
+                    if isinstance(member_count, (int, float)) and not isinstance(member_count, bool) and member_count >= 0
+                    else None,
                 }
             )
-            if len(result) >= safe_limit:
-                break
-        return result
+        # Larger public placements appear first. Unknown subscriber counts are
+        # intentionally placed after verified counts, never treated as zero.
+        all_items.sort(
+            key=lambda item: (
+                item["subscriber_slots"] is None,
+                -int(item["subscriber_slots"] or 0),
+                str(item["label"]).casefold(),
+            )
+        )
+        start = safe_page * safe_limit
+        return {
+            "items": all_items[start : start + safe_limit],
+            "total": len(all_items),
+            "page": safe_page,
+            "page_size": safe_limit,
+        }
 
     @staticmethod
     def _view_tracking_payload(tracking: Document | None) -> Document:

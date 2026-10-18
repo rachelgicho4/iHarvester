@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     run_mode: Literal["webhook", "polling"] = "polling"
     public_base_url: str | None = None
     koyeb_public_domain: str | None = None
+    # Optional public contact for the primary media kit. Child creator bots
+    # deliberately clear this value and fall back to their own owner ID.
+    public_contact_username: str | None = None
     webhook_path_secret: str | None = None
     webhook_secret_token: str | None = None
     clone_token_encryption_key: str | None = None
@@ -64,6 +67,16 @@ class Settings(BaseSettings):
             raise ValueError("CLONE_DATABASE_PREFIX must use only ASCII letters, numbers, underscores, or hyphens")
         return value
 
+    @field_validator("public_contact_username")
+    @classmethod
+    def valid_public_contact_username(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        username = value.strip().lstrip("@")
+        if not username.replace("_", "").isalnum() or not 5 <= len(username) <= 32:
+            raise ValueError("PUBLIC_CONTACT_USERNAME must be a valid Telegram username, with or without @")
+        return username
+
     @model_validator(mode="after")
     def validate_broadcast_limits(self) -> Settings:
         if not self.allow_paid_broadcast and self.broadcast_send_rps > 30:
@@ -87,6 +100,15 @@ class Settings(BaseSettings):
         if self.koyeb_public_domain:
             return f"https://{self.koyeb_public_domain}".rstrip("/")
         return None
+
+    @property
+    def public_contact_url(self) -> str:
+        """Return a clone-safe human contact URL, never the bot itself."""
+        if self.public_contact_username:
+            return f"https://t.me/{self.public_contact_username}"
+        # Child clones use their own creator allow-list. A direct Telegram
+        # user link keeps the contact target distinct even without a username.
+        return f"tg://user?id={min(self.owner_ids)}"
 
     @property
     def webhook_url(self) -> str | None:

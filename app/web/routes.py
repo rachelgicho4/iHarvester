@@ -73,14 +73,36 @@ async def _client_portal_payload(runtime: object, token: str) -> tuple[object, d
     )
 
 
-async def _media_kit_payload(runtime: object) -> dict[str, object]:
+async def _media_kit_payload(runtime: object, *, insights_url: str = "/promote/insights") -> dict[str, object]:
     audience, benchmarks = await asyncio.gather(
         runtime.repositories.network_audience_summary(),
         runtime.repositories.promotion_view_benchmarks(),
     )
-    bot_username = getattr(runtime, "bot_username", None)
-    contact_url = f"https://t.me/{bot_username}" if bot_username else None
-    return media_kit_payload(audience, benchmarks, contact_url=contact_url)
+    return media_kit_payload(
+        audience,
+        benchmarks,
+        contact_url=runtime.settings.public_contact_url,
+        insights_url=insights_url,
+    )
+
+
+def _clone_runtime(request: Request, clone_id: str) -> object:
+    """Resolve a running clone without ever falling back to the main data."""
+    manager = getattr(request.app.state.runtime, "clone_manager", None)
+    runtime = manager.child_runtime(clone_id) if manager else None
+    if not runtime or not runtime.ready:
+        raise HTTPException(status_code=404, detail="This creator workspace is unavailable.")
+    return runtime
+
+
+async def _client_placements_payload(runtime: object, token: str, page: int) -> dict[str, object]:
+    share = await runtime.repositories.campaign_portal_share(token)
+    if not share:
+        raise HTTPException(status_code=404, detail="This client progress link is no longer available.")
+    campaign = await runtime.repositories.get_campaign(share["campaign_id"])
+    if not campaign:
+        raise HTTPException(status_code=404, detail="This campaign is no longer available.")
+    return await runtime.repositories.campaign_public_placements(campaign["campaign_id"], page=max(0, page))
 
 
 async def _notify_rerun_request(runtime: object, client_request: object) -> None:
@@ -153,6 +175,16 @@ def install_routes(app: object) -> None:
         runtime = request.app.state.runtime
         return await _media_kit_payload(runtime)
 
+    @app.get("/promote/{clone_id}", response_class=HTMLResponse)
+    async def clone_promotion_media_kit(clone_id: str, request: Request) -> HTMLResponse:
+        runtime = _clone_runtime(request, clone_id)
+        return HTMLResponse(render_media_kit(await _media_kit_payload(runtime, insights_url=f"/promote/{clone_id}/insights")))
+
+    @app.get("/promote/{clone_id}/insights")
+    async def clone_promotion_media_kit_insights(clone_id: str, request: Request) -> dict[str, object]:
+        runtime = _clone_runtime(request, clone_id)
+        return await _media_kit_payload(runtime, insights_url=f"/promote/{clone_id}/insights")
+
     @app.get("/client/c/{token}", response_class=HTMLResponse)
     async def client_campaign_page(token: str, request: Request) -> HTMLResponse:
         runtime = request.app.state.runtime
@@ -165,9 +197,56 @@ def install_routes(app: object) -> None:
         _, payload = await _client_portal_payload(runtime, token)
         return payload
 
+    @app.get("/client/c/{token}/placements")
+    async def client_campaign_placements(token: str, request: Request, page: int = 0) -> dict[str, object]:
+        runtime = request.app.state.runtime
+        return await _client_placements_payload(runtime, token, page)
+
     @app.post("/client/c/{token}/requests")
     async def client_campaign_request(token: str, body: ClientPromotionRequest, request: Request) -> dict[str, str | None]:
         runtime = request.app.state.runtime
+        share, _ = await _client_portal_payload(runtime, token)
+        request_type = body.request_type.upper()
+        if request_type not in {"RERUN", "NEW"}:
+            raise HTTPException(status_code=422, detail="Choose either a rerun or a new promotion.")
+        if request_type == "NEW" and not runtime.bot_username:
+            raise HTTPException(status_code=503, detail="The Telegram material intake is temporarily unavailable. Please try again shortly.")
+        desired_start = _client_start_time(body.desired_start, body.client_timezone)
+        client_request, material_token = await runtime.repositories.create_client_promotion_request(
+            share=share,
+            request_type=request_type,
+            client_name=body.client_name,
+            details=body.details,
+            desired_start_at_utc=desired_start,
+            client_timezone=body.client_timezone,
+        )
+        material_url = None
+        if request_type == "NEW":
+            material_url = f"https://t.me/{runtime.bot_username}?start=promo_{client_request['request_id']}_{material_token}"
+        if request_type == "RERUN":
+            await _notify_rerun_request(runtime, client_request)
+        return {"request_id": client_request["request_id"], "material_url": material_url}
+
+    @app.get("/client/t/{clone_id}/c/{token}", response_class=HTMLResponse)
+    async def clone_client_campaign_page(clone_id: str, token: str, request: Request) -> HTMLResponse:
+        runtime = _clone_runtime(request, clone_id)
+        _, payload = await _client_portal_payload(runtime, token)
+        return HTMLResponse(render_client_portal(token, payload, portal_route=f"/client/t/{clone_id}/c"))
+
+    @app.get("/client/t/{clone_id}/c/{token}/progress")
+    async def clone_client_campaign_progress(clone_id: str, token: str, request: Request) -> dict[str, object]:
+        runtime = _clone_runtime(request, clone_id)
+        _, payload = await _client_portal_payload(runtime, token)
+        return payload
+
+    @app.get("/client/t/{clone_id}/c/{token}/placements")
+    async def clone_client_campaign_placements(clone_id: str, token: str, request: Request, page: int = 0) -> dict[str, object]:
+        runtime = _clone_runtime(request, clone_id)
+        return await _client_placements_payload(runtime, token, page)
+
+    @app.post("/client/t/{clone_id}/c/{token}/requests")
+    async def clone_client_campaign_request(clone_id: str, token: str, body: ClientPromotionRequest, request: Request) -> dict[str, str | None]:
+        runtime = _clone_runtime(request, clone_id)
         share, _ = await _client_portal_payload(runtime, token)
         request_type = body.request_type.upper()
         if request_type not in {"RERUN", "NEW"}:

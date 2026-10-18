@@ -52,7 +52,8 @@ def test_client_portal_auto_refreshes_and_has_approval_gated_request_copy() -> N
     assert "setInterval(refresh,10000)" in page
     assert "approves every request" in page
     assert "&lt;Client promotion&gt;" in page
-    assert "/client/c/${encodeURIComponent(token)}/progress" in page
+    assert "const portalRoute=\"/client/c\"" in page
+    assert "placementsUrl" in page
 
 
 def test_client_portal_includes_honest_audience_views_and_public_proof_only() -> None:
@@ -86,8 +87,14 @@ def test_client_portal_includes_honest_audience_views_and_public_proof_only() ->
     assert payload["audience"]["subscriber_slots"] == 12_345
     assert payload["views"]["total"] == 456
     assert payload["benchmarks"]["hourly"][0]["hour"] == 20
-    assert payload["placements"] == [{"label": "Visible public placement", "url": "https://t.me/example/123"}]
+    assert payload["placements"] == {
+        "items": [{"label": "Visible public placement", "url": "https://t.me/example/123", "subscriber_slots": None}],
+        "total": 1,
+        "page": 0,
+        "page_size": 24,
+    }
     page = render_client_portal("secret-token", payload)
-    assert "Subscriber slots across this campaign" in page
+    assert "Subscriber memberships across campaign" in page
     assert "See public placements" in page
     assert "Private placements remain intentionally private" in page
+    assert "largest public placements" in page

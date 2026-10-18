@@ -2,16 +2,26 @@
 
 iHarvester has two web experiences:
 
-- `https://<service-domain>/promote` is the public, aggregate-only media kit for prospective clients. It shows active placement inventory, combined subscriber slots, and verified historical benchmarks without exposing channel identities.
-- **Share client progress page** in a campaign creates a private bearer link. It shows that campaign's delivery, elapsed time, subscriber-slot audience, live post views, timing benchmark, client request form, and links to any currently live **public** placements. Private placements never appear as links.
+- `https://<service-domain>/promote` is the public, aggregate-only media kit for prospective clients. It shows active placement inventory, subscriber memberships, and verified historical benchmarks without exposing channel identities. Creator clones receive isolated media-kit paths automatically.
+- **Share client progress page** in a campaign creates a private bearer link. It shows that campaign's delivery, elapsed time, subscriber-membership inventory, live post views, timing benchmark, client request form, and links to currently live **public** placements. The public catalogue is ordered by known subscriber count and paginated; private placements never appear as links.
 
 ## What the figures mean
 
-`Combined subscriber audience` is the sum of the latest known subscriber count for every selected placement. One person may follow more than one channel, so it is not a unique-person reach figure.
+`Subscriber memberships` is the sum of the latest known subscriber count for every selected placement. One person may follow more than one channel, so it is not an audience total, unique-person reach figure, or outcome forecast.
 
 `Views` comes only from Telegram's actual post-view counters. The tracker stores the latest counter on the existing delivery record and one compact total on the campaign. It does not create a per-minute analytics collection, retain message content, or estimate views without a sample.
 
-The time-of-day planner groups prior campaigns by the start hour selected in the campaign's owner timezone. It uses the measured views per placement-hour and shows the number of campaign samples behind each number. A time without sufficient samples stays unscored rather than being assigned a made-up forecast.
+The time-of-day planner groups prior campaigns by the start hour selected in the campaign's owner timezone. It uses the measured post views per placement-hour and shows the number of campaign samples behind each number. A time without sufficient samples stays unscored rather than being assigned a made-up forecast.
+
+## Contact target
+
+The public media kit never points prospects to the bot. By default it links to the first authorised owner using a Telegram `tg://user?id=...` link. On the primary deployment, set the optional environment variable below to use a public username instead:
+
+```env
+PUBLIC_CONTACT_USERNAME=iamskyking2
+```
+
+Creator clones intentionally do not inherit the primary username. Their media kits link to their own first authorised creator, so each creator receives an isolated contact flow without a separate deployment.
 
 ## Enable live view sampling on the recovery VPS
 

@@ -544,6 +544,8 @@ class OwnerHandlers:
         campaigns: CampaignService,
         sender: TelegramSender,
         public_base_url: str | None = None,
+        client_portal_route: str = "/client/c",
+        media_kit_route: str = "/promote",
         include_clone_manager: bool = False,
     ) -> None:
         self.owner_ids = owner_ids
@@ -551,6 +553,8 @@ class OwnerHandlers:
         self.campaigns = campaigns
         self.sender = sender
         self.public_base_url = public_base_url.rstrip("/") if public_base_url else None
+        self.client_portal_route = "/" + client_portal_route.strip("/")
+        self.media_kit_route = "/" + media_kit_route.strip("/")
         self.include_clone_manager = include_clone_manager
         self.router = Router(name="owner")
         self.router.message.register(self.start, CommandStart())
@@ -1556,7 +1560,7 @@ class OwnerHandlers:
         elif action_name == "media":
             if not self.public_base_url:
                 raise ValueError("the media kit needs PUBLIC_BASE_URL or KOYEB_PUBLIC_DOMAIN to be configured")
-            url = f"{self.public_base_url}/promote"
+            url = f"{self.public_base_url}{self.media_kit_route}"
             await query.message.answer(
                 "Your public media kit is ready. It presents aggregate audience inventory and measured promotion benchmarks without exposing private channels.",
                 reply_markup=_markup(
@@ -1603,7 +1607,7 @@ class OwnerHandlers:
         if not self.public_base_url:
             raise ValueError("client pages need PUBLIC_BASE_URL or KOYEB_PUBLIC_DOMAIN to be configured")
         _, token = await self.repositories.create_campaign_portal_share(query.from_user.id, campaign["campaign_id"])
-        url = f"{self.public_base_url}/client/c/{token}"
+        url = f"{self.public_base_url}{self.client_portal_route}/{token}"
         await query.message.answer(
             "Client progress page created. It updates its delivery and campaign-time bars automatically while the page is open. "
             "Anyone with this private link can see only this campaign's aggregate progress and submit an approval-gated request.",
