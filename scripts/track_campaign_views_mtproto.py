@@ -69,9 +69,13 @@ async def _resolve_channel(client: TelegramClient, channel_id: int, username: st
     return types.InputChannel(expected_channel_id, access_hash)
 
 
-async def _open_clients(session_paths: list[Path], api_id: int, api_hash: str) -> tuple[list[TelegramClient], list[set[int]]]:
+async def _open_clients(
+    session_paths: list[Path], api_id: int, api_hash: str
+) -> tuple[list[TelegramClient], list[set[int]], list[float]]:
     clients: list[TelegramClient] = []
     accessible_channel_ids: list[set[int]] = []
+    initial_cooldowns: list[float] = []
+    loop = asyncio.get_running_loop()
     for session in session_paths:
         client = TelegramClient(
             str(session),
@@ -89,16 +93,27 @@ async def _open_clients(session_paths: list[Path], api_id: int, api_hash: str) -
         # This reads the account directory only, so Telethon can obtain access
         # hashes for channels already available to that account. It does not
         # enumerate or inspect channel message history.
-        dialogs = await client.get_dialogs(limit=None)
-        channel_ids = {
-            -1_000_000_000_000 - int(dialog.entity.id)
-            for dialog in dialogs
-            if isinstance(dialog.entity, types.Channel)
-        }
-        logger.info("%s: loaded %s accessible dialogs (%s channels)", session.name, len(dialogs), len(channel_ids))
+        try:
+            dialogs = await client.get_dialogs(limit=None)
+        except errors.FloodWaitError as error:
+            # Dialog discovery is an optimisation, not a reason to abandon a
+            # complete sample. The cached session can still serve a later
+            # fallback after Telegram's short cooldown, while the other
+            # authorised accounts continue immediately.
+            channel_ids = set()
+            initial_cooldowns.append(loop.time() + int(error.seconds) + 2)
+            logger.warning("%s: dialog directory cooling down for %ss", session.name, error.seconds)
+        else:
+            channel_ids = {
+                -1_000_000_000_000 - int(dialog.entity.id)
+                for dialog in dialogs
+                if isinstance(dialog.entity, types.Channel)
+            }
+            initial_cooldowns.append(0.0)
+            logger.info("%s: loaded %s accessible dialogs (%s channels)", session.name, len(dialogs), len(channel_ids))
         clients.append(client)
         accessible_channel_ids.append(channel_ids)
-    return clients, accessible_channel_ids
+    return clients, accessible_channel_ids, initial_cooldowns
 
 
 def _targets(database: Any, campaign_id: str | None, limit: int | None) -> list[dict[str, Any]]:
@@ -229,9 +244,9 @@ async def run(args: argparse.Namespace) -> int:
             for target in targets[:20]:
                 logger.info("Would sample campaign=%s channel=%s message=%s", target["campaign_id"], target["channel_id"], target["message_id"])
             return 0
-        clients, accessible_channel_ids = await _open_clients(session_paths, api_id, api_hash)
+        clients, accessible_channel_ids, initial_cooldowns = await _open_clients(session_paths, api_id, api_hash)
         entities: dict[tuple[int, int], Any] = {}
-        cooldown_until: dict[int, float] = defaultdict(float)
+        cooldown_until: dict[int, float] = defaultdict(float, enumerate(initial_cooldowns))
         changed_campaigns: set[str] = set()
         sampled = unavailable = failed = 0
         loop = asyncio.get_running_loop()
