@@ -56,6 +56,6 @@ python scripts/track_campaign_views_mtproto.py \
   --session ~/iharvester-recovery/session/account-3
 ```
 
-Run it roughly every 10-15 minutes using a conservative cron job or systemd timer. It loads the authorised accounts' dialog directories once to obtain access hashes, then requests the counter for exact live message IDs. If one account receives a flood wait, the sampler skips it temporarily and attempts another already-authorised account; it never signs in again or sends a message.
+Run it roughly every 15-30 minutes using a conservative cron job or systemd timer. It loads the authorised accounts' dialog directories once to obtain access hashes, then routes each exact post to the account that already lists that channel and rotates between accounts where more than one can read it. If one account receives a flood wait, the sampler skips it temporarily and attempts another already-authorised account; it never signs in again or sends a message.
 
 Do not place `TELEGRAM_API_HASH`, Mongo credentials, or session files in Git, Koyeb variables, public logs, or client links. Keep the existing session files until the owner explicitly retires them.

@@ -69,8 +69,9 @@ async def _resolve_channel(client: TelegramClient, channel_id: int, username: st
     return types.InputChannel(expected_channel_id, access_hash)
 
 
-async def _open_clients(session_paths: list[Path], api_id: int, api_hash: str) -> list[TelegramClient]:
+async def _open_clients(session_paths: list[Path], api_id: int, api_hash: str) -> tuple[list[TelegramClient], list[set[int]]]:
     clients: list[TelegramClient] = []
+    accessible_channel_ids: list[set[int]] = []
     for session in session_paths:
         client = TelegramClient(
             str(session),
@@ -89,9 +90,15 @@ async def _open_clients(session_paths: list[Path], api_id: int, api_hash: str) -
         # hashes for channels already available to that account. It does not
         # enumerate or inspect channel message history.
         dialogs = await client.get_dialogs(limit=None)
-        logger.info("%s: loaded %s accessible dialogs", session.name, len(dialogs))
+        channel_ids = {
+            -1_000_000_000_000 - int(dialog.entity.id)
+            for dialog in dialogs
+            if isinstance(dialog.entity, types.Channel)
+        }
+        logger.info("%s: loaded %s accessible dialogs (%s channels)", session.name, len(dialogs), len(channel_ids))
         clients.append(client)
-    return clients
+        accessible_channel_ids.append(channel_ids)
+    return clients, accessible_channel_ids
 
 
 def _targets(database: Any, campaign_id: str | None, limit: int | None) -> list[dict[str, Any]]:
@@ -222,14 +229,30 @@ async def run(args: argparse.Namespace) -> int:
             for target in targets[:20]:
                 logger.info("Would sample campaign=%s channel=%s message=%s", target["campaign_id"], target["channel_id"], target["message_id"])
             return 0
-        clients = await _open_clients(session_paths, api_id, api_hash)
+        clients, accessible_channel_ids = await _open_clients(session_paths, api_id, api_hash)
         entities: dict[tuple[int, int], Any] = {}
         cooldown_until: dict[int, float] = defaultdict(float)
         changed_campaigns: set[str] = set()
         sampled = unavailable = failed = 0
         loop = asyncio.get_running_loop()
         for offset, target in enumerate(targets):
-            candidates = sorted(range(len(clients)), key=lambda index: cooldown_until[index])
+            # A channel can be reached through only one of the three authorised
+            # owner/admin accounts. Prefer the account that already listed the
+            # exact channel in its dialog directory, then rotate the order so
+            # one account is not needlessly asked to serve every public post.
+            known = [
+                index
+                for index, channel_ids in enumerate(accessible_channel_ids)
+                if target["channel_id"] in channel_ids
+            ]
+            fallback = [index for index in range(len(clients)) if index not in known]
+            candidates = sorted(
+                known + fallback,
+                key=lambda index: (
+                    cooldown_until[index] > loop.time(),
+                    (index - offset) % len(clients),
+                ),
+            )
             success = False
             for client_index in candidates:
                 pause = cooldown_until[client_index] - loop.time()
