@@ -17,6 +17,8 @@ from app.db.client import Database
 from app.utils.time import as_utc, utcnow
 
 Document = dict[str, Any]
+VIEW_MATURITY = timedelta(hours=6)
+MIN_PUBLIC_VIEW_PLACEMENTS = 50
 
 
 class Repositories:
@@ -655,10 +657,71 @@ class Repositories:
                     # without retaining a second delivery analytics history.
                     "posted_at": posted_at,
                     "updated_at": posted_at,
-                }
+                },
+                # A replacement post is a fresh observation target. Never
+                # accidentally show the previous post's counter on it.
+                "$unset": {
+                    "view_count": "",
+                    "view_observed_at": "",
+                    "view_first_observed_at": "",
+                    "view_tracker_session": "",
+                    "view_finalized_at": "",
+                },
             },
             upsert=True,
         )
+
+    async def finalize_live_state_views(self, campaign_id: str, channel_id: int, expected_message_ids: list[int]) -> int:
+        """Preserve one sampled post counter before its live-state is removed.
+
+        The campaign-level total is bounded data, while the per-placement
+        state is removed as normal after a repost or cleanup. Marking the
+        state first makes duplicate worker retries harmless; a database outage
+        can only omit a final sample, never inflate a client's reported views.
+        """
+        message_ids = [int(value) for value in expected_message_ids if int(value) > 0]
+        if not message_ids:
+            return 0
+        now = utcnow()
+        state = await self.db.campaign_channel_state.find_one_and_update(
+            {
+                "campaign_id": campaign_id,
+                "channel_id": channel_id,
+                "current_message_ids": message_ids,
+                "view_count": {"$type": "number"},
+                "view_finalized_at": {"$exists": False},
+            },
+            {"$set": {"view_finalized_at": now}},
+            return_document=ReturnDocument.BEFORE,
+        )
+        if not state:
+            return 0
+        views = max(0, int(state.get("view_count") or 0))
+        observed_at = as_utc(state.get("view_observed_at")) or now
+        posted_at = as_utc(state.get("posted_at"))
+        mature = bool(posted_at and observed_at - posted_at >= VIEW_MATURITY)
+        increment: Document = {
+            "view_tracking.finalized_views": views,
+            "view_tracking.finalized_placements": 1,
+        }
+        if mature:
+            elapsed_hours = max(0.0, (observed_at - posted_at).total_seconds() / 3600)
+            increment.update(
+                {
+                    "view_tracking.finalized_mature_views": views,
+                    "view_tracking.finalized_mature_placements": 1,
+                    "view_tracking.finalized_mature_placement_hours": round(elapsed_hours, 3),
+                }
+            )
+        await self.db.campaigns.update_one(
+            {"campaign_id": campaign_id},
+            {
+                "$inc": increment,
+                "$min": {"view_tracking.first_sample_at": observed_at},
+                "$max": {"view_tracking.last_sample_at": observed_at},
+            },
+        )
+        return views
 
     async def clear_live_state(self, campaign_id: str, channel_id: int) -> None:
         await self.db.campaign_channel_state.delete_one({"campaign_id": campaign_id, "channel_id": channel_id})
@@ -1451,12 +1514,49 @@ class Repositories:
     @staticmethod
     def _view_tracking_payload(tracking: Document | None) -> Document:
         values = dict(tracking or {})
+        live_accumulator = any(
+            key in values
+            for key in (
+                "current_views",
+                "finalized_views",
+                "current_sampled_placements",
+                "finalized_placements",
+            )
+        )
+        current_views = max(0, int(values.get("current_views") or 0))
+        finalized_views = max(0, int(values.get("finalized_views") or 0))
+        current_placements = max(0, int(values.get("current_sampled_placements") or 0))
+        finalized_placements = max(0, int(values.get("finalized_placements") or 0))
+        current_mature_views = max(0, int(values.get("current_mature_views") or 0))
+        finalized_mature_views = max(0, int(values.get("finalized_mature_views") or 0))
+        current_mature_placements = max(0, int(values.get("current_mature_placements") or 0))
+        finalized_mature_placements = max(0, int(values.get("finalized_mature_placements") or 0))
+        current_mature_hours = max(0.0, float(values.get("current_mature_placement_hours") or 0))
+        finalized_mature_hours = max(0.0, float(values.get("finalized_mature_placement_hours") or 0))
+        total_views = finalized_views + current_views if live_accumulator else max(0, int(values.get("total_views") or 0))
+        sampled_placements = finalized_placements + current_placements if live_accumulator else max(0, int(values.get("sampled_placements") or 0))
+        mature_views = finalized_mature_views + current_mature_views if live_accumulator else max(0, int(values.get("mature_views") or 0))
+        mature_placements = (
+            finalized_mature_placements + current_mature_placements
+            if live_accumulator
+            else max(0, int(values.get("mature_placements") or 0))
+        )
+        mature_hours = (
+            finalized_mature_hours + current_mature_hours
+            if live_accumulator
+            else max(0.0, float(values.get("mature_placement_hours") or 0))
+        )
         return {
-            "total_views": max(0, int(values.get("total_views") or 0)),
-            "sampled_placements": max(0, int(values.get("sampled_placements") or 0)),
+            "total_views": total_views,
+            "current_views": current_views,
+            "sampled_placements": sampled_placements,
+            "finalized_placements": finalized_placements,
+            "mature_views": mature_views,
+            "mature_placements": mature_placements,
+            "mature_placement_hours": mature_hours,
             "sampled_campaigns": max(0, int(values.get("sampled_campaigns") or 0)),
-            "views_per_placement": max(0, int(values.get("views_per_placement") or 0)),
-            "views_per_placement_hour": max(0.0, float(values.get("views_per_placement_hour") or 0)),
+            "views_per_placement": round(total_views / sampled_placements) if sampled_placements else 0,
+            "views_per_placement_hour": round(mature_views / mature_hours, 3) if mature_hours else 0,
             "last_sample_at": values.get("last_sample_at"),
             "first_sample_at": values.get("first_sample_at"),
             "placement_hours": max(0.0, float(values.get("placement_hours") or 0)),
@@ -1476,20 +1576,28 @@ class Repositories:
         """
         safe_limit = max(1, min(int(limit), 2_000))
         rows = await self.db.campaigns.find(
-            {"view_tracking.sampled_placements": {"$gte": 1}},
+            {
+                "$or": [
+                    {"view_tracking.mature_placements": {"$gte": MIN_PUBLIC_VIEW_PLACEMENTS}},
+                    {"view_tracking.current_mature_placements": {"$gte": 1}},
+                    {"view_tracking.finalized_mature_placements": {"$gte": 1}},
+                ]
+            },
             {"view_tracking": 1, "start_at_utc": 1, "owner_timezone": 1},
         ).sort("updated_at", -1).limit(safe_limit).to_list(safe_limit)
         per_campaign: list[float] = []
         per_hour: dict[int, list[float]] = {hour: [] for hour in range(24)}
         sampled_placements = 0
+        verified_views = 0
         for row in rows:
             tracking = self._view_tracking_payload(row.get("view_tracking"))
-            placements = tracking["sampled_placements"]
-            views = tracking["total_views"]
-            if placements <= 0 or views < 0:
+            placements = tracking["mature_placements"]
+            views = tracking["mature_views"]
+            if placements < MIN_PUBLIC_VIEW_PLACEMENTS or views < 0:
                 continue
             per_campaign.append(views / placements)
             sampled_placements += placements
+            verified_views += views
             start = row.get("start_at_utc")
             rate = tracking["views_per_placement_hour"]
             if not start or rate <= 0:
@@ -1510,6 +1618,7 @@ class Repositories:
         return {
             "sampled_campaigns": len(per_campaign),
             "sampled_placements": sampled_placements,
+            "verified_views": verified_views,
             "average_views_per_placement": round(sum(per_campaign) / len(per_campaign)) if per_campaign else 0,
             "hourly": hourly,
         }

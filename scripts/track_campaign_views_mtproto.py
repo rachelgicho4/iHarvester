@@ -33,6 +33,7 @@ except ImportError as error:  # pragma: no cover - operator environment only
 
 
 logger = logging.getLogger("iharvester.view_tracker")
+MATURE_VIEW_AGE_HOURS = 6
 
 
 class ChannelUnavailableError(RuntimeError):
@@ -116,7 +117,7 @@ async def _open_clients(
     return clients, accessible_channel_ids, initial_cooldowns
 
 
-def _targets(database: Any, campaign_id: str | None, limit: int | None) -> list[dict[str, Any]]:
+def _targets(database: Any, campaign_id: str | None, limit: int | None, *, include_archived: bool) -> list[dict[str, Any]]:
     match: dict[str, Any] = {"current_message_ids.0": {"$exists": True}}
     if campaign_id:
         match["campaign_id"] = campaign_id
@@ -133,7 +134,7 @@ def _targets(database: Any, campaign_id: str | None, limit: int | None) -> list[
                     }
                 },
                 {"$unwind": "$campaign"},
-                {"$match": {"campaign.status": {"$in": ["ACTIVE", "PAUSED", "ENDING", "ARCHIVED"]}}},
+                {"$match": {"campaign.status": {"$in": ["ACTIVE", "PAUSED", "ENDING", *(["ARCHIVED"] if include_archived else [])]}}},
                 {
                     "$lookup": {
                         "from": "channels",
@@ -188,35 +189,39 @@ def _update_campaign_rollup(database: Any, campaign_id: str, now: datetime) -> d
             {"view_count": 1, "view_observed_at": 1, "view_first_observed_at": 1, "posted_at": 1},
         )
     )
-    total_views = sum(max(0, int(row.get("view_count") or 0)) for row in rows)
+    current_views = sum(max(0, int(row.get("view_count") or 0)) for row in rows)
     timestamps = [_as_utc(row.get("view_observed_at")) for row in rows]
     timestamps = [value for value in timestamps if value]
     placement_hours = 0.0
-    hourly_samples = 0
+    mature_views = 0
+    mature_samples = 0
     for row in rows:
         sent_at = _as_utc(row.get("posted_at"))
         observed_at = _as_utc(row.get("view_observed_at"))
         if not sent_at or not observed_at:
             continue
         hours = max(0.0, (observed_at - sent_at).total_seconds() / 3600)
-        # A view velocity is only meaningful after a full observed hour. The
-        # post's raw view count still appears in the live client page sooner.
-        if hours >= 1:
+        # Public performance evidence begins only after several hours. Fresh
+        # counters still appear in a client's live report, but never poison a
+        # public benchmark with the first minutes of a post's life.
+        if hours >= MATURE_VIEW_AGE_HOURS:
             placement_hours += hours
-            hourly_samples += 1
+            mature_samples += 1
+            mature_views += max(0, int(row.get("view_count") or 0))
     sampled = len(rows)
     tracking = {
-        "total_views": total_views,
-        "sampled_placements": sampled,
-        "views_per_placement": round(total_views / sampled) if sampled else 0,
-        "placement_hours": round(placement_hours, 3),
-        "views_per_placement_hour": round(total_views / placement_hours, 3) if placement_hours and hourly_samples else 0,
-        "first_sample_at": min(timestamps) if timestamps else None,
-        "last_sample_at": max(timestamps) if timestamps else None,
-        "updated_at": now,
+        "current_views": current_views,
+        "current_sampled_placements": sampled,
+        "current_mature_views": mature_views,
+        "current_mature_placements": mature_samples,
+        "current_mature_placement_hours": round(placement_hours, 3),
     }
-    database.campaigns.update_one({"campaign_id": campaign_id}, {"$set": {"view_tracking": tracking, "updated_at": now}})
-    return tracking
+    update: dict[str, Any] = {"$set": {**{f"view_tracking.{key}": value for key, value in tracking.items()}, "updated_at": now}}
+    if timestamps:
+        update["$min"] = {"view_tracking.first_sample_at": min(timestamps)}
+        update["$max"] = {"view_tracking.last_sample_at": max(timestamps)}
+    database.campaigns.update_one({"campaign_id": campaign_id}, update)
+    return {"current_views": current_views, "sampled_placements": sampled}
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -233,7 +238,7 @@ async def run(args: argparse.Namespace) -> int:
     clients: list[TelegramClient] = []
     try:
         mongo.admin.command("ping")
-        targets = _targets(database, args.campaign, args.limit)
+        targets = _targets(database, args.campaign, args.limit, include_archived=args.include_archived)
         if not targets:
             logger.info("No live campaign posts matched this run.")
             return 0
@@ -337,7 +342,7 @@ async def run(args: argparse.Namespace) -> int:
         now = datetime.now(UTC)
         for campaign_id in changed_campaigns:
             summary = _update_campaign_rollup(database, campaign_id, now)
-            logger.info("%s: %s views from %s sampled placements", campaign_id, summary["total_views"], summary["sampled_placements"])
+            logger.info("%s: %s current views from %s sampled live placements", campaign_id, summary["current_views"], summary["sampled_placements"])
         logger.info("Complete: %s sampled, %s unavailable, %s failures", sampled, unavailable, failed)
         return 0
     finally:
@@ -351,6 +356,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session", action="append", required=True, help="Authorised Telethon session path; repeat for each owner/admin account.")
     parser.add_argument("--campaign", help="Limit the sampler to one iHarvester campaign ID.")
     parser.add_argument("--limit", type=int, help="Maximum live posts to sample in this run.")
+    parser.add_argument("--include-archived", action="store_true", help="Also sample retained posts from archived campaigns during a one-off history pass.")
     parser.add_argument("--delay", type=float, default=0.35, help="Minimum seconds between Telegram view reads (default: 0.35).")
     parser.add_argument("--dry-run", action="store_true", help="List exact stored targets without connecting to Telegram or writing MongoDB.")
     return parser.parse_args()

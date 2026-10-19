@@ -9,7 +9,9 @@ iHarvester has two web experiences:
 
 `Subscriber memberships` is the sum of the latest known subscriber count for every selected placement. One person may follow more than one channel, so it is not an audience total, unique-person reach figure, or outcome forecast.
 
-`Views` comes only from Telegram's actual post-view counters. The tracker stores the latest counter on the existing live-placement record and one compact total on the campaign. It does not create a per-minute analytics collection, retain message content, or estimate views without a sample.
+`Verified views so far` on a private client page is an accumulating total from Telegram's actual post-view counters. The tracker refreshes each still-live placement and preserves its final sampled counter when a repost or cleanup removes it. It does not create a per-minute analytics collection, retain message content, or estimate views without a sample.
+
+The public media kit deliberately does **not** show a raw average post-view figure. It presents accumulated verified post views only after a campaign has at least 50 placements observed for six or more hours. Fresh live counters remain visible to that campaign's client, but cannot become public performance evidence until they mature.
 
 The time-of-day planner groups prior campaigns by the start hour selected in the campaign's owner timezone. It uses the measured post views per placement-hour and shows the number of campaign samples behind each number. A time without sufficient samples stays unscored rather than being assigned a made-up forecast.
 
@@ -56,6 +58,6 @@ python scripts/track_campaign_views_mtproto.py \
   --session ~/iharvester-recovery/session/account-3
 ```
 
-Run it roughly every 15-30 minutes using a conservative cron job or systemd timer. It loads the authorised accounts' dialog directories once to obtain access hashes, then routes each exact post to the account that already lists that channel and rotates between accounts where more than one can read it. If one account receives a flood wait, the sampler skips it temporarily and attempts another already-authorised account; it never signs in again or sends a message.
+Run it roughly every 15-30 minutes using a conservative cron job or systemd timer. The normal run samples only active, paused, and ending campaigns; use `--include-archived` only for a deliberate one-off history pass. It loads the authorised accounts' dialog directories once to obtain access hashes, then routes each exact post to the account that already lists that channel and rotates between accounts where more than one can read it. If one account receives a flood wait, the sampler skips it temporarily and attempts another already-authorised account; it never signs in again or sends a message.
 
 Do not place `TELEGRAM_API_HASH`, Mongo credentials, or session files in Git, Koyeb variables, public logs, or client links. Keep the existing session files until the owner explicitly retires them.

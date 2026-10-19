@@ -95,6 +95,8 @@ def test_client_portal_includes_honest_audience_views_and_public_proof_only() ->
     }
     page = render_client_portal("secret-token", payload)
     assert "Subscriber memberships across campaign" in page
+    assert "Verified views so far" in page
+    assert "avg." not in page
     assert "See public placements" in page
     assert "Private placements remain intentionally private" in page
     assert "largest public placements" in page

@@ -12,7 +12,7 @@ def test_media_kit_uses_aggregate_inventory_and_sampled_benchmarks() -> None:
         {
             "sampled_campaigns": 5,
             "sampled_placements": 90,
-            "average_views_per_placement": 220,
+            "verified_views": 19_800,
             "hourly": [{"hour": 19, "sample_campaigns": 4, "views_per_placement_hour": 18.25}],
         },
         contact_url="tg://user?id=123456",
@@ -23,5 +23,7 @@ def test_media_kit_uses_aggregate_inventory_and_sampled_benchmarks() -> None:
     assert payload["benchmarks"]["hourly"] == [{"hour": 19, "sample_campaigns": 4, "views_per_placement_hour": 18.25}]
     page = render_media_kit(payload)
     assert "Indicative post-view model" in page
+    assert "Verified mature post views" in page
+    assert "Average measured post views" not in page
     assert "not a deduplicated audience" in page
     assert "/promote/clone_abc/insights" in page

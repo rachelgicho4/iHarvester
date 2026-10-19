@@ -212,10 +212,12 @@ class DeliveryWorker:
             if state and state.get("current_message_ids"):
                 try:
                     replaced_message_count = await self._delete_message_ids(delivery["channel_id"], state["current_message_ids"])
+                    await self._finalize_live_views(delivery["campaign_id"], delivery["channel_id"], state["current_message_ids"])
                     await self.repositories.clear_live_state(delivery["campaign_id"], delivery["channel_id"])
                 except Exception as error:
                     decision = classify_telegram_error(error, operation="delete")
                     if decision.kind == ErrorKind.CLEAN_ABSENT:
+                        await self._finalize_live_views(delivery["campaign_id"], delivery["channel_id"], state["current_message_ids"])
                         await self.repositories.clear_live_state(delivery["campaign_id"], delivery["channel_id"])
                     elif decision.kind == ErrorKind.PERMANENT:
                         await self._permanent(delivery, channel, "DELETE_FAILED_NO_REPLACEMENT", self._safe_error_summary(error))
@@ -306,8 +308,22 @@ class DeliveryWorker:
             else:
                 await self._retry_or_fail(delivery, decision, cleanup=True, error=error)
                 return
+        await self._finalize_live_views(delivery["campaign_id"], delivery["channel_id"], delivery["message_ids"])
         await self.repositories.clear_live_state(delivery["campaign_id"], delivery["channel_id"])
         await self._complete(delivery, delivery["_id"], DeliveryStatus.CLEANED, cleaned_message_count=cleaned_count)
+
+    async def _finalize_live_views(self, campaign_id: str, channel_id: int, message_ids: list[int]) -> None:
+        """Keep a bounded final counter when a sampled post leaves the channel."""
+        finalize = getattr(self.repositories, "finalize_live_state_views", None)
+        if not finalize:
+            return
+        try:
+            await finalize(campaign_id, channel_id, message_ids)
+        except Exception:
+            # Delivery/cleanup has already succeeded on Telegram. A failure to
+            # retain optional view telemetry must never resurrect or retry the
+            # same post, which could duplicate a campaign delivery.
+            logger.exception("Could not preserve the final live-post view count", extra={"campaign_id": campaign_id, "channel_id": channel_id})
 
     async def _retry_or_fail(self, delivery: dict[str, Any], decision: Any, cleanup: bool = False, error: Exception | None = None) -> None:
         summary = self._safe_error_summary(error) if error else decision.category
