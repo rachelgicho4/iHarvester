@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import secrets
-from datetime import timedelta
+from datetime import datetime, timedelta
 from hashlib import sha256
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1455,6 +1455,46 @@ class Repositories:
             "public_channels": public_channels,
         }
 
+    async def network_public_placements(self, *, page: int = 0, limit: int = 24) -> Document:
+        """Return the active, publicly browseable part of the network.
+
+        The public sales page may link only to channels that intentionally
+        expose a username.  Private channels remain part of aggregate
+        inventory figures but are never disclosed through this endpoint.
+        """
+        safe_limit = max(1, min(int(limit), 60))
+        safe_page = max(0, int(page))
+        query: Document = {
+            "$and": [
+                self._active_channel_query(),
+                self._channel_visibility_query(True),
+                {"username": {"$type": "string", "$ne": ""}},
+            ]
+        }
+        total = await self.db.channels.count_documents(query)
+        rows = await self.db.channels.find(
+            query,
+            {"title": 1, "username": 1, "member_count": 1},
+        ).sort(
+            [("member_count", -1), ("title", ASCENDING)]
+        ).skip(safe_page * safe_limit).limit(safe_limit).to_list(safe_limit)
+        items: list[Document] = []
+        for row in rows:
+            username = row.get("username")
+            if not isinstance(username, str) or not username.strip():
+                continue
+            members = row.get("member_count")
+            items.append(
+                {
+                    "label": str(row.get("title") or f"@{username}").strip()[:120],
+                    "url": f"https://t.me/{username.strip()}",
+                    "subscriber_slots": int(members)
+                    if isinstance(members, (int, float)) and not isinstance(members, bool) and members >= 0
+                    else None,
+                }
+            )
+        return {"items": items, "total": total, "page": safe_page, "page_size": safe_limit}
+
     async def campaign_public_placements(self, campaign_id: str, *, page: int = 0, limit: int = 24) -> Document:
         """Provide inspectable links for public placements only.
 
@@ -1466,7 +1506,7 @@ class Repositories:
         safe_page = max(0, int(page))
         states = await self.db.campaign_channel_state.find(
             {"campaign_id": campaign_id},
-            {"channel_id": 1, "current_message_ids": 1},
+            {"channel_id": 1, "current_message_ids": 1, "posted_at": 1, "view_count": 1, "view_observed_at": 1},
         ).sort("updated_at", -1).to_list(None)
         channel_ids = {int(row["channel_id"]) for row in states if row.get("channel_id") is not None}
         if not channel_ids:
@@ -1485,6 +1525,19 @@ class Repositories:
                 continue
             label = str(channel.get("title") or f"@{username}").strip()
             member_count = channel.get("member_count")
+            views = state.get("view_count")
+            posted_at = state.get("posted_at")
+            observed_at = state.get("view_observed_at")
+            mature_view = (
+                int(views)
+                if isinstance(views, (int, float))
+                and not isinstance(views, bool)
+                and views >= 0
+                and isinstance(posted_at, datetime)
+                and isinstance(observed_at, datetime)
+                and as_utc(observed_at) - as_utc(posted_at) >= VIEW_MATURITY
+                else None
+            )
             all_items.append(
                 {
                     "label": label[:120],
@@ -1492,6 +1545,11 @@ class Repositories:
                     "subscriber_slots": int(member_count)
                     if isinstance(member_count, (int, float)) and not isinstance(member_count, bool) and member_count >= 0
                     else None,
+                    # A post is a fair highlight only after it has had enough
+                    # time to gather views.  Fresh posts are still browseable
+                    # below, but never labelled as "best performing".
+                    "verified_post_views": mature_view,
+                    "view_observed_at": as_utc(observed_at).isoformat() if mature_view is not None else None,
                 }
             )
         # Larger public placements appear first. Unknown subscriber counts are
@@ -1503,12 +1561,27 @@ class Repositories:
                 str(item["label"]).casefold(),
             )
         )
+        measured = [item for item in all_items if item["verified_post_views"] is not None]
+        measured.sort(
+            key=lambda item: (
+                -int(item["verified_post_views"] or 0),
+                item["subscriber_slots"] is None,
+                -int(item["subscriber_slots"] or 0),
+                str(item["label"]).casefold(),
+            )
+        )
+        highlights = measured[:3] if measured else all_items[:3]
         start = safe_page * safe_limit
         return {
             "items": all_items[start : start + safe_limit],
             "total": len(all_items),
             "page": safe_page,
             "page_size": safe_limit,
+            "highlights": {
+                "items": highlights,
+                "kind": "views" if measured else "audience",
+                "available": len(measured),
+            },
         }
 
     @staticmethod

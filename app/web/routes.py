@@ -48,15 +48,13 @@ async def _client_portal_payload(runtime: object, token: str) -> tuple[object, d
     campaign = await runtime.repositories.get_campaign(share["campaign_id"])
     if not campaign:
         raise HTTPException(status_code=404, detail="This campaign is no longer available.")
-    totals, cycle_stats, metrics, live_posts, joined, audience, views, benchmarks, public_placements = await asyncio.gather(
+    totals, cycle_stats, metrics, live_posts, joined, audience, public_placements = await asyncio.gather(
         runtime.repositories.campaign_delivery_totals(campaign["campaign_id"]),
         runtime.repositories.campaign_cycle_stats(campaign["campaign_id"]),
         runtime.repositories.campaign_delivery_metrics(campaign["campaign_id"]),
         runtime.repositories.campaign_live_state_count(campaign["campaign_id"]),
         runtime.repositories.campaign_join_count(campaign["campaign_id"]),
         runtime.repositories.campaign_audience_summary(campaign),
-        runtime.repositories.campaign_view_summary(campaign),
-        runtime.repositories.promotion_view_benchmarks(),
         runtime.repositories.campaign_public_placements(campaign["campaign_id"]),
     )
     return share, campaign_progress_payload(
@@ -67,22 +65,26 @@ async def _client_portal_payload(runtime: object, token: str) -> tuple[object, d
         live_posts=live_posts,
         joined=joined,
         audience=audience,
-        views=views,
-        benchmarks=benchmarks,
         public_placements=public_placements,
     )
 
 
-async def _media_kit_payload(runtime: object, *, insights_url: str = "/promote/insights") -> dict[str, object]:
-    audience, benchmarks = await asyncio.gather(
+async def _media_kit_payload(
+    runtime: object,
+    *,
+    insights_url: str = "/promote/insights",
+    placements_url: str = "/promote/placements",
+) -> dict[str, object]:
+    audience, public_placements = await asyncio.gather(
         runtime.repositories.network_audience_summary(),
-        runtime.repositories.promotion_view_benchmarks(),
+        runtime.repositories.network_public_placements(),
     )
     return media_kit_payload(
         audience,
-        benchmarks,
+        public_placements,
         contact_url=runtime.settings.public_contact_url,
         insights_url=insights_url,
+        placements_url=placements_url,
     )
 
 
@@ -175,15 +177,37 @@ def install_routes(app: object) -> None:
         runtime = request.app.state.runtime
         return await _media_kit_payload(runtime)
 
+    @app.get("/promote/placements")
+    async def promotion_media_kit_placements(request: Request, page: int = 0) -> dict[str, object]:
+        runtime = request.app.state.runtime
+        return await runtime.repositories.network_public_placements(page=max(0, page))
+
+    @app.get("/promote/{clone_id}/placements")
+    async def clone_promotion_media_kit_placements(clone_id: str, request: Request, page: int = 0) -> dict[str, object]:
+        runtime = _clone_runtime(request, clone_id)
+        return await runtime.repositories.network_public_placements(page=max(0, page))
+
     @app.get("/promote/{clone_id}", response_class=HTMLResponse)
     async def clone_promotion_media_kit(clone_id: str, request: Request) -> HTMLResponse:
         runtime = _clone_runtime(request, clone_id)
-        return HTMLResponse(render_media_kit(await _media_kit_payload(runtime, insights_url=f"/promote/{clone_id}/insights")))
+        return HTMLResponse(
+            render_media_kit(
+                await _media_kit_payload(
+                    runtime,
+                    insights_url=f"/promote/{clone_id}/insights",
+                    placements_url=f"/promote/{clone_id}/placements",
+                )
+            )
+        )
 
     @app.get("/promote/{clone_id}/insights")
     async def clone_promotion_media_kit_insights(clone_id: str, request: Request) -> dict[str, object]:
         runtime = _clone_runtime(request, clone_id)
-        return await _media_kit_payload(runtime, insights_url=f"/promote/{clone_id}/insights")
+        return await _media_kit_payload(
+            runtime,
+            insights_url=f"/promote/{clone_id}/insights",
+            placements_url=f"/promote/{clone_id}/placements",
+        )
 
     @app.get("/client/c/{token}", response_class=HTMLResponse)
     async def client_campaign_page(token: str, request: Request) -> HTMLResponse:

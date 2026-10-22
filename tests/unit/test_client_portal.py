@@ -71,31 +71,42 @@ def test_client_portal_includes_honest_audience_views_and_public_proof_only() ->
             "unknown_audience_channels": 1,
             "public_channels": 2,
         },
-        views={"total_views": 456, "sampled_placements": 3, "views_per_placement": 152},
-        benchmarks={
-            "sampled_campaigns": 2,
-            "sampled_placements": 6,
-            "average_views_per_placement": 123,
-            "hourly": [{"hour": 20, "sample_campaigns": 2, "views_per_placement_hour": 14.5}],
+        public_placements={
+            "items": [
+                {"label": "Visible public placement", "url": "https://t.me/example/123"},
+                {"label": "Do not expose", "url": "https://example.test/private"},
+            ],
+            "highlights": {
+                "kind": "views",
+                "available": 1,
+                "items": [{"label": "Top live placement", "url": "https://t.me/example/123", "verified_post_views": 456}],
+            },
         },
-        public_placements=[
-            {"label": "Visible public placement", "url": "https://t.me/example/123"},
-            {"label": "Do not expose", "url": "https://example.test/private"},
-        ],
     )
 
     assert payload["audience"]["subscriber_slots"] == 12_345
-    assert payload["views"]["total"] == 456
-    assert payload["benchmarks"]["hourly"][0]["hour"] == 20
     assert payload["placements"] == {
         "items": [{"label": "Visible public placement", "url": "https://t.me/example/123", "subscriber_slots": None}],
         "total": 1,
         "page": 0,
         "page_size": 24,
+        "highlights": {
+            "items": [
+                {
+                    "label": "Top live placement",
+                    "url": "https://t.me/example/123",
+                    "subscriber_slots": None,
+                    "verified_post_views": 456,
+                    "view_observed_at": None,
+                }
+            ],
+            "kind": "views",
+            "available": 1,
+        },
     }
     page = render_client_portal("secret-token", payload)
     assert "Subscriber memberships across campaign" in page
-    assert "Verified views so far" in page
+    assert "Live campaign highlights" in page
     assert "avg." not in page
     assert "See public placements" in page
     assert "Private placements remain intentionally private" in page

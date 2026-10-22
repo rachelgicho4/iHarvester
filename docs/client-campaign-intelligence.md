@@ -2,18 +2,18 @@
 
 iHarvester has two web experiences:
 
-- `https://<service-domain>/promote` is the public, aggregate-only media kit for prospective clients. It shows active placement inventory, subscriber memberships, and verified historical benchmarks without exposing channel identities. Creator clones receive isolated media-kit paths automatically.
-- **Share client progress page** in a campaign creates a private bearer link. It shows that campaign's delivery, elapsed time, subscriber-membership inventory, live post views, timing benchmark, client request form, and links to currently live **public** placements. The public catalogue is ordered by known subscriber count and paginated; private placements never appear as links.
+- `https://<service-domain>/promote` is the public media kit for prospective clients. It shows active placement inventory, subscriber memberships, and a paginated browse of active **public** channels ordered by their current subscriber count. Creator clones receive isolated media-kit paths automatically.
+- **Share client progress page** in a campaign creates a private bearer link. It shows that campaign's delivery, elapsed time, subscriber-membership inventory, client request form, public placement catalogue, and live placement highlights. The public catalogue is ordered by known subscriber count and paginated; private placements never appear as links.
 
 ## What the figures mean
 
 `Subscriber memberships` is the sum of the latest known subscriber count for every selected placement. One person may follow more than one channel, so it is not an audience total, unique-person reach figure, or outcome forecast.
 
-`Verified views so far` on a private client page is an accumulating total from Telegram's actual post-view counters. The tracker refreshes each still-live placement and preserves its final sampled counter when a repost or cleanup removes it. It does not create a per-minute analytics collection, retain message content, or estimate views without a sample.
+The optional view sampler reads Telegram's actual post-view counters only for exact live campaign posts. It preserves a final sampled counter when a repost or cleanup removes a post, but these internal measurements are **not** presented as a network-wide average or a sales forecast.
 
-The public media kit deliberately does **not** show a raw average post-view figure. It presents accumulated verified post views only after a campaign has at least 50 placements observed for six or more hours. Fresh live counters remain visible to that campaign's client, but cannot become public performance evidence until they mature.
+The public media kit deliberately does **not** show post-view averages or forecasts. It instead lets prospects browse the public portion of the live network. Private channels contribute only to aggregate inventory totals.
 
-The time-of-day planner groups prior campaigns by the start hour selected in the campaign's owner timezone. It uses the measured post views per placement-hour and shows the number of campaign samples behind each number. A time without sufficient samples stays unscored rather than being assigned a made-up forecast.
+For an active campaign, the client page shows up to three **live campaign highlights**. Where a public post has both a real sampled counter and at least six hours of life, the highlights are ordered by that verified post counter. Until then, the page honestly falls back to the largest currently public campaign placements. It never labels a fresh or sparsely sampled post as best-performing.
 
 ## Contact target
 

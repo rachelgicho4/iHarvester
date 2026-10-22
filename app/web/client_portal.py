@@ -32,68 +32,46 @@ def _audience_payload(value: dict[str, Any] | None) -> dict[str, int]:
     }
 
 
-def _view_payload(value: dict[str, Any] | None) -> dict[str, Any]:
-    source = value or {}
-    return {
-        "total": max(0, _number(source.get("total_views"))),
-        "current": max(0, _number(source.get("current_views"))),
-        "sampled_placements": max(0, _number(source.get("sampled_placements"))),
-        "mature_placements": max(0, _number(source.get("mature_placements"))),
-        "per_placement": max(0, _number(source.get("views_per_placement"))),
-        "per_placement_hour": max(0.0, float(source.get("views_per_placement_hour") or 0)),
-        "first_sample_at": _iso(source.get("first_sample_at")),
-        "last_sample_at": _iso(source.get("last_sample_at")),
-    }
-
-
-def _benchmark_payload(value: dict[str, Any] | None) -> dict[str, Any]:
-    source = value or {}
-    hours: list[dict[str, Any]] = []
-    for item in list(source.get("hourly") or []):
-        try:
-            hour = int(item.get("hour"))
-        except (TypeError, ValueError):
-            continue
-        if not 0 <= hour <= 23:
-            continue
-        hours.append(
-            {
-                "hour": hour,
-                "sample_campaigns": max(0, _number(item.get("sample_campaigns"))),
-                "views_per_placement_hour": max(0.0, float(item.get("views_per_placement_hour") or 0)),
-            }
-        )
-    return {
-        "sampled_campaigns": max(0, _number(source.get("sampled_campaigns"))),
-        "sampled_placements": max(0, _number(source.get("sampled_placements"))),
-        "average_views_per_placement": max(0, _number(source.get("average_views_per_placement"))),
-        "hourly": sorted(hours, key=lambda item: item["hour"]),
-    }
-
-
 def _placements_payload(value: dict[str, Any] | list[dict[str, Any]] | None) -> dict[str, Any]:
     source = value if isinstance(value, dict) else {"items": value or []}
-    result: list[dict[str, Any]] = []
-    for item in list(source.get("items") or []):
+    def safe_item(item: Any, *, include_highlight: bool = False) -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
         label = str(item.get("label") or "Public placement").strip()
         url = str(item.get("url") or "").strip()
-        if label and url.startswith("https://t.me/"):
-            audience = item.get("subscriber_slots")
-            result.append(
-                {
-                    "label": label[:120],
-                    "url": url,
-                    "subscriber_slots": int(audience)
-                    if isinstance(audience, (int, float)) and not isinstance(audience, bool) and audience >= 0
-                    else None,
-                }
+        if not label or not url.startswith("https://t.me/"):
+            return None
+        audience = item.get("subscriber_slots")
+        result: dict[str, Any] = {
+            "label": label[:120],
+            "url": url,
+            "subscriber_slots": int(audience)
+            if isinstance(audience, (int, float)) and not isinstance(audience, bool) and audience >= 0
+            else None,
+        }
+        if include_highlight:
+            views = item.get("verified_post_views")
+            result["verified_post_views"] = (
+                int(views) if isinstance(views, (int, float)) and not isinstance(views, bool) and views >= 0 else None
             )
+            observed_at = item.get("view_observed_at")
+            result["view_observed_at"] = observed_at if isinstance(observed_at, str) else (_iso(observed_at) if observed_at else None)
+        return result
+
+    result = [entry for item in list(source.get("items") or []) if (entry := safe_item(item))]
+    highlight_source = source.get("highlights") if isinstance(source.get("highlights"), dict) else {}
+    highlights = [entry for item in list(highlight_source.get("items") or []) if (entry := safe_item(item, include_highlight=True))]
     page_size = max(1, min(60, _number(source.get("page_size")) or 24))
     return {
         "items": result[:page_size],
         "total": max(len(result), _number(source.get("total"))),
         "page": max(0, _number(source.get("page"))),
         "page_size": page_size,
+        "highlights": {
+            "items": highlights[:3],
+            "kind": "views" if highlight_source.get("kind") == "views" else "audience",
+            "available": max(0, _number(highlight_source.get("available"))),
+        },
     }
 
 
@@ -106,8 +84,6 @@ def campaign_progress_payload(
     live_posts: int,
     joined: int,
     audience: dict[str, Any] | None = None,
-    views: dict[str, Any] | None = None,
-    benchmarks: dict[str, Any] | None = None,
     public_placements: dict[str, Any] | list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return client-safe aggregate promotion data.
@@ -161,8 +137,6 @@ def campaign_progress_payload(
         "cleanup": {"deleted": cleaned, "failed": cleanup_failed, "live_posts": max(0, int(live_posts))},
         "engagement": {"tracked_joins": max(0, int(joined))},
         "audience": _audience_payload(audience),
-        "views": _view_payload(views),
-        "benchmarks": _benchmark_payload(benchmarks),
         "placements": _placements_payload(public_placements),
     }
 
@@ -181,22 +155,20 @@ def render_client_portal(token: str, payload: dict[str, Any], *, portal_route: s
 <header class="hero"><div><div class="eyebrow">iHarvester / campaign intelligence</div><h1 id="campaign-name">{title}</h1><p class="subtle" id="campaign-state">Live campaign information refreshes automatically.</p></div><div class="badge"><span class="pulse"></span><span id="live-badge">Live updates</span></div></header>
 <section class="layout"><article class="card accent wide"><div class="line"><div><h2>Campaign delivery</h2><p class="muted">A clear, live view of delivery and campaign time.</p></div><b id="delivery-label">Loading...</b></div><div class="track"><div id="delivery-bar" class="fill"></div></div><p class="mini" id="delivery-detail"></p><div class="line" style="margin-top:17px"><b id="timeline-label">Campaign time</b><span class="mini" id="timeline-detail"></span></div><div class="track"><div id="timeline-bar" class="fill timefill"></div></div></article>
 <article class="card"><h2>Placement inventory</h2><div class="figure" id="audience">-</div><p class="muted">Subscriber memberships across campaign placements.</p><div class="trust" id="audience-note">Loading the verified placement inventory...</div></article>
-<article class="card"><h2>Verified views so far</h2><div class="figure" id="views">-</div><p class="muted" id="views-label">Read-only Telegram sampling is preparing.</p><div class="trust" id="views-note">The counter accumulates verified post views as campaign placements are sampled.</div></article>
 <article class="card wide"><div class="line"><div><h2>Results at a glance</h2><p class="muted">Delivery, visibility and response signals update while you are here.</p></div><span class="eyebrow">Verified delivery</span></div><div class="kpis"><div class="kpi"><small>Delivered</small><b id="sent">-</b></div><div class="kpi"><small>Awaiting / processing</small><b id="pending">-</b></div><div class="kpi"><small>Delivery issues</small><b id="failed">-</b></div><div class="kpi"><small>Live placements</small><b id="live-posts">-</b></div><div class="kpi"><small>Cycles completed</small><b id="cycles">-</b></div><div class="kpi"><small>Tracked joins</small><b id="joins">-</b></div></div><p class="mini" id="updated">Updates while this page is open; no manual refresh is needed.</p></article>
-<article class="card wide"><h2>When tends to perform best?</h2><p class="muted">Use measured results from earlier promotions to choose a time for the next run. Estimates remain indicative, not a guarantee.</p><div id="slot-grid" class="slot-grid"></div><label for="estimate-hour">Preferred start hour (your local time)</label><select id="estimate-hour"></select><label for="estimate-hours">How many hours should the ad remain live?</label><input id="estimate-hours" type="number" min="1" max="720" value="24"><div class="estimate" id="estimate-copy">View history will appear here as verified samples are collected.</div></article>
+<article class="card wide" id="highlights-card"><div class="line"><div><h2>Live campaign highlights</h2><p class="muted" id="highlight-note">The strongest public placements will appear here as live post samples mature.</p></div><span class="eyebrow">Open live posts</span></div><div id="highlight-list" class="proof"></div><div id="highlight-empty" class="quiet">Largest public live placements will appear here once a current post is available.</div></article>
 <article class="card wide" id="proof-card"><div class="line"><div><h2>See public placements</h2><p class="muted">Open any public placement to see the live ad in context. Private placements remain intentionally private.</p></div><span class="mini" id="proof-summary"></span></div><div id="proof-list" class="proof"></div><div id="proof-empty" class="quiet">Public placement links appear here once a live post is available in a public channel.</div><div class="line" style="margin-top:12px"><button id="proof-prev" class="secondary" type="button">Previous</button><button id="proof-next" class="secondary" type="button">More placements</button></div></article>
 <article class="card wide"><h2>Book your next promotion</h2><p class="muted">Choose a preferred time or request a new promotion. Your campaign manager reviews payment and approves every request before anything is scheduled.</p><form id="request-form"><div class="layout"><div><label>Request type</label><select id="request-type"><option value="RERUN">Run this promotion again</option><option value="NEW">Request a new promotion</option></select></div><div><label>Your name or reference</label><input id="client-name" maxlength="100" required placeholder="For example: Acme Media"></div></div><label>Preferred start time</label><input id="desired-start" type="datetime-local"><small>Leave blank if you want the campaign manager to choose the most suitable slot.</small><label>Notes or material changes</label><textarea id="details" maxlength="3000" placeholder="Timing, duration, changes, or instructions"></textarea><button type="submit">Send request for approval</button></form><div id="notice" class="notice"></div></article></section>
-<footer>Private campaign link. Subscriber memberships and post-view totals are reported transparently; they are not a promise of unique people, reach, or conversions.</footer>
+<footer>Private campaign link. Delivery, subscriber memberships and mature placement highlights are reported transparently; they are not a promise of unique people, reach, or conversions.</footer>
 </main><script>
 const token={_safe_json(token)};const portalRoute={_safe_json(safe_route)};const progressUrl=`${{portalRoute}}/${{encodeURIComponent(token)}}/progress`;const requestUrl=`${{portalRoute}}/${{encodeURIComponent(token)}}/requests`;const placementsUrl=`${{portalRoute}}/${{encodeURIComponent(token)}}/placements`;let current={initial};
-const n=v=>Number(v||0).toLocaleString();const when=v=>v?new Date(v).toLocaleString():"Not scheduled";const hour=h=>new Intl.DateTimeFormat([],{{hour:'numeric'}}).format(new Date(2026,0,1,Number(h),0));
-function slots(data){{const select=document.getElementById('estimate-hour');const old=select.value;select.innerHTML='';for(let i=0;i<24;i++){{const o=document.createElement('option');o.value=i;o.textContent=hour(i);select.appendChild(o)}}select.value=old||String(new Date().getHours());const measured=(data.benchmarks.hourly||[]).filter(item=>item.sample_campaigns>0&&item.views_per_placement_hour>0).sort((a,b)=>b.views_per_placement_hour-a.views_per_placement_hour).slice(0,3);const box=document.getElementById('slot-grid');box.innerHTML='';if(!measured.length){{box.innerHTML='<div class="quiet" style="grid-column:1/-1">No verified hourly view history yet. The first live tracking samples will build this recommendation.</div>';return}}for(const item of measured){{const card=document.createElement('div');card.className='slot';card.innerHTML=`<b>${{hour(item.hour)}}</b><span>${{n(item.views_per_placement_hour)}} views / placement / hr</span><span>${{n(item.sample_campaigns)}} campaign sample(s)</span>`;box.appendChild(card)}}}}
-function estimate(data){{const selected=Number(document.getElementById('estimate-hour').value);const duration=Math.max(1,Number(document.getElementById('estimate-hours').value)||1);const row=(data.benchmarks.hourly||[]).find(item=>Number(item.hour)===selected&&item.sample_campaigns>0&&item.views_per_placement_hour>0);const copy=document.getElementById('estimate-copy');if(!row){{copy.textContent='There is not enough verified view history for this hour yet. You can still request it; your manager will review the best available slot.';return}}const projected=Math.round(row.views_per_placement_hour*duration*Math.max(1,Number(data.audience.target_count)||0));copy.textContent=`Indicative benchmark: about ${{n(row.views_per_placement_hour)}} measured views per placement per hour from ${{n(row.sample_campaigns)}} similar campaign sample(s). At ${{duration}} hour(s), that is roughly ${{n(projected)}} placement views across this campaign inventory, before any manager adjustments. Not a guarantee.`}}
+const n=v=>Number(v||0).toLocaleString();const when=v=>v?new Date(v).toLocaleString():"Not scheduled";
+function highlights(data){{const box=document.getElementById('highlight-list'),empty=document.getElementById('highlight-empty'),p=data.placements||{{}},h=p.highlights||{{items:[]}},items=h.items||[];box.innerHTML='';empty.style.display=items.length?'none':'block';const note=document.getElementById('highlight-note');note.textContent=h.kind==='views'&&items.length?'Highest verified post-view totals among public live placements. Each post is eligible only after at least six hours.':'Largest public live placements. View highlights appear only after a post has had time to gather a fair sample.';for(const item of items){{const a=document.createElement('a');a.href=item.url;a.target='_blank';a.rel='noopener noreferrer';const copy=document.createElement('span'),title=document.createElement('b'),detail=document.createElement('small'),arrow=document.createElement('span');title.textContent=item.label;detail.textContent=h.kind==='views'&&item.verified_post_views!==null?`${{n(item.verified_post_views)}} verified post views${{item.subscriber_slots===null?'':` · ${{n(item.subscriber_slots)}} subscriber memberships`}}`:item.subscriber_slots===null?'Subscriber count not available':`${{n(item.subscriber_slots)}} subscriber memberships`;copy.append(title,document.createElement('br'),detail);arrow.className='arrow';arrow.textContent='Open ->';a.append(copy,arrow);box.appendChild(a)}}}}
 function proof(data){{const list=document.getElementById('proof-list'),empty=document.getElementById('proof-empty'),p=data.placements||{{items:[]}},placements=p.items||[];list.innerHTML='';empty.style.display=placements.length?'none':'block';document.getElementById('proof-summary').textContent=p.total?`Showing ${{n(p.page*p.page_size+1)}}-${{n(Math.min(p.total,(p.page+1)*p.page_size))}} of ${{n(p.total)}} largest public placements`:'No public placements live yet';document.getElementById('proof-prev').disabled=!p.page;document.getElementById('proof-next').disabled=!p.total||((p.page+1)*p.page_size>=p.total);for(const item of placements){{const a=document.createElement('a');a.href=item.url;a.target='_blank';a.rel='noopener noreferrer';const copy=document.createElement('span'),title=document.createElement('b'),detail=document.createElement('small'),arrow=document.createElement('span');title.textContent=item.label;detail.textContent=item.subscriber_slots===null?'Subscriber count not available':`${{n(item.subscriber_slots)}} subscriber memberships`;copy.append(title,document.createElement('br'),detail);arrow.className='arrow';arrow.textContent='Open ->';a.append(copy,arrow);list.appendChild(a)}}}}
 async function loadProof(page){{try{{const r=await fetch(`${{placementsUrl}}?page=${{Math.max(0,page)}}`,{{cache:'no-store'}});if(!r.ok)throw Error();current={{...current,placements:await r.json()}};proof(current)}}catch{{document.getElementById('proof-summary').textContent='Could not load more public placements. Please retry.'}}}}
-function paint(data){{current=data;const c=data.campaign,d=data.delivery,t=data.timeline,cy=data.cycles,cl=data.cleanup,e=data.engagement,a=data.audience,v=data.views;document.title=`${{c.name}} | iHarvester`;document.getElementById('campaign-name').textContent=c.name;document.getElementById('campaign-state').textContent=`${{c.status}} | ${{c.mode}} | updates every 10 seconds`;document.getElementById('delivery-bar').style.width=`${{d.percent}}%`;document.getElementById('delivery-label').textContent=d.total?`${{d.percent}}% complete`:'Waiting for the first delivery cycle';document.getElementById('delivery-detail').textContent=`${{n(d.sent)}} delivered | ${{n(d.pending)}} in progress | ${{n(d.failed+d.unknown)}} issue(s)`;document.getElementById('timeline-bar').style.width=`${{t.percent}}%`;document.getElementById('timeline-label').textContent=`Campaign time: ${{t.percent}}%`;document.getElementById('timeline-detail').textContent=`${{when(c.start_at)}} - ${{when(c.end_at)}}`;document.getElementById('sent').textContent=n(d.sent);document.getElementById('pending').textContent=n(d.pending);document.getElementById('failed').textContent=n(d.failed+d.unknown);document.getElementById('live-posts').textContent=n(cl.live_posts);document.getElementById('cycles').textContent=`${{n(cy.completed)}} / ${{n(cy.planned)}}`;document.getElementById('joins').textContent=n(e.tracked_joins);document.getElementById('audience').textContent=a.subscriber_slots?n(a.subscriber_slots):'Building inventory';document.getElementById('audience-note').innerHTML=a.subscriber_slots?`<strong>${{n(a.known_count)}} of ${{n(a.target_count)}} placements</strong> have a current subscriber count. These are subscriber memberships across channels, not a unique-person audience or a reach estimate.${{a.unknown_count?` ${{n(a.unknown_count)}} placement(s) are not counted yet.`:''}}`:'The campaign placement inventory is still being measured.';document.getElementById('views').textContent=v.sampled_placements?n(v.total):'Tracking starts soon';document.getElementById('views-label').textContent=v.sampled_placements?`${{n(v.sampled_placements)}} verified placement samples | ${{n(v.current)}} views on posts still live`:'Telegram post views will appear after the first verified sample.';document.getElementById('views-note').textContent=v.sampled_placements?`Last sampled ${{when(v.last_sample_at)}}. This total accumulates observed Telegram post views and rises as the sampler records newer counters.`:'View tracking reads live post counters without creating extra exposure.';document.getElementById('updated').textContent=`Last campaign data update: ${{when(c.updated_at)}} | refreshes automatically every 10 seconds.`;slots(data);estimate(data);proof(data)}}
+function paint(data){{current=data;const c=data.campaign,d=data.delivery,t=data.timeline,cy=data.cycles,cl=data.cleanup,e=data.engagement,a=data.audience;document.title=`${{c.name}} | iHarvester`;document.getElementById('campaign-name').textContent=c.name;document.getElementById('campaign-state').textContent=`${{c.status}} | ${{c.mode}} | updates every 10 seconds`;document.getElementById('delivery-bar').style.width=`${{d.percent}}%`;document.getElementById('delivery-label').textContent=d.total?`${{d.percent}}% complete`:'Waiting for the first delivery cycle';document.getElementById('delivery-detail').textContent=`${{n(d.sent)}} delivered | ${{n(d.pending)}} in progress | ${{n(d.failed+d.unknown)}} issue(s)`;document.getElementById('timeline-bar').style.width=`${{t.percent}}%`;document.getElementById('timeline-label').textContent=`Campaign time: ${{t.percent}}%`;document.getElementById('timeline-detail').textContent=`${{when(c.start_at)}} - ${{when(c.end_at)}}`;document.getElementById('sent').textContent=n(d.sent);document.getElementById('pending').textContent=n(d.pending);document.getElementById('failed').textContent=n(d.failed+d.unknown);document.getElementById('live-posts').textContent=n(cl.live_posts);document.getElementById('cycles').textContent=`${{n(cy.completed)}} / ${{n(cy.planned)}}`;document.getElementById('joins').textContent=n(e.tracked_joins);document.getElementById('audience').textContent=a.subscriber_slots?n(a.subscriber_slots):'Building inventory';document.getElementById('audience-note').innerHTML=a.subscriber_slots?`<strong>${{n(a.known_count)}} of ${{n(a.target_count)}} placements</strong> have a current subscriber count. These are subscriber memberships across channels, not a unique-person audience or a reach estimate.${{a.unknown_count?` ${{n(a.unknown_count)}} placement(s) are not counted yet.`:''}}`:'The campaign placement inventory is still being measured.';document.getElementById('updated').textContent=`Last campaign data update: ${{when(c.updated_at)}} | refreshes automatically every 10 seconds.`;highlights(data);proof(data)}}
 async function refresh(){{try{{const r=await fetch(progressUrl,{{cache:'no-store'}});if(!r.ok)throw Error();paint(await r.json());document.getElementById('live-badge').textContent='Live updates'}}catch{{document.getElementById('live-badge').textContent='Reconnecting...';document.getElementById('updated').textContent='Live updates are temporarily unavailable. Retrying automatically...'}}}}
-paint(current);setInterval(refresh,10000);document.getElementById('estimate-hour').addEventListener('change',()=>estimate(current));document.getElementById('estimate-hours').addEventListener('input',()=>estimate(current));document.getElementById('proof-prev').addEventListener('click',()=>loadProof(Number(current.placements?.page||0)-1));document.getElementById('proof-next').addEventListener('click',()=>loadProof(Number(current.placements?.page||0)+1));
+paint(current);setInterval(refresh,10000);document.getElementById('proof-prev').addEventListener('click',()=>loadProof(Number(current.placements?.page||0)-1));document.getElementById('proof-next').addEventListener('click',()=>loadProof(Number(current.placements?.page||0)+1));
 document.getElementById('request-form').addEventListener('submit',async event=>{{event.preventDefault();const notice=document.getElementById('notice');notice.style.display='block';notice.textContent='Sending request...';const wanted=document.getElementById('desired-start').value;const body={{request_type:document.getElementById('request-type').value,client_name:document.getElementById('client-name').value,details:document.getElementById('details').value,desired_start:wanted||null,client_timezone:Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC'}};try{{const r=await fetch(requestUrl,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});const out=await r.json();if(!r.ok)throw Error(out.detail||'Could not send request');notice.textContent=out.material_url?'Request recorded. Send your post materials through Telegram, then tap Done there so it reaches approval.':'Request recorded and waiting for payment and approval.';if(out.material_url){{const a=document.createElement('a');a.className='button';a.href=out.material_url;a.textContent='Send materials in Telegram';notice.appendChild(document.createElement('br'));notice.appendChild(a)}}event.target.reset()}}catch(error){{notice.textContent=error.message||'Could not send request. Please try again.'}}}});
 </script></body></html>"""
 
