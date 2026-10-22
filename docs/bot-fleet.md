@@ -36,4 +36,6 @@ It reads `MONGODB_URI`, `MONGODB_DB_NAME`, `TELEGRAM_API_ID`, and `TELEGRAM_API_
 
 Use `--dry-run` to list waiting fleet jobs without opening Telegram or writing data. A systemd timer may call the `--once` command every few minutes. The Telegram UI shows per-bot completion, already-admin, pending, failed, or cancelled state.
 
+The repository includes ready-to-copy systemd units in [`deploy/iharvester-bot-fleet.service`](../deploy/iharvester-bot-fleet.service) and [`deploy/iharvester-bot-fleet.timer`](../deploy/iharvester-bot-fleet.timer). They use the existing VPS-only environment and preserved session paths, run one channel per invocation, and take a non-blocking lock so they never overlap.
+
 If every authorised account lacks **Add admins** in a chosen channel, the job safely fails without changing the channel. Grant that right to one of the three human accounts and create a fresh job from the Bot fleet screen.

@@ -1,0 +1,15 @@
+[Unit]
+Description=iHarvester approved bot-fleet promotion worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/iharvester-recovery/repo
+EnvironmentFile=/root/iharvester-recovery/view-tracker.env
+# The worker opens only the existing authorised human sessions.  flock makes
+# a timer overlap harmless, and --once bounds each invocation to one channel.
+ExecStart=/usr/bin/flock -n /run/iharvester-bot-fleet.lock /root/iharvester-recovery/venv/bin/python /root/iharvester-recovery/repo/scripts/promote_bot_fleet_mtproto.py --session /root/iharvester-recovery/session/account-1.session --session /root/iharvester-recovery/session/account-2.session --session /root/iharvester-recovery/session/account-3.session --once --delay 1
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the iHarvester bot-fleet worker regularly
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=2min
+RandomizedDelaySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
