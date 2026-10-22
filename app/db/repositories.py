@@ -288,6 +288,105 @@ class Repositories:
             },
         )
 
+    async def create_bot_fleet_job(
+        self,
+        *,
+        owner_id: int,
+        channel_id: int,
+        bot_usernames: tuple[str, ...],
+    ) -> tuple[Document, bool]:
+        """Queue one owner-approved fleet promotion without duplicate runs.
+
+        The web bot merely validates that iHarvester already administers the
+        registered channel.  A separate private MTProto worker later selects
+        an authorised *human* account which has that exact channel in its own
+        Telegram directory and can add administrators.
+        """
+        channel = await self.get_channel(channel_id)
+        if not channel or not bool(channel.get("permissions", {}).get("is_admin")):
+            raise ValueError("iHarvester must already be an administrator of that registered channel")
+        if not bot_usernames:
+            raise ValueError("the approved bot fleet is empty")
+        existing = await self.db.bot_fleet_jobs.find_one(
+            {
+                "owner_id": owner_id,
+                "channel_id": channel_id,
+                "status": {"$in": ["QUEUED", "RUNNING", "CANCEL_REQUESTED"]},
+            },
+            sort=[("requested_at", -1)],
+        )
+        if existing:
+            return existing, False
+        now = utcnow()
+        job: Document = {
+            "job_id": f"fleet_{secrets.token_urlsafe(9)}",
+            "owner_id": owner_id,
+            "channel_id": channel_id,
+            "channel_title": str(channel.get("title") or channel_id),
+            "channel_username": channel.get("username"),
+            "bot_usernames": list(bot_usernames),
+            "results": [
+                {
+                    "username": username,
+                    "status": "PENDING",
+                    "account_label": None,
+                    "error": None,
+                    "updated_at": now,
+                }
+                for username in bot_usernames
+            ],
+            "status": "QUEUED",
+            "requested_at": now,
+            "started_at": None,
+            "completed_at": None,
+            "updated_at": now,
+            "worker_id": None,
+            "lease_until": None,
+        }
+        try:
+            await self.db.bot_fleet_jobs.insert_one(job)
+        except DuplicateKeyError:
+            # The unique ID collision is extraordinarily unlikely.  Retrying
+            # once keeps a callback idempotent without creating a second job.
+            job["job_id"] = f"fleet_{secrets.token_urlsafe(12)}"
+            await self.db.bot_fleet_jobs.insert_one(job)
+        return job, True
+
+    async def get_bot_fleet_job(self, job_id: str, owner_id: int) -> Document | None:
+        return await self.db.bot_fleet_jobs.find_one({"job_id": job_id, "owner_id": owner_id})
+
+    async def list_bot_fleet_jobs(self, owner_id: int, *, skip: int = 0, limit: int = 6) -> list[Document]:
+        safe_skip = max(0, int(skip))
+        safe_limit = max(1, min(int(limit), 10))
+        return await self.db.bot_fleet_jobs.find({"owner_id": owner_id}).sort(
+            "requested_at", -1
+        ).skip(safe_skip).limit(safe_limit).to_list(safe_limit)
+
+    async def cancel_bot_fleet_job(self, job_id: str, owner_id: int) -> Document | None:
+        """Cancel a queued job immediately or ask a running worker to stop."""
+        now = utcnow()
+        queued = await self.db.bot_fleet_jobs.find_one_and_update(
+            {"job_id": job_id, "owner_id": owner_id, "status": "QUEUED"},
+            {
+                "$set": {
+                    "status": "CANCELLED",
+                    "completed_at": now,
+                    "updated_at": now,
+                    "lease_until": None,
+                    "results.$[].status": "CANCELLED",
+                    "results.$[].updated_at": now,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if queued:
+            return queued
+        return await self.db.bot_fleet_jobs.find_one_and_update(
+            {"job_id": job_id, "owner_id": owner_id, "status": "RUNNING"},
+            {"$set": {"status": "CANCEL_REQUESTED", "updated_at": now}},
+            return_document=ReturnDocument.AFTER,
+        )
+
     async def set_channel_tags(self, chat_id: int, tags: list[str]) -> None:
         await self.db.channels.update_one(
             {"telegram_chat_id": chat_id},

@@ -92,6 +92,26 @@ def test_creator_clone_button_is_only_added_to_the_primary_home_keyboard() -> No
     assert "clone:home" not in clone_controls
 
 
+def test_bot_fleet_button_is_primary_only_and_usernames_are_normalized() -> None:
+    settings = Settings(
+        bot_token="1:" + "x" * 30,
+        owner_user_ids="1",
+        mongodb_uri="mongodb://example.invalid",
+        run_mode="polling",
+        bot_fleet_usernames="@OneFleetBot, two_fleet_bot, ONEFLEETBOT",
+    )
+    primary_controls = [
+        button.callback_data
+        for row in home_keyboard(include_fleet_manager=True).inline_keyboard
+        for button in row
+    ]
+    clone_controls = [button.callback_data for row in home_keyboard().inline_keyboard for button in row]
+
+    assert settings.fleet_usernames == ("onefleetbot", "two_fleet_bot")
+    assert "fleet:home" in primary_controls
+    assert "fleet:home" not in clone_controls
+
+
 def test_clone_worker_uses_the_current_delivery_worker_constructor(monkeypatch: pytest.MonkeyPatch) -> None:
     received: dict[str, object] = {}
 

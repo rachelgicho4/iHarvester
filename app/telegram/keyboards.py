@@ -40,7 +40,11 @@ def audience_markup(buttons: list[Button], layout: str = "AUTO") -> InlineKeyboa
     ] for row in auto_button_rows(buttons, layout)])
 
 
-def home_keyboard(*, include_clone_manager: bool = False) -> InlineKeyboardMarkup:
+def home_keyboard(
+    *,
+    include_clone_manager: bool = False,
+    include_fleet_manager: bool = False,
+) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="Create Campaign", callback_data="home:create"),
          InlineKeyboardButton(text="Campaigns", callback_data="home:campaigns")],
@@ -54,4 +58,8 @@ def home_keyboard(*, include_clone_manager: bool = False) -> InlineKeyboardMarku
     # but must never be able to reach the main bot's clone controls.
     if include_clone_manager:
         rows.insert(3, [InlineKeyboardButton(text="Creator clones", callback_data="clone:home")])
+    # Human-account fleet promotion belongs only to the primary bot.  Clones
+    # share this keyboard helper but never opt in to this control.
+    if include_fleet_manager:
+        rows.insert(3, [InlineKeyboardButton(text="Bot fleet", callback_data="fleet:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

@@ -27,6 +27,14 @@ class Settings(BaseSettings):
     webhook_path_secret: str | None = None
     webhook_secret_token: str | None = None
     clone_token_encryption_key: str | None = None
+    # The primary operator can add this approved, fixed fleet to one selected
+    # channel at a time.  It is deliberately unavailable to creator clones.
+    # Values may be supplied with or without ``@`` and separated by commas.
+    bot_fleet_usernames: str = (
+        "HD10STORE111BOT,HD10_22SHAREBOT,HD10REBOOTBOT,HD10SHARE222222BOT,HD10SHARE3333BOT,"
+        "hd10share555bot,iBoxTV66666bot,HD10SHARE7777BOT,HD10SHARE8888888BOT,hd10share999bot,"
+        "HD10SHARE1000BOT,HoDragonsBot,hd10share13bot,ibox3bot,whatdoyouwantrobot"
+    )
     # Atlas accepts database names up to 38 bytes.  Clone IDs are 22 ASCII
     # characters, so this deliberately stays short enough for ``prefix_id``.
     clone_database_prefix: str = Field(default="iharvester", min_length=1, max_length=15)
@@ -77,6 +85,26 @@ class Settings(BaseSettings):
             raise ValueError("PUBLIC_CONTACT_USERNAME must be a valid Telegram username, with or without @")
         return username
 
+    @field_validator("bot_fleet_usernames")
+    @classmethod
+    def valid_bot_fleet_usernames(cls, value: str) -> str:
+        usernames: list[str] = []
+        seen: set[str] = set()
+        for raw in value.split(","):
+            username = raw.strip().lstrip("@").lower()
+            if not username:
+                continue
+            if not username.replace("_", "").isalnum() or not 5 <= len(username) <= 32:
+                raise ValueError("BOT_FLEET_USERNAMES must contain valid comma-separated Telegram usernames")
+            if username not in seen:
+                usernames.append(username)
+                seen.add(username)
+        if not usernames:
+            raise ValueError("BOT_FLEET_USERNAMES must contain at least one Telegram bot username")
+        if len(usernames) > 50:
+            raise ValueError("BOT_FLEET_USERNAMES may contain at most 50 bots")
+        return ",".join(usernames)
+
     @model_validator(mode="after")
     def validate_broadcast_limits(self) -> Settings:
         if not self.allow_paid_broadcast and self.broadcast_send_rps > 30:
@@ -92,6 +120,11 @@ class Settings(BaseSettings):
     @cached_property
     def owner_ids(self) -> frozenset[int]:
         return frozenset(int(value) for value in self.owner_user_ids.split(","))
+
+    @cached_property
+    def fleet_usernames(self) -> tuple[str, ...]:
+        """Approved fleet names, normalized without leading ``@`` signs."""
+        return tuple(value.strip().lstrip("@").lower() for value in self.bot_fleet_usernames.split(",") if value.strip())
 
     @property
     def resolved_public_base_url(self) -> str | None:

@@ -87,6 +87,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 sender=sender,
                 public_base_url=settings.resolved_public_base_url,
                 include_clone_manager=True,
+                include_fleet_manager=True,
+                fleet_usernames=settings.fleet_usernames,
             ).router
         )
         app.state.runtime = runtime

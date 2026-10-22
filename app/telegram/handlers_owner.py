@@ -547,6 +547,8 @@ class OwnerHandlers:
         client_portal_route: str = "/client/c",
         media_kit_route: str = "/promote",
         include_clone_manager: bool = False,
+        include_fleet_manager: bool = False,
+        fleet_usernames: tuple[str, ...] = (),
     ) -> None:
         self.owner_ids = owner_ids
         self.repositories = repositories
@@ -556,6 +558,10 @@ class OwnerHandlers:
         self.client_portal_route = "/" + client_portal_route.strip("/")
         self.media_kit_route = "/" + media_kit_route.strip("/")
         self.include_clone_manager = include_clone_manager
+        self.include_fleet_manager = include_fleet_manager
+        self.fleet_usernames = tuple(
+            dict.fromkeys(username.strip().lstrip("@").lower() for username in fleet_usernames if username.strip())
+        )
         self.router = Router(name="owner")
         self.router.message.register(self.start, CommandStart())
         self.router.message.register(self.backup, Command("backup"))
@@ -571,7 +577,10 @@ class OwnerHandlers:
         return user_id in self.owner_ids
 
     def _home_keyboard(self) -> InlineKeyboardMarkup:
-        return home_keyboard(include_clone_manager=self.include_clone_manager)
+        return home_keyboard(
+            include_clone_manager=self.include_clone_manager,
+            include_fleet_manager=self.include_fleet_manager,
+        )
 
     @staticmethod
     def _date(value: Any, timezone: str = "UTC") -> str:
@@ -941,6 +950,182 @@ class OwnerHandlers:
             f"State: {phase}.",
             campaign_keyboard(campaign["campaign_id"], status, variant_count=len(variants), has_live_posts=live_count > 0),
         )
+
+    async def _show_bot_fleet(self, message: Message, owner_id: int, *, notice: str | None = None) -> None:
+        """Show the primary owner's narrowly scoped fleet-promotion workspace."""
+        if not self.include_fleet_manager:
+            raise ValueError("bot fleet controls are available only from the primary iHarvester bot")
+        jobs = await self.repositories.list_bot_fleet_jobs(owner_id, limit=3)
+        recent = "No fleet jobs have been requested yet."
+        if jobs:
+            recent_lines = []
+            for job in jobs:
+                results = job.get("results", [])
+                completed = sum(
+                    1
+                    for result in results
+                    if result.get("status") in {"ADDED", "ALREADY_ADMIN", "FAILED", "CANCELLED"}
+                )
+                recent_lines.append(
+                    f"â€¢ {job.get('channel_title', job.get('channel_id'))}: {str(job.get('status', 'UNKNOWN')).replace('_', ' ').title()} "
+                    f"({completed}/{len(results)})"
+                )
+            recent = "\n".join(recent_lines)
+        await self._render(
+            message,
+            (f"{notice}\n\n" if notice else "")
+            + "Bot fleet\n\n"
+            + f"Approved bots: {len(self.fleet_usernames)}\n"
+            + "Choose one registered channel at a time. iHarvester must already be its administrator. "
+            + "A private authorised human-account worker then uses only an account which already sees that exact channel and has Add admins permission.\n\n"
+            + "Every fleet bot receives posting and editing rights only. They do not receive channel-management, "
+            + "invite, deletion, or administrator-delegation rights.\n\n"
+            + f"Recent jobs\n{recent}",
+            _markup(
+                [
+                    [InlineKeyboardButton(text="Add fleet to one channel", callback_data="fleet:add")],
+                    [InlineKeyboardButton(text="Fleet job history", callback_data="fleet:history:0")],
+                    [InlineKeyboardButton(text="Home", callback_data="home:back")],
+                ]
+            ),
+        )
+
+    @staticmethod
+    def _fleet_job_counts(job: Document) -> Counter[str]:
+        return Counter(str(item.get("status") or "PENDING") for item in job.get("results", []))
+
+    async def _show_bot_fleet_job(self, message: Message, owner_id: int, job_id: str, *, notice: str | None = None) -> None:
+        job = await self.repositories.get_bot_fleet_job(job_id, owner_id)
+        if not job:
+            await self._show_bot_fleet(message, owner_id, notice="That fleet job has expired or is not available.")
+            return
+        results = list(job.get("results", []))
+        counts = self._fleet_job_counts(job)
+        done = sum(counts[state] for state in ("ADDED", "ALREADY_ADMIN", "FAILED", "CANCELLED"))
+        title = str(job.get("channel_title") or job.get("channel_id"))
+        channel_username = job.get("channel_username")
+        destination = f"@{channel_username}" if channel_username else "private channel"
+        status = str(job.get("status") or "UNKNOWN").replace("_", " ").title()
+        summary = [
+            f"Fleet job â€¢ {status}",
+            "",
+            f"Channel: {title} ({destination})",
+            f"Progress: {done}/{len(results)} complete",
+            f"Added: {counts['ADDED']}  |  Already admin: {counts['ALREADY_ADMIN']}",
+            f"Waiting: {counts['PENDING']}  |  Failed: {counts['FAILED']}  |  Cancelled: {counts['CANCELLED']}",
+        ]
+        if job.get("started_at"):
+            summary.append(f"Started: {self._date(job.get('started_at'))}")
+        if job.get("completed_at"):
+            summary.append(f"Finished: {self._date(job.get('completed_at'))}")
+        summary.append("\nPer bot")
+        for result in results:
+            label = f"@{result.get('username', 'unknown')}"
+            state = str(result.get("status") or "PENDING").replace("_", " ").title()
+            detail = str(result.get("error") or "").strip()
+            summary.append(f"â€¢ {label}: {state}" + (f" â€” {detail[:90]}" if detail else ""))
+        controls: list[list[InlineKeyboardButton]] = [
+            [InlineKeyboardButton(text="Refresh status", callback_data=f"fleet:job:{job_id}")],
+        ]
+        if job.get("status") in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}:
+            controls.append([InlineKeyboardButton(text="Cancel remaining", callback_data=f"fleet:cancel:{job_id}")])
+        controls.extend(
+            [
+                [InlineKeyboardButton(text="Fleet jobs", callback_data="fleet:history:0")],
+                [InlineKeyboardButton(text="Bot fleet", callback_data="fleet:home")],
+            ]
+        )
+        await self._render(message, (f"{notice}\n\n" if notice else "") + "\n".join(summary), _markup(controls))
+
+    async def _show_bot_fleet_history(self, message: Message, owner_id: int, page: int) -> None:
+        page = max(0, page)
+        page_size = 6
+        jobs = await self.repositories.list_bot_fleet_jobs(owner_id, skip=page * page_size, limit=page_size)
+        if not jobs:
+            await self._show_bot_fleet(message, owner_id, notice="No fleet jobs on that page.")
+            return
+        lines = [f"Bot fleet history â€¢ page {page + 1}", ""]
+        controls: list[list[InlineKeyboardButton]] = []
+        for index, job in enumerate(jobs, start=page * page_size + 1):
+            counts = self._fleet_job_counts(job)
+            results = list(job.get("results", []))
+            complete = sum(counts[state] for state in ("ADDED", "ALREADY_ADMIN", "FAILED", "CANCELLED"))
+            lines.append(
+                f"{index}. {job.get('channel_title', job.get('channel_id'))} â€” "
+                f"{str(job.get('status', 'UNKNOWN')).replace('_', ' ').title()} ({complete}/{len(results)})"
+            )
+            controls.append([InlineKeyboardButton(text=f"Open job {index}", callback_data=f"fleet:job:{job['job_id']}")])
+        navigation: list[InlineKeyboardButton] = []
+        if page:
+            navigation.append(InlineKeyboardButton(text="Previous", callback_data=f"fleet:history:{page - 1}"))
+        if len(jobs) == page_size:
+            navigation.append(InlineKeyboardButton(text="Next", callback_data=f"fleet:history:{page + 1}"))
+        if navigation:
+            controls.append(navigation)
+        controls.append([InlineKeyboardButton(text="Bot fleet", callback_data="fleet:home")])
+        await self._render(message, "\n".join(lines), _markup(controls))
+
+    async def _fleet_channel(self, bot: Bot, channel_id: int) -> Document:
+        """Recheck the current bot's access; legacy registry rows can be stale."""
+        channel = await self.repositories.get_channel(channel_id)
+        if not channel or not bool(channel.get("permissions", {}).get("is_admin")):
+            await refresh_channel(bot, self.repositories, channel_id, preserve_manual_pause=True)
+            channel = await self.repositories.get_channel(channel_id)
+        if not channel or not bool(channel.get("permissions", {}).get("is_admin")):
+            raise ValueError("iHarvester is not an administrator of that channel; add it first, then try again")
+        return channel
+
+    async def _fleet_action(self, query: CallbackQuery, bot: Bot, data: str) -> None:
+        if not self.include_fleet_manager:
+            await query.answer("This control is only available in the primary iHarvester bot.", show_alert=True)
+            return
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        owner_id = query.from_user.id
+        if action == "home":
+            await self.repositories.clear_owner_session(owner_id)
+            await self._show_bot_fleet(query.message, owner_id)
+        elif action == "add":
+            await self.repositories.set_owner_session(owner_id, {"action": "await_fleet_channel_id"})
+            await query.message.answer(
+                "Send the numeric Telegram channel ID, for example -1001234567890. "
+                "iHarvester must already be an administrator there.",
+                reply_markup=_markup(_navigation("fleet:home")),
+            )
+        elif action == "confirm" and len(parts) == 3:
+            channel_id = int(parts[2])
+            channel = await self._fleet_channel(bot, channel_id)
+            job, created = await self.repositories.create_bot_fleet_job(
+                owner_id=owner_id,
+                channel_id=channel_id,
+                bot_usernames=self.fleet_usernames,
+            )
+            await self.repositories.clear_owner_session(owner_id)
+            notice = (
+                f"Queued {len(self.fleet_usernames)} approved bots for {channel.get('title', channel_id)}. "
+                "The private worker will select an authorised human account that has Add admins permission."
+                if created
+                else "A fleet job for this channel is already queued or running."
+            )
+            await self._show_bot_fleet_job(query.message, owner_id, job["job_id"], notice=notice)
+        elif action == "job" and len(parts) == 3:
+            await self._show_bot_fleet_job(query.message, owner_id, parts[2])
+        elif action == "history" and len(parts) == 3:
+            await self._show_bot_fleet_history(query.message, owner_id, int(parts[2]))
+        elif action == "cancel" and len(parts) == 3:
+            job = await self.repositories.cancel_bot_fleet_job(parts[2], owner_id)
+            await self._show_bot_fleet_job(
+                query.message,
+                owner_id,
+                parts[2],
+                notice=(
+                    "Queued work cancelled."
+                    if job and job.get("status") == "CANCELLED"
+                    else "Cancellation requested; the current safe step will finish first."
+                ),
+            )
+        else:
+            raise ValueError("that fleet control is no longer valid")
 
     async def _show_network(self, message: Message, *, notice: str | None = None) -> None:
         counts = await self.repositories.channel_status_counts()
@@ -1341,6 +1526,8 @@ class OwnerHandlers:
             elif data.startswith("share:"):
                 _, campaign_id, index, action, share_code = data.split(":", 4)
                 await self._share_action(query, campaign_id, int(index), action, share_code)
+            elif data.startswith("fleet:"):
+                await self._fleet_action(query, bot, data)
             elif data.startswith("btn:"):
                 _, campaign_id, index, placement = data.split(":", 3)
                 await self.repositories.set_owner_session(
@@ -3058,6 +3245,8 @@ class OwnerHandlers:
             return _markup(_navigation(f"c:{campaign_id}:open"))
         if session.get("action") in {"await_channel_forward", "await_channel_tag"}:
             return _markup(_navigation("net:home"))
+        if session.get("action") == "await_fleet_channel_id":
+            return _markup(_navigation("fleet:home"))
         return _markup(_navigation())
 
     async def _handle_session_message(self, message: Message, bot: Bot, session: Document) -> None:
@@ -3104,6 +3293,31 @@ class OwnerHandlers:
             await self.repositories.clear_owner_session(owner_id)
             await message.answer(f"Tags saved: {', '.join(tags) or 'none'}")
             await self._show_channel(message, session["channel_id"])
+            return
+        if action == "await_fleet_channel_id":
+            raw_channel_id = (message.text or "").strip()
+            try:
+                channel_id = int(raw_channel_id)
+            except ValueError as error:
+                raise ValueError("send the numeric channel ID, for example -1001234567890") from error
+            if channel_id >= 0:
+                raise ValueError("send the negative numeric ID of a Telegram channel, for example -1001234567890")
+            channel = await self._fleet_channel(bot, channel_id)
+            await self.repositories.set_owner_session(owner_id, {"action": "confirm_fleet_channel", "channel_id": channel_id})
+            username = f"@{channel['username']}" if channel.get("username") else "private channel"
+            await message.answer(
+                f"Ready to add {len(self.fleet_usernames)} approved bots to:\n"
+                f"{channel.get('title', channel_id)} ({username})\n\n"
+                "The private worker will use only an authorised human account that already has this exact channel and Add admins permission. "
+                "Each fleet bot receives posting and editing rights only. Confirm to queue it.",
+                reply_markup=_markup(
+                    [
+                        [InlineKeyboardButton(text="Confirm add bot fleet", callback_data=f"fleet:confirm:{channel_id}")],
+                        [InlineKeyboardButton(text="Choose another channel", callback_data="fleet:add")],
+                        [InlineKeyboardButton(text="Cancel", callback_data="fleet:home")],
+                    ]
+                ),
+            )
             return
         if action == "await_setting_timezone":
             timezone = (message.text or "").strip()

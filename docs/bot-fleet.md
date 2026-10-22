@@ -1,0 +1,39 @@
+# Bot fleet promotion
+
+The **Bot fleet** button exists only in the primary iHarvester bot's private owner menu. It is intentionally absent from creator clones and cannot be reached through a command.
+
+It adds the configured approved bot usernames to **one channel at a time**. The owner enters a numeric channel ID, iHarvester verifies that it is already a channel administrator, then asks for an explicit confirmation. This creates one compact MongoDB job containing the requested bot names and their final outcomes.
+
+The Bot API cannot promote unrelated bots. A small private worker therefore runs on the recovery VPS using the three already-authorised human Telegram sessions. For each job it:
+
+1. Reads each authorised account's dialog directory, without inspecting channel history.
+2. Uses only an account that already has the exact target channel in that directory.
+3. Requires that account to have Telegram's **Add admins** permission.
+4. Promotes only the approved fleet bots, sequentially and with a delay.
+5. Grants only **post messages** and **edit messages** rights. It does not grant deletion, invitations, channel management, or the ability to add other administrators.
+
+The worker never logs in, exports, or deletes a human session. It does not need any bot token for the fleet bots.
+
+## Configuration
+
+`BOT_FLEET_USERNAMES` is an optional comma-separated override in the primary deployment. Names may include `@`; iHarvester normalizes and de-duplicates them. The repository's default is the approved fifteen-bot fleet. This setting has no effect in clones.
+
+## VPS worker
+
+Install the recovery-only dependencies in the existing recovery checkout, then run the job worker with all three preserved sessions:
+
+```bash
+cd /root/iharvester-recovery/repo
+source /root/iharvester-recovery/venv/bin/activate
+python scripts/promote_bot_fleet_mtproto.py \
+  --session /root/iharvester-recovery/session/account-1 \
+  --session /root/iharvester-recovery/session/account-2 \
+  --session /root/iharvester-recovery/session/account-3 \
+  --once
+```
+
+It reads `MONGODB_URI`, `MONGODB_DB_NAME`, `TELEGRAM_API_ID`, and `TELEGRAM_API_HASH` from the VPS-only environment. Do not put those human-account credentials, session files, or API values into Koyeb.
+
+Use `--dry-run` to list waiting fleet jobs without opening Telegram or writing data. A systemd timer may call the `--once` command every few minutes. The Telegram UI shows per-bot completion, already-admin, pending, failed, or cancelled state.
+
+If every authorised account lacks **Add admins** in a chosen channel, the job safely fails without changing the channel. Grant that right to one of the three human accounts and create a fresh job from the Bot fleet screen.
