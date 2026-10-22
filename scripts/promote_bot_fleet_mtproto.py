@@ -397,20 +397,28 @@ async def run(args: argparse.Namespace) -> int:
             for job in queued:
                 logger.info("Would process %s for channel %s (%s)", job["job_id"], job["channel_id"], job["status"])
             return 0
-        sessions = await _open_sessions(session_paths, api_id, api_hash)
-        if not sessions:
-            raise SystemExit("None of the supplied sessions could load an authorised Telegram channel directory.")
         worker_id = f"bot-fleet:{socket.gethostname()}:{os.getpid()}"
+        job = _claim_job(database, worker_id, args.lease_seconds)
+        if not job:
+            logger.info("No fleet jobs waiting.")
+            return 0
+        try:
+            sessions = await _open_sessions(session_paths, api_id, api_hash)
+        except Exception:
+            _defer_job(database, str(job["job_id"]), 300, "could not open authorised Telegram session directory")
+            raise
+        if not sessions:
+            _defer_job(database, str(job["job_id"]), 300, "no authorised Telegram session directory is currently available")
+            logger.warning("%s: no authorised session directory could be opened", job["job_id"])
+            return 1
         completed = 0
         while True:
-            job = _claim_job(database, worker_id, args.lease_seconds)
-            if not job:
-                if completed == 0:
-                    logger.info("No fleet jobs waiting.")
-                return 0
             await _run_job(database, job, sessions, args)
             completed += 1
             if args.once:
+                return 0
+            job = _claim_job(database, worker_id, args.lease_seconds)
+            if not job:
                 return 0
     finally:
         for session in sessions:
