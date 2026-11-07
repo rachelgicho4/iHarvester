@@ -6,6 +6,7 @@ import logging
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
@@ -323,6 +324,17 @@ def install_routes(app: object) -> None:
             return Response(status_code=200)
         try:
             await runtime.dispatcher.feed_update(runtime.bot, update)
+        except TelegramNetworkError:
+            # Telegram can accept an outbound reply yet lose or delay the Bot
+            # API response.  Replaying the inbound update in that situation
+            # duplicates stateful owner actions (for example, a Launch tap).
+            # Keep the idempotency record and acknowledge the update; normal
+            # exceptions still unregister it so Telegram can retry safely.
+            logger.warning(
+                "Telegram Bot API response timed out after webhook dispatch; acknowledging update to avoid replay",
+                extra={"update_id": update.update_id},
+            )
+            return Response(status_code=200)
         except Exception:
             await runtime.repositories.unregister_update(update.update_id)
             raise
