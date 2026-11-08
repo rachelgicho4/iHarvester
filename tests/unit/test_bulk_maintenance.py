@@ -84,6 +84,7 @@ def deletion_repositories(*, live_count: int = 0, cleanup_finalization: str | No
         campaigns=DeleteCollection(document=campaign, deleted_count=1),
         campaign_cycles=DeleteCollection(),
         deliveries=DeleteCollection(),
+        campaign_history_rollups=DeleteCollection(),
         join_events=DeleteCollection(),
         campaign_channel_state=DeleteCollection(count=live_count),
         variant_shares=DeleteCollection(),
@@ -104,6 +105,7 @@ async def test_archived_deletion_cascades_finished_campaign_history() -> None:
     expected = [{"campaign_id": "cmp"}]
     assert db.campaign_cycles.deleted_many == expected
     assert db.deliveries.deleted_many == expected
+    assert db.campaign_history_rollups.deleted_many == expected
     assert db.join_events.deleted_many == expected
     assert db.campaign_channel_state.deleted_many == expected
     assert db.variant_shares.deleted_many == expected

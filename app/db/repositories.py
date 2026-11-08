@@ -19,6 +19,20 @@ from app.utils.time import as_utc, utcnow
 Document = dict[str, Any]
 VIEW_MATURITY = timedelta(hours=6)
 MIN_PUBLIC_VIEW_PLACEMENTS = 50
+TERMINAL_SEND_DELIVERY_STATUSES = frozenset(
+    {
+        DeliveryStatus.SENT.value,
+        DeliveryStatus.FAILED_PERMANENT.value,
+        DeliveryStatus.UNKNOWN_SEND_STATE.value,
+        DeliveryStatus.CANCELLED.value,
+    }
+)
+FAILURE_DELIVERY_STATUSES = frozenset(
+    {
+        DeliveryStatus.FAILED_PERMANENT.value,
+        DeliveryStatus.UNKNOWN_SEND_STATE.value,
+    }
+)
 
 
 class Repositories:
@@ -1432,13 +1446,82 @@ class Repositories:
         rows = await cursor.to_list(None)
         return {item["_id"]: item["count"] for item in rows}
 
+    @staticmethod
+    def _empty_history_rollup() -> Document:
+        return {
+            "delivery_totals": {},
+            "cleanup_totals": {},
+            "cleanup_failure_totals": {},
+            "metrics": {
+                "attempts": 0,
+                "replaced_messages": 0,
+                "cleaned_messages": 0,
+                "first_created_at": None,
+                "last_updated_at": None,
+            },
+            "join_count": 0,
+            "failure_samples": [],
+            "cycle_stats": {"planned": 0, "completed": 0, "first_started_at": None, "last_completed_at": None},
+        }
+
+    @classmethod
+    def _merge_history_rollups(cls, *rollups: Document) -> Document:
+        """Merge manual/offline and automatic compacted campaign history."""
+        result = cls._empty_history_rollup()
+        for rollup in rollups:
+            if not rollup:
+                continue
+            for field in ("delivery_totals", "cleanup_totals", "cleanup_failure_totals"):
+                result[field] = cls._merge_counts(result[field], dict(rollup.get(field) or {}))
+            for field in ("attempts", "replaced_messages", "cleaned_messages"):
+                result["metrics"][field] += int(rollup.get("metrics", {}).get(field, 0) or 0)
+            for field, choose_minimum in (("first_created_at", True), ("last_updated_at", False)):
+                value = rollup.get("metrics", {}).get(field)
+                current = result["metrics"].get(field)
+                if value and (not current or (value < current if choose_minimum else value > current)):
+                    result["metrics"][field] = value
+            result["join_count"] += int(rollup.get("join_count", 0) or 0)
+            samples = list(rollup.get("failure_samples", []))
+            result["failure_samples"] = [*result["failure_samples"], *samples][:20]
+            source_cycles = rollup.get("cycle_stats", {})
+            for field in ("planned", "completed"):
+                result["cycle_stats"][field] += int(source_cycles.get(field, 0) or 0)
+            for field, choose_minimum in (("first_started_at", True), ("last_completed_at", False)):
+                value = source_cycles.get(field)
+                current = result["cycle_stats"].get(field)
+                if value and (not current or (value < current if choose_minimum else value > current)):
+                    result["cycle_stats"][field] = value
+        return result
+
+    async def _automatic_history_rollup(self, campaign_id: str) -> Document:
+        """Read the bounded per-cycle summaries created by the background compactor."""
+        collection = getattr(self.db, "campaign_history_rollups", None)
+        if collection is None or not hasattr(collection, "find"):
+            return self._empty_history_rollup()
+        cursor = collection.find(
+            {"campaign_id": campaign_id},
+            {
+                "_id": 0,
+                "delivery_totals": 1,
+                "cleanup_totals": 1,
+                "cleanup_failure_totals": 1,
+                "metrics": 1,
+                "join_count": 1,
+                "failure_samples": 1,
+                "cycle_stats": 1,
+            },
+        )
+        rows = await cursor.to_list(None)
+        return self._merge_history_rollups(*rows)
+
     async def _history_rollup(self, campaign_id: str) -> Document:
         """Return compacted/offline-history counters, if this campaign has any."""
         campaigns = getattr(self.db, "campaigns", None)
         if campaigns is None or not hasattr(campaigns, "find_one"):
-            return {}
+            return await self._automatic_history_rollup(campaign_id)
         campaign = await campaigns.find_one({"campaign_id": campaign_id}, {"history_rollup": 1})
-        return dict(campaign.get("history_rollup", {})) if campaign else {}
+        manual = dict(campaign.get("history_rollup", {})) if campaign else {}
+        return self._merge_history_rollups(manual, await self._automatic_history_rollup(campaign_id))
 
     @staticmethod
     def _merge_counts(current: Document, archived: Document) -> Document:
@@ -1491,7 +1574,9 @@ class Repositories:
         return self._merge_counts(current, (await self._history_rollup(campaign_id)).get("cleanup_failure_totals", {}))
 
     async def campaign_cycle_count(self, campaign_id: str) -> int:
-        return await self.db.campaign_cycles.count_documents({"campaign_id": campaign_id})
+        current = await self.db.campaign_cycles.count_documents({"campaign_id": campaign_id})
+        compacted = int((await self._history_rollup(campaign_id)).get("cycle_stats", {}).get("planned", 0) or 0)
+        return current + compacted
 
     async def latest_cycle_report(self, campaign_id: str) -> Document | None:
         cycle = await self.db.campaign_cycles.find_one({"campaign_id": campaign_id}, sort=[("cycle_number", -1)])
@@ -1549,7 +1634,16 @@ class Repositories:
             ]
         )
         rows = await cursor.to_list(1)
-        return rows[0] if rows else {"planned": 0, "completed": 0}
+        current = rows[0] if rows else {"planned": 0, "completed": 0}
+        archived = (await self._history_rollup(campaign_id)).get("cycle_stats", {})
+        result = dict(current)
+        for field in ("planned", "completed"):
+            result[field] = int(current.get(field, 0) or 0) + int(archived.get(field, 0) or 0)
+        for field, choose_minimum in (("first_started_at", True), ("last_completed_at", False)):
+            value = archived.get(field)
+            if value and (not result.get(field) or (value < result[field] if choose_minimum else value > result[field])):
+                result[field] = value
+        return result
 
     async def campaign_delivery_metrics(self, campaign_id: str) -> Document:
         cursor = await self.db.deliveries.aggregate(
@@ -1586,6 +1680,219 @@ class Repositories:
     async def campaign_join_count(self, campaign_id: str) -> int:
         current = await self.db.join_events.count_documents({"campaign_id": campaign_id})
         return current + int((await self._history_rollup(campaign_id)).get("join_count", 0) or 0)
+
+    async def compact_completed_campaign_history(
+        self,
+        *,
+        active_cycles_to_keep: int,
+        archived_cycles_to_keep: int,
+        max_cycles: int,
+    ) -> int:
+        """Replace old, completed send cycles with compact aggregate records.
+
+        Only completed positive cycles are eligible. Cleanup jobs, live-post
+        pointers, pending/retrying work, and the newest actionable cycles stay
+        untouched. A unique per-cycle summary is written before the verbose
+        rows are removed, so a deployment interruption can retry safely.
+        """
+        if max_cycles <= 0:
+            return 0
+        compacted = 0
+        campaigns = await self.db.campaigns.find(
+            {"status": {"$in": ["ACTIVE", "PAUSED", "ENDING", "ARCHIVED"]}},
+            {"_id": 0, "campaign_id": 1, "status": 1},
+        ).to_list(None)
+        for campaign in campaigns:
+            if compacted >= max_cycles:
+                break
+            keep = archived_cycles_to_keep if campaign.get("status") == "ARCHIVED" else active_cycles_to_keep
+            remaining = max_cycles - compacted
+            cursor = (
+                self.db.campaign_cycles.find(
+                    {"campaign_id": campaign["campaign_id"], "cycle_number": {"$gte": 0}, "status": "COMPLETED"}
+                )
+                .sort("cycle_number", -1)
+                .skip(max(0, keep))
+                .limit(remaining)
+            )
+            cycles = await cursor.to_list(remaining)
+            for cycle in cycles:
+                if await self._compact_completed_cycle(campaign["campaign_id"], cycle):
+                    compacted += 1
+                    if compacted >= max_cycles:
+                        break
+            # Finished campaigns commonly have one successful cleanup row per
+            # channel. Once no live pointers remain, those rows are just as
+            # bulky as historical sends and can be represented by a single
+            # aggregate without weakening future cleanup/retry controls.
+            if campaign.get("status") == "ARCHIVED" and compacted < max_cycles:
+                if await self._compact_archived_cleanup_history(campaign["campaign_id"]):
+                    compacted += 1
+        return compacted
+
+    async def _compact_completed_cycle(self, campaign_id: str, cycle: Document) -> bool:
+        """Compact one immutable completed send cycle, preserving its totals."""
+        cycle_number = int(cycle["cycle_number"])
+        base_query: Document = {
+            "campaign_id": campaign_id,
+            "cycle_number": cycle_number,
+            "operation": {"$ne": "CLEANUP"},
+        }
+        outstanding = await self.db.deliveries.count_documents(
+            {**base_query, "status": {"$nin": sorted(TERMINAL_SEND_DELIVERY_STATUSES)}},
+            limit=1,
+        )
+        if outstanding:
+            return False
+
+        summary_key = {"campaign_id": campaign_id, "cycle_number": cycle_number}
+        existing = await self.db.campaign_history_rollups.find_one(summary_key, {"_id": 1})
+        if not existing:
+            rollup = await self._completed_cycle_rollup(base_query, cycle)
+            now = utcnow()
+            try:
+                await self.db.campaign_history_rollups.update_one(
+                    summary_key,
+                    {
+                        "$setOnInsert": {
+                            **summary_key,
+                            "source": "AUTO_COMPLETED_CYCLE",
+                            **rollup,
+                            "compacted_at": now,
+                        }
+                    },
+                    upsert=True,
+                )
+            except DuplicateKeyError:
+                # A second deployment won the race to record the same compact
+                # summary. It is now safe for this instance to finish removal.
+                pass
+
+        terminal_query = {**base_query, "status": {"$in": sorted(TERMINAL_SEND_DELIVERY_STATUSES)}}
+        await self.db.deliveries.delete_many(terminal_query)
+        # Do not remove the cycle marker if any worker/owner action revived
+        # work after the initial completion check. The later retry still has
+        # its raw rows and will be compacted after it completes again.
+        if await self.db.deliveries.count_documents(base_query, limit=1):
+            return False
+        removed = await self.db.campaign_cycles.delete_one(
+            {"campaign_id": campaign_id, "cycle_number": cycle_number, "status": "COMPLETED"}
+        )
+        return removed.deleted_count == 1
+
+    async def _completed_cycle_rollup(self, base_query: Document, cycle: Document) -> Document:
+        cursor = await self.db.deliveries.aggregate(
+            [
+                {"$match": {**base_query, "discard_from_history_rollup": {"$ne": True}}},
+                {
+                    "$group": {
+                        "_id": "$status",
+                        "count": {"$sum": 1},
+                        "attempts": {"$sum": {"$ifNull": ["$attempts", 0]}},
+                        "replaced_messages": {"$sum": {"$ifNull": ["$replaced_message_count", 0]}},
+                        "cleaned_messages": {"$sum": {"$ifNull": ["$cleaned_message_count", 0]}},
+                        "first_created_at": {"$min": "$created_at"},
+                        "last_updated_at": {"$max": "$updated_at"},
+                    }
+                },
+            ]
+        )
+        rows = await cursor.to_list(None)
+        rollup = self._empty_history_rollup()
+        for row in rows:
+            status = str(row.get("_id") or "UNKNOWN")
+            rollup["delivery_totals"][status] = int(row.get("count", 0) or 0)
+            for field in ("attempts", "replaced_messages", "cleaned_messages"):
+                rollup["metrics"][field] += int(row.get(field, 0) or 0)
+            first, last = row.get("first_created_at"), row.get("last_updated_at")
+            if first and (not rollup["metrics"]["first_created_at"] or first < rollup["metrics"]["first_created_at"]):
+                rollup["metrics"]["first_created_at"] = first
+            if last and (not rollup["metrics"]["last_updated_at"] or last > rollup["metrics"]["last_updated_at"]):
+                rollup["metrics"]["last_updated_at"] = last
+
+        samples = await self.db.deliveries.find(
+            {**base_query, "status": {"$in": sorted(FAILURE_DELIVERY_STATUSES)}},
+            {
+                "_id": 0,
+                "channel_id": 1,
+                "cycle_number": 1,
+                "operation": 1,
+                "status": 1,
+                "error_category": 1,
+                "error_summary": 1,
+                "updated_at": 1,
+            },
+        ).sort("updated_at", -1).limit(20).to_list(20)
+        rollup["failure_samples"] = samples
+        rollup["cycle_stats"] = {
+            "planned": 1,
+            "completed": 1,
+            "first_started_at": cycle.get("started_at") or cycle.get("created_at"),
+            "last_completed_at": cycle.get("completed_at") or cycle.get("updated_at"),
+        }
+        return rollup
+
+    async def _compact_archived_cleanup_history(self, campaign_id: str) -> bool:
+        """Compact successful archived cleanup rows only after live state is gone."""
+        if await self.db.campaign_channel_state.count_documents({"campaign_id": campaign_id}, limit=1):
+            return False
+        cleanup_query: Document = {
+            "campaign_id": campaign_id,
+            "cycle_number": -1,
+            "operation": "CLEANUP",
+            "status": DeliveryStatus.CLEANED.value,
+        }
+        if not await self.db.deliveries.count_documents(cleanup_query, limit=1):
+            return False
+
+        summary_key = {"campaign_id": campaign_id, "cycle_number": -1}
+        existing = await self.db.campaign_history_rollups.find_one(summary_key, {"_id": 1})
+        if not existing:
+            cursor = await self.db.deliveries.aggregate(
+                [
+                    {"$match": cleanup_query},
+                    {
+                        "$group": {
+                            "_id": None,
+                            "count": {"$sum": 1},
+                            "attempts": {"$sum": {"$ifNull": ["$attempts", 0]}},
+                            "cleaned_messages": {"$sum": {"$ifNull": ["$cleaned_message_count", 0]}},
+                            "first_created_at": {"$min": "$created_at"},
+                            "last_updated_at": {"$max": "$updated_at"},
+                        }
+                    },
+                ]
+            )
+            rows = await cursor.to_list(1)
+            if not rows:
+                return False
+            row = rows[0]
+            rollup = self._empty_history_rollup()
+            rollup["cleanup_totals"][DeliveryStatus.CLEANED.value] = int(row.get("count", 0) or 0)
+            rollup["metrics"] = {
+                "attempts": int(row.get("attempts", 0) or 0),
+                "replaced_messages": 0,
+                "cleaned_messages": int(row.get("cleaned_messages", 0) or 0),
+                "first_created_at": row.get("first_created_at"),
+                "last_updated_at": row.get("last_updated_at"),
+            }
+            try:
+                await self.db.campaign_history_rollups.update_one(
+                    summary_key,
+                    {
+                        "$setOnInsert": {
+                            **summary_key,
+                            "source": "AUTO_COMPLETED_CLEANUP",
+                            **rollup,
+                            "compacted_at": utcnow(),
+                        }
+                    },
+                    upsert=True,
+                )
+            except DuplicateKeyError:
+                pass
+        result = await self.db.deliveries.delete_many(cleanup_query)
+        return result.deleted_count > 0
 
     async def campaign_audience_summary(self, campaign: Document) -> Document:
         """Summarise the frozen campaign audience without exposing channel rows.
@@ -2257,6 +2564,7 @@ class Repositories:
         campaign_query = {"campaign_id": campaign_id}
         await self.db.campaign_cycles.delete_many(campaign_query)
         await self.db.deliveries.delete_many(campaign_query)
+        await self.db.campaign_history_rollups.delete_many(campaign_query)
         await self.db.join_events.delete_many(campaign_query)
         # This should already be empty due to the guard, but deleting it keeps
         # retries idempotent if legacy data contains empty-state artifacts.

@@ -1,8 +1,45 @@
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 
 from app.db.repositories import Repositories
+
+
+def test_compacted_history_preserves_delivery_cycle_and_metric_totals() -> None:
+    started = datetime(2026, 1, 1, tzinfo=UTC)
+    completed = started + timedelta(hours=2)
+    offline = {
+        "delivery_totals": {"SENT": 12, "FAILED_PERMANENT": 1},
+        "metrics": {"attempts": 14, "replaced_messages": 2, "cleaned_messages": 0, "first_created_at": started},
+        "cycle_stats": {"planned": 2, "completed": 2, "first_started_at": started},
+    }
+    automatic = {
+        "delivery_totals": {"SENT": 8},
+        "cleanup_totals": {"CLEANED": 8},
+        "metrics": {"attempts": 9, "cleaned_messages": 8, "last_updated_at": completed},
+        "failure_samples": [{"status": "FAILED_PERMANENT", "channel_id": -1001}],
+        "cycle_stats": {"planned": 1, "completed": 1, "last_completed_at": completed},
+    }
+
+    result = Repositories._merge_history_rollups(offline, automatic)
+
+    assert result["delivery_totals"] == {"SENT": 20, "FAILED_PERMANENT": 1}
+    assert result["cleanup_totals"] == {"CLEANED": 8}
+    assert result["metrics"] == {
+        "attempts": 23,
+        "replaced_messages": 2,
+        "cleaned_messages": 8,
+        "first_created_at": started,
+        "last_updated_at": completed,
+    }
+    assert result["cycle_stats"] == {
+        "planned": 3,
+        "completed": 3,
+        "first_started_at": started,
+        "last_completed_at": completed,
+    }
+    assert result["failure_samples"] == [{"status": "FAILED_PERMANENT", "channel_id": -1001}]
 
 
 class Cursor:

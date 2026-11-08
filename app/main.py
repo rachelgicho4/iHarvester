@@ -21,6 +21,7 @@ from app.db.leases import LeaseManager
 from app.db.repositories import Repositories
 from app.delivery.rate_limit import AsyncTokenBucket
 from app.delivery.worker import DeliveryWorker
+from app.maintenance.history_compactor import HistoryCompactor
 from app.network.refresh_worker import ChannelRefreshWorker
 from app.telegram.handlers_admin_updates import ChannelAdminHandlers
 from app.telegram.handlers_client_requests import ClientRequestHandlers
@@ -138,6 +139,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             send_limiter = AsyncTokenBucket(settings.broadcast_send_rps)
             mutation_limiter = AsyncTokenBucket(settings.broadcast_global_api_rps)
             runtime.tasks.append(asyncio.create_task(scheduler.run(runtime.stopping), name="scheduler"))
+            if settings.history_compaction_enabled:
+                compactor = HistoryCompactor(
+                    instance_id=instance_id,
+                    repositories=repositories,
+                    lease_manager=lease_manager,
+                    interval_seconds=settings.history_compaction_interval_minutes * 60,
+                    active_cycles_to_keep=settings.history_active_cycles_to_keep,
+                    archived_cycles_to_keep=settings.history_archived_cycles_to_keep,
+                    max_cycles_per_run=settings.history_compaction_max_cycles_per_run,
+                )
+                runtime.tasks.append(asyncio.create_task(compactor.run(runtime.stopping), name="campaign-history-compactor"))
             backup_worker = AutomaticBackupWorker(
                 instance_id=instance_id,
                 repositories=repositories,

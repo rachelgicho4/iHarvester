@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     delivery_lease_seconds: int = Field(default=90, ge=15)
     scheduler_lease_seconds: int = Field(default=30, ge=10)
     scheduler_tick_seconds: float = Field(default=2, gt=0)
+    # Completed delivery cycles are the largest MongoDB records in a busy
+    # network. Keep a short recent window for actionable reports, then retain
+    # only compact aggregate history for older cycles.
+    history_compaction_enabled: bool = True
+    history_compaction_interval_minutes: int = Field(default=5, ge=1, le=1_440)
+    history_active_cycles_to_keep: int = Field(default=3, ge=1, le=100)
+    history_archived_cycles_to_keep: int = Field(default=1, ge=1, le=100)
+    history_compaction_max_cycles_per_run: int = Field(default=20, ge=1, le=200)
     telegram_request_timeout_seconds: float = Field(default=20, gt=0)
     max_transient_attempts: int = Field(default=3, ge=1, le=10)
     # The operator and primary deployment are based in Nairobi.  Individual

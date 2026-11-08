@@ -14,6 +14,12 @@ async def ensure_indexes(database: Database) -> None:
     await db.campaigns.create_index([("status", 1), ("start_at_utc", 1)])
     await db.campaign_cycles.create_index([("campaign_id", 1), ("cycle_number", 1)], unique=True)
     await db.deliveries.create_index([("campaign_id", 1), ("cycle_number", 1), ("channel_id", 1)], unique=True)
+    await db.deliveries.create_index([("campaign_id", 1), ("cycle_number", 1), ("operation", 1), ("status", 1)])
+    # One compact summary per pruned completed cycle. This unique key makes
+    # compaction retry-safe if an instance stops after recording a summary but
+    # before removing the corresponding verbose delivery rows.
+    await db.campaign_history_rollups.create_index([("campaign_id", 1), ("cycle_number", 1)], unique=True)
+    await db.campaign_history_rollups.create_index([("campaign_id", 1), ("compacted_at", -1)])
     await db.deliveries.create_index([("status", 1), ("next_retry_at", 1), ("lease_until", 1), ("dispatch_rank", 1)])
     await db.campaign_channel_state.create_index([("campaign_id", 1), ("channel_id", 1)], unique=True)
     await db.campaign_channel_state.create_index([("campaign_id", 1), ("updated_at", 1)])
